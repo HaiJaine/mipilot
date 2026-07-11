@@ -10,6 +10,9 @@
 - 上游仓库: <https://github.com/MetaCubeX/mihomo>
 - 发布页: <https://github.com/MetaCubeX/mihomo/releases>
 - 本项目使用的资产: `mihomo-linux-amd64-v*.gz`
+- MiPilot v1.0.0离线包版本: `v1.19.28`
+- 上游提交: `cbd11db1e13a75d8e680e0fe7742c95be4cba2be`
+- SHA-256: `d5967e079d9f793515a5a8193aabda455f7e012427eccd567dbc4f2f15498204`
 - 上游许可证: GNU General Public License v3.0 (GPL-3.0)
 - 许可证文本: <https://github.com/MetaCubeX/mihomo/blob/Meta/LICENSE>
 
@@ -21,6 +24,10 @@ Mihomo 二进制是独立的第三方程序, 不属于本项目的 MIT 授权范
 - 上游仓库: <https://github.com/MetaCubeX/meta-rules-dat>
 - 发布页: <https://github.com/MetaCubeX/meta-rules-dat/releases>
 - 本项目使用的资产: `country.mmdb`、`geosite.dat`
+- MiPilot v1.0.0离线包上游标签: `latest`, 发布于 `2026-07-10T23:28:50Z`
+- 上游提交: `4178770badecb1b349fbcd62c737e0d7a2079729`
+- `country.mmdb` SHA-256: `3256b2ba2d8f75778fab6fe4e0e1c77ccffbd8774aab8e577251f3803ad95b49`
+- `geosite.dat` SHA-256: `cb77421b5ebe0b786d4bce7cb100c532b28ffc0e7b46d7181cd63139433f4526`
 - 上游许可证: GNU General Public License v3.0 (GPL-3.0)
 - 许可证文本: <https://github.com/MetaCubeX/meta-rules-dat/blob/meta/LICENSE>
 
@@ -30,4 +37,4 @@ Mihomo 二进制是独立的第三方程序, 不属于本项目的 MIT 授权范
 
 如果只发布 MiPilot 源码而不附带上述资产, 请保留本文件和 `.gitignore`, 并引导用户从上游获取文件。
 
-如果在源码包、安装包或 Release 中附带 Mihomo 二进制或 meta-rules-dat 数据, 发布者需要自行履行 GPL-3.0 及上游声明的全部再分发义务, 包括保留版权和许可证声明, 随分发物提供对应许可证文本, 并按许可证要求提供相应源码。具体义务以分发时的上游版本和许可证为准。
+MiPilot v1.0.0完整离线包随附GPL-3.0许可证文本, Release同时提供 `mipilot-v1.0.0-third-party-sources.tar.gz`, 包含上述两个精确提交的源码快照。第三方版权和许可证仍归各上游项目所有。

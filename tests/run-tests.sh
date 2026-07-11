@@ -86,7 +86,7 @@ test_bash_syntax() {
 
 test_manager_release_version() {
   load_manager || return 1
-  assert_equal "1.0.0-dev" "$MANAGER_VERSION" "manager development version"
+  assert_equal "1.0.0" "$MANAGER_VERSION" "manager release version"
 }
 
 test_source_testing_guard() {
@@ -962,7 +962,7 @@ run_test() {
 }
 
 run_test "bash -n" test_bash_syntax
-run_test "manager development version" test_manager_release_version
+run_test "manager release version" test_manager_release_version
 run_test "testing source guard" test_source_testing_guard
 run_test "source preserves enabled shell options" test_source_preserves_enabled_shell_options
 run_test "local asset discovery" test_find_local_assets

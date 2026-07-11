@@ -1,10 +1,32 @@
 # MiPilot
 
-当前版本: `1.0.0-dev`。项目仍处于首个正式版本发布前的开发和验收阶段, 尚未发布稳定版。
+当前版本: `1.0.0`, MiPilot首个正式版本。
 
 MiPilot 取意于“Mihomo + Pilot”, 是面向 Ubuntu 的 Mihomo 一键安装与维护工具。首次执行时可完全使用本地的 Mihomo 内核和地理数据完成安装; 安装完成后通过 `mipilot` 管理订阅、节点、TUN、终端代理、服务、更新、备份和卸载。
 
-## 开发版安装
+## 安装
+
+### 使用完整离线包
+
+从 [MiPilot v1.0.0 Release](https://github.com/HaiJaine/mipilot/releases/tag/v1.0.0) 下载:
+
+```text
+mipilot-v1.0.0-linux-amd64-offline.tar.gz
+SHA256SUMS
+```
+
+校验、解压并安装:
+
+```bash
+sha256sum -c SHA256SUMS --ignore-missing
+tar -xzf mipilot-v1.0.0-linux-amd64-offline.tar.gz
+cd mipilot-v1.0.0
+bash ./mipilot
+```
+
+完整离线包已经包含Mihomo内核、`country.mmdb` 和 `geosite.dat`, 首次安装这些组件不需要访问GitHub。
+
+### 克隆源码安装
 
 ```bash
 git clone https://github.com/HaiJaine/mipilot.git
@@ -26,7 +48,7 @@ ls -lh mipilot country.mmdb geosite.dat mihomo-linux-amd64-v1.19.28.gz
 bash ./mipilot
 ```
 
-Git 仓库不会提交这 3 个第三方大文件。它们可以从 [Mihomo v1.19.28](https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.28) 和 [meta-rules-dat Releases](https://github.com/MetaCubeX/meta-rules-dat/releases) 获取; GitHub 无法访问时也可以在其他设备下载后传入服务器。
+Git仓库不会提交这3个第三方大文件。它们可以从 [Mihomo v1.19.28](https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.28) 和 [meta-rules-dat Releases](https://github.com/MetaCubeX/meta-rules-dat/releases) 获取; GitHub无法访问时也可以在其他设备下载后传入服务器。
 
 安装完成后执行:
 
@@ -228,8 +250,8 @@ bash -n mipilot
 bash tests/run-tests.sh
 ```
 
-模拟测试不会写入真实系统目录。正式发布前仍应在 Ubuntu amd64 虚拟机中完成离线安装、订阅、TUN、更新回退和彻底卸载验收。
+模拟测试不会写入真实系统目录。涉及TUN、Docker公网端口和systemd的行为应在受支持的Ubuntu amd64环境中验证。
 
 ## 许可证
 
-本项目原创代码和文档以 [MIT License](LICENSE) 发布。Mihomo 内核以及 meta-rules-dat 数据不属于本项目的 MIT 授权范围; 其来源和再分发说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。第三方资产由使用者自行下载, 且已被 `.gitignore` 排除。
+本项目原创代码和文档以 [MIT License](LICENSE) 发布。Mihomo内核以及meta-rules-dat数据不属于本项目的MIT授权范围; 其来源和再分发说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。第三方资产不进入Git仓库; 完整离线Release另行附带对应源码包和GPL-3.0许可证文本。
