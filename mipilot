@@ -42,6 +42,7 @@ ROLLBACK_DIR="${STATE_DIR}/rollback"
 INSTALL_MARKER="${STATE_DIR}/installed"
 LOCK_FILE="${MIPILOT_LOCK_FILE:-/run/lock/mipilot.lock}"
 ROLLBACK_MAX_AGE=$((72 * 60 * 60))
+MANAGER_RELEASE_BASE="https://github.com/HaiJaine/mipilot/releases/latest/download"
 TUN_BYPASS_RULE_PRIORITY=8990
 SHELL_INTEGRATION_BEGIN="# >>> mipilot managed >>>"
 SHELL_INTEGRATION_END="# <<< mipilot managed <<<"
@@ -166,56 +167,141 @@ read_line_or_back() {
   done
 }
 
-run_cancellable() (
+run_with_progress() (
+  local label="$1"
+  local cancellable="$2"
+  local timeout_seconds="$3"
   local temporary
-  local process_id
+  local process_id=0
   local key
   local status
   local loop_count=0
   local frame_index=0
   local progress_visible=0
+  local timed_out=0
+  local started_at=$SECONDS
+  local elapsed=0
   local spinner_frames=('|' '/' '-' '\')
 
+  shift 3
   set +m
-  temporary="$(mktemp /tmp/mipilot-command.XXXXXX)" || return
-  setsid "$@" >"$temporary" 2>&1 &
+  umask 077
+  temporary="$(mktemp /tmp/mipilot-command.XXXXXX)" || return 1
+
+  clear_progress() {
+    if (( progress_visible == 1 )); then
+      printf '\r\033[2K\033[?25h' >&2
+      progress_visible=0
+    fi
+  }
+
+  stop_progress_process() {
+    (( process_id > 0 )) || return 0
+    if kill -0 "$process_id" 2>/dev/null; then
+      sudo -n kill -- "-${process_id}" 2>/dev/null || \
+        kill -- "-${process_id}" 2>/dev/null || \
+        kill "$process_id" 2>/dev/null || true
+    fi
+    wait "$process_id" 2>/dev/null || true
+  }
+
+  cleanup_progress() {
+    clear_progress
+    rm -f -- "$temporary"
+  }
+
+  trap 'stop_progress_process; cleanup_progress; exit 130' HUP INT TERM
+  trap 'cleanup_progress' EXIT
+
+  if [[ ! -t 2 ]]; then
+    printf '%s...\n' "$label" >&2
+  fi
+
+  if declare -F "${1:-}" >/dev/null 2>&1; then
+    "$@" >"$temporary" 2>&1 &
+  else
+    setsid "$@" >"$temporary" 2>&1 &
+  fi
   process_id=$!
 
   while kill -0 "$process_id" 2>/dev/null; do
     ((loop_count++)) || true
-    if (( loop_count >= 5 )) && [[ -t 2 ]]; then
-      printf '\r处理中... %s (按 Esc 取消)' "${spinner_frames[$((frame_index % 4))]}" >&2
+    elapsed=$((SECONDS - started_at))
+    if (( timeout_seconds > 0 && elapsed >= timeout_seconds )); then
+      timed_out=1
+      stop_progress_process
+      break
+    fi
+
+    if (( loop_count >= 3 )) && [[ -t 2 ]]; then
+      if (( progress_visible == 0 )); then
+        printf '\033[?25l' >&2
+      fi
+      if [[ $cancellable == true ]]; then
+        printf '\r\033[2K%s %s  已等待 %ss, 按 Esc 取消' \
+          "$label" "${spinner_frames[$((frame_index % 4))]}" "$elapsed" >&2
+      else
+        printf '\r\033[2K%s %s  已等待 %ss, 当前阶段不可中断' \
+          "$label" "${spinner_frames[$((frame_index % 4))]}" "$elapsed" >&2
+      fi
       ((frame_index++)) || true
       progress_visible=1
     fi
 
-    if IFS= read -r -s -n 1 -t 0.1 key; then
-      if [[ $key == $'\e' ]]; then
-        sudo -n kill -- "-${process_id}" 2>/dev/null || \
-          kill -- "-${process_id}" 2>/dev/null || \
-          kill "$process_id" 2>/dev/null || true
-        wait "$process_id" 2>/dev/null || true
-        rm -f -- "$temporary"
-        if (( progress_visible == 1 )); then
-          printf '\r%60s\r' ' ' >&2
-        else
-          echo >&2
-        fi
+    if [[ $cancellable == true && -t 0 ]]; then
+      if IFS= read -r -s -n 1 -t 0.1 key && [[ $key == $'\e' ]]; then
+        stop_progress_process
+        clear_progress
         echo "已取消当前操作." >&2
+        trap - EXIT HUP INT TERM
+        cleanup_progress
         return 130
       fi
+    else
+      sleep 0.1
     fi
   done
 
-  wait "$process_id"
-  status=$?
-  if (( progress_visible == 1 )); then
-    printf '\r%60s\r' ' ' >&2
+  if (( timed_out == 1 )); then
+    status=124
+  else
+    wait "$process_id"
+    status=$?
   fi
+  process_id=0
+  clear_progress
   cat "$temporary"
-  rm -f -- "$temporary"
+  if (( timed_out == 1 )); then
+    echo "${label}: 等待超过 ${timeout_seconds}s, 已停止." >&2
+  elif [[ ! -t 2 ]]; then
+    if (( status == 0 )); then
+      echo "${label}: 完成." >&2
+    else
+      echo "${label}: 失败(状态 ${status})." >&2
+    fi
+  fi
+  trap - EXIT HUP INT TERM
+  cleanup_progress
   return "$status"
 )
+
+run_cancellable() {
+  run_with_progress "处理中" true 0 "$@"
+}
+
+run_cancellable_named() {
+  local label="$1"
+  local timeout_seconds="$2"
+  shift 2
+  run_with_progress "$label" true "$timeout_seconds" "$@"
+}
+
+run_blocking() {
+  local label="$1"
+  local timeout_seconds="$2"
+  shift 2
+  run_with_progress "$label" false "$timeout_seconds" "$@"
+}
 
 ensure_shell_integration() {
   local bashrc="$SHELL_RC_FILE"
@@ -288,6 +374,7 @@ remove_shell_integration() {
 }
 
 mipilot() {
+  # shellcheck disable=SC1090
   source "$MANAGER_INSTALLED_SCRIPT" --menu
 }
 
@@ -381,7 +468,7 @@ test_proxy_target() {
 
   echo "${name}: 测试中, 按 Esc 取消..."
   if result="$(
-    run_cancellable curl \
+    run_cancellable_named "正在测试 ${name}" 22 curl \
       --proxy "$PROXY_URL" \
       --max-time 20 \
       -o /dev/null \
@@ -486,12 +573,12 @@ atomic_install_file() {
   local destination="$3"
   local temporary="${destination}.new.$$.$RANDOM"
 
-  sudo install -m "$mode" "$source_file" "$temporary" || {
-    sudo rm -f -- "$temporary" 2>/dev/null || true
+  sudo -n install -m "$mode" "$source_file" "$temporary" || {
+    sudo -n rm -f -- "$temporary" 2>/dev/null || true
     return 1
   }
-  sudo mv -f -- "$temporary" "$destination" || {
-    sudo rm -f -- "$temporary" 2>/dev/null || true
+  sudo -n mv -f -- "$temporary" "$destination" || {
+    sudo -n rm -f -- "$temporary" 2>/dev/null || true
     return 1
   }
 }
@@ -561,6 +648,8 @@ render_tun_config() {
   local output_file="$2"
   local enabled="$3"
 
+  # The input needs sudo; the caller-owned output path intentionally does not.
+  # shellcheck disable=SC2024
   sudo awk -v tun_enabled="$enabled" '
     function replace_boolean(line, key, value, indent, comment_pos, comment) {
       match(line, /^[[:space:]]*/)
@@ -702,8 +791,8 @@ detect_public_service_ports() {
       '
     fi
 
-    if command -v docker >/dev/null 2>&1 && sudo docker ps >/dev/null 2>&1; then
-      sudo docker ps --format '{{.Ports}}' 2>/dev/null \
+    if command -v docker >/dev/null 2>&1 && timeout 4 sudo -n docker ps >/dev/null 2>&1; then
+      timeout 4 sudo -n docker ps --format '{{.Ports}}' 2>/dev/null \
         | grep -oE '[0-9]+->[0-9]+/(tcp|udp)' \
         | sed -E 's/^([0-9]+)->[0-9]+\/(tcp|udp)$/\2:\1/' \
         || true
@@ -731,7 +820,7 @@ add_tun_bypass_rule() {
   local port="$2"
 
   tun_bypass_rule_exists "$protocol" "$port" && return 0
-  sudo ip rule add pref "$TUN_BYPASS_RULE_PRIORITY" \
+  sudo -n ip rule add pref "$TUN_BYPASS_RULE_PRIORITY" \
     ipproto "$protocol" sport "$port" lookup main
 }
 
@@ -740,14 +829,14 @@ delete_tun_bypass_rule() {
   local port="$2"
 
   while tun_bypass_rule_exists "$protocol" "$port"; do
-    sudo ip rule del pref "$TUN_BYPASS_RULE_PRIORITY" \
+    sudo -n ip rule del pref "$TUN_BYPASS_RULE_PRIORITY" \
       ipproto "$protocol" sport "$port" lookup main || return 1
   done
 }
 
 list_tun_bypass_ports() {
-  sudo test -f "$TUN_BYPASS_STATE_FILE" || return 0
-  sudo awk -F: '
+  sudo -n test -f "$TUN_BYPASS_STATE_FILE" || return 0
+  sudo -n awk -F: '
     ($1 == "tcp" || $1 == "udp") && $2 ~ /^[0-9]+$/ && $2 >= 1 && $2 <= 65535 {
       print $1 ":" $2
     }
@@ -824,6 +913,7 @@ apply_tun_setting() {
   local backup
   local status
 
+  ensure_sudo_access || return 1
   temporary="$(mktemp /tmp/mihomo-tun-config.XXXXXX.yaml)" || return
   backup=""
 
@@ -834,8 +924,9 @@ apply_tun_setting() {
     return 1
   fi
 
-  echo "[2/5] 正在验证配置, 按 Esc 取消..."
-  run_cancellable sudo "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$temporary"
+  echo "[2/5] 验证配置"
+  run_cancellable_named "正在验证 TUN 配置" 35 \
+    sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$temporary"
   status=$?
   if (( status == 130 )); then
     rm -f -- "$temporary"
@@ -858,8 +949,8 @@ apply_tun_setting() {
   }
   rm -f -- "$temporary"
 
-  echo "[4/5] 正在重启 Mihomo 服务, 请稍候..."
-  if ! sudo systemctl restart mihomo; then
+  echo "[4/5] 重启 Mihomo 服务"
+  if ! run_blocking "正在重启 Mihomo 服务" 35 sudo -n systemctl restart mihomo; then
     if rollback_config "$backup"; then
       echo "Mihomo 启动失败, TUN 状态已回滚."
     else
@@ -868,9 +959,8 @@ apply_tun_setting() {
     return 1
   fi
 
-  echo "[5/5] 正在等待 Mihomo 服务稳定..."
-  sleep 2
-  if ! sudo systemctl is-active --quiet mihomo; then
+  echo "[5/5] 等待 Mihomo 服务稳定"
+  if ! run_blocking "正在等待 Mihomo 服务稳定" 15 wait_for_mihomo_stable 2; then
     if rollback_config "$backup"; then
       echo "Mihomo 未能稳定运行, TUN 状态已回滚."
     else
@@ -885,11 +975,11 @@ apply_tun_setting() {
   fi
 
   if [[ $enabled == true ]]; then
-    if ! refresh_tun_bypass_ports; then
+    if ! run_blocking "正在扫描并保存公网服务端口" 15 refresh_tun_bypass_ports; then
       echo "警告: 无法扫描公网服务端口, 请检查 iproute2 和 Docker 权限."
     fi
   fi
-  if ! sync_tun_bypass_rules; then
+  if ! run_blocking "正在同步公网服务返回路由" 15 sync_tun_bypass_rules; then
     echo "警告: 公网服务返回流量保护规则同步失败."
   fi
 
@@ -1029,6 +1119,8 @@ config_value() {
 
 refresh_api_config() {
   local controller
+  local controller_host
+  local controller_port
   local mixed_port
 
   mixed_port="$(config_value mixed-port)"
@@ -1045,28 +1137,70 @@ refresh_api_config() {
     return
   fi
 
-  case "$controller" in
-    0.0.0.0:*) controller="127.0.0.1:${controller##*:}" ;;
-    :*) controller="127.0.0.1${controller}" ;;
-  esac
+  controller_host="${controller%:*}"
+  controller_port="${controller##*:}"
+  if [[ $controller_host != 127.0.0.1 && $controller_host != localhost ]] ||
+     [[ ! $controller_port =~ ^[0-9]+$ ]] ||
+     (( controller_port < 1 || controller_port > 65535 )); then
+    API=""
+    API_SECRET=""
+    return 1
+  fi
 
   API="http://${controller}"
 }
 
+create_api_header_file() {
+  local target="$1"
+
+  [[ $API_SECRET != *$'\n'* && $API_SECRET != *$'\r'* ]] || return 1
+  umask 077
+  printf 'Authorization: Bearer %s\n' "$API_SECRET" >"$target"
+  chmod 600 "$target"
+}
+
 api() {
+  local header_file=""
+  local status
+
   if [[ -n $API_SECRET ]]; then
-    run_cancellable curl -fsS --connect-timeout 2 --max-time 10 -H "Authorization: Bearer ${API_SECRET}" "$@"
+    header_file="$(mktemp /tmp/mipilot-api-header.XXXXXX)" || return 1
+    create_api_header_file "$header_file" || {
+      rm -f -- "$header_file"
+      return 1
+    }
+    run_cancellable_named "正在访问 Mihomo API" 12 \
+      curl -fsS --noproxy '*' --connect-timeout 2 --max-time 10 \
+      -H "@${header_file}" "$@"
   else
-    run_cancellable curl -fsS --connect-timeout 2 --max-time 10 "$@"
+    run_cancellable_named "正在访问 Mihomo API" 12 \
+      curl -fsS --noproxy '*' --connect-timeout 2 --max-time 10 "$@"
   fi
+  status=$?
+  [[ -n $header_file ]] && rm -f -- "$header_file"
+  return "$status"
 }
 
 api_quick() {
+  local header_file=""
+  local status
+
   if [[ -n $API_SECRET ]]; then
-    curl -fsS --noproxy '*' --connect-timeout 1 --max-time 2 -H "Authorization: Bearer ${API_SECRET}" "$@"
+    header_file="$(mktemp /tmp/mipilot-api-header.XXXXXX)" || return 1
+    create_api_header_file "$header_file" || {
+      rm -f -- "$header_file"
+      return 1
+    }
+    run_blocking "正在刷新运行状态" 2 \
+      curl -fsS --noproxy '*' --connect-timeout 0.5 --max-time 1 \
+      -H "@${header_file}" "$@"
   else
-    curl -fsS --noproxy '*' --connect-timeout 1 --max-time 2 "$@"
+    run_blocking "正在刷新运行状态" 2 \
+      curl -fsS --noproxy '*' --connect-timeout 0.5 --max-time 1 "$@"
   fi
+  status=$?
+  [[ -n $header_file ]] && rm -f -- "$header_file"
+  return "$status"
 }
 
 mode_status_label() {
@@ -1096,7 +1230,7 @@ refresh_menu_runtime_summary() {
     return
   fi
 
-  response="$(api_quick "${API}/configs" 2>/dev/null)" || {
+  response="$(api_quick "${API}/configs")" || {
     return
   }
   mode="$(jq -r '.mode // empty' <<<"$response")"
@@ -1108,18 +1242,32 @@ refresh_menu_runtime_summary() {
   fi
 
   MENU_NODE_STATUS="读取失败"
-  proxies_response="$(api_quick "${API}/proxies" 2>/dev/null)" || return
+  proxies_response="$(api_quick "${API}/proxies")" || return
   if resolve_main_proxy_response "$proxies_response" "$mode"; then
     MENU_NODE_STATUS="$ACTIVE_NODE"
   fi
 }
 
 api_cancellable() {
+  local header_file=""
+  local status
+
   if [[ -n $API_SECRET ]]; then
-    run_cancellable curl -fsS --connect-timeout 2 --max-time 12 -H "Authorization: Bearer ${API_SECRET}" "$@"
+    header_file="$(mktemp /tmp/mipilot-api-header.XXXXXX)" || return 1
+    create_api_header_file "$header_file" || {
+      rm -f -- "$header_file"
+      return 1
+    }
+    run_cancellable_named "正在等待 Mihomo API" 14 \
+      curl -fsS --noproxy '*' --connect-timeout 2 --max-time 12 \
+      -H "@${header_file}" "$@"
   else
-    run_cancellable curl -fsS --connect-timeout 2 --max-time 12 "$@"
+    run_cancellable_named "正在等待 Mihomo API" 14 \
+      curl -fsS --noproxy '*' --connect-timeout 2 --max-time 12 "$@"
   fi
+  status=$?
+  [[ -n $header_file ]] && rm -f -- "$header_file"
+  return "$status"
 }
 
 require_api() {
@@ -1442,6 +1590,8 @@ refresh_saved_region_definitions() {
   local exclude_pattern
 
   exclude_pattern="$(region_exclude_pattern)"
+  # The input needs sudo; the caller-owned output path intentionally does not.
+  # shellcheck disable=SC2024
   sudo awk \
     -v state_file="$state_file" \
     -v exclude_pattern="$exclude_pattern" '
@@ -1541,6 +1691,8 @@ region_group_rules_current() {
   local exclude_pattern
 
   exclude_pattern="$(region_exclude_pattern)"
+  # The input needs sudo; the caller-owned output path intentionally does not.
+  # shellcheck disable=SC2024
   sudo awk \
     -v state_file="$state_file" \
     -v exclude_pattern="$exclude_pattern" '
@@ -1617,6 +1769,8 @@ render_region_overlay() {
   local refs_file="$3"
   local definitions_file="$4"
 
+  # The input needs sudo; the caller-owned output path intentionally does not.
+  # shellcheck disable=SC2024
   sudo awk \
     -v refs_file="$refs_file" \
     -v definitions_file="$definitions_file" \
@@ -1835,6 +1989,7 @@ auto_add_region_groups() {
   jq -r '.proxies | to_entries[] | select(.value.all != null) | .key' <<<"$response" >"$groups_file"
 
   if sudo test -s "$REGION_STATE_FILE"; then
+    # shellcheck disable=SC2024
     sudo cat "$REGION_STATE_FILE" >"$existing_state" || {
       rm -f -- "$nodes_file" "$groups_file" "$existing_state" "$candidate_state" "$dedup_state" "$temporary_config"
       return 1
@@ -1914,8 +2069,8 @@ auto_add_region_groups() {
     return 1
   fi
 
-  echo "正在验证新配置, 按 Esc 取消..."
-  run_cancellable sudo "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$temporary_config"
+  run_cancellable_named "正在验证地区策略组配置" 45 \
+    sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$temporary_config"
   status=$?
   if (( status == 130 )); then
     rm -f -- "$nodes_file" "$groups_file" "$existing_state" "$candidate_state" "$dedup_state" "$temporary_config"
@@ -1937,7 +2092,7 @@ auto_add_region_groups() {
     return 1
   }
 
-  if ! sudo systemctl restart mihomo; then
+  if ! restart_mihomo_with_progress; then
     if rollback_config "$backup"; then
       echo "新配置启动失败, 已自动回滚."
     else
@@ -1947,8 +2102,7 @@ auto_add_region_groups() {
     return 1
   fi
 
-  sleep 2
-  if ! sudo systemctl is-active --quiet mihomo; then
+  if ! wait_mihomo_with_progress 2; then
     if rollback_config "$backup"; then
       echo "新配置未能稳定运行, 已自动回滚."
     else
@@ -2470,36 +2624,84 @@ rollback_config() {
     echo "回滚失败: 无法恢复配置文件 ${backup}"
     return 1
   fi
-  if ! sudo systemctl restart mihomo; then
+  if ! restart_mihomo_with_progress; then
     echo "回滚配置已恢复, 但 Mihomo 服务重启失败."
     return 1
   fi
   echo "旧配置已恢复, Mihomo 服务已重新启动."
 }
 
+create_curl_url_config() {
+  local url="$1"
+  local target="$2"
+  local escaped
+
+  [[ $url == http://* || $url == https://* ]] || return 1
+  [[ $url != *$'\n'* && $url != *$'\r'* ]] || return 1
+  escaped="${url//\\/\\\\}"
+  escaped="${escaped//\"/\\\"}"
+  umask 077
+  printf 'url = "%s"\n' "$escaped" >"$target"
+  chmod 600 "$target"
+}
+
+render_local_api_config() {
+  local input_file="$1"
+  local output_file="$2"
+
+  awk '
+    /^external-controller:[[:space:]]*/ {
+      if (!controller_seen) {
+        print "external-controller: '\''127.0.0.1:9090'\''"
+        controller_seen = 1
+      }
+      next
+    }
+    { print }
+    END {
+      if (!controller_seen) {
+        print ""
+        print "external-controller: '\''127.0.0.1:9090'\''"
+      }
+    }
+  ' "$input_file" >"$output_file"
+}
+
 download_and_apply_subscription() {
   local url="$1"
   local temporary
+  local curl_config
   local tun_temporary
   local tun_override
   local region_temporary
+  local api_temporary
   local backup
   local status
 
+  ensure_sudo_access || return 1
   temporary="$(mktemp /tmp/mihomo-config.XXXXXX.yaml)" || return
+  curl_config="$(mktemp /tmp/mipilot-subscription-curl.XXXXXX)" || {
+    rm -f -- "$temporary"
+    return 1
+  }
+  if ! create_curl_url_config "$url" "$curl_config"; then
+    rm -f -- "$temporary" "$curl_config"
+    echo "订阅地址无效, 仅支持不含控制字符的 HTTP/HTTPS 地址."
+    return 1
+  fi
   backup=""
 
-  echo "正在下载订阅, 按 Esc 取消..."
-  run_cancellable curl \
+  run_cancellable_named "正在下载订阅" 125 curl \
     -fL \
     -sS \
     --show-error \
     --connect-timeout 20 \
     --max-time 120 \
     -H 'User-Agent: clash.meta' \
-    "$url" \
+    --config "$curl_config" \
     -o "$temporary"
   status=$?
+  rm -f -- "$curl_config"
   if (( status == 130 )); then
     rm -f -- "$temporary"
     return 130
@@ -2540,8 +2742,19 @@ download_and_apply_subscription() {
     mv -f -- "$region_temporary" "$temporary"
   fi
 
-  echo "正在验证新配置, 按 Esc 取消..."
-  run_cancellable sudo "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$temporary"
+  api_temporary="$(mktemp /tmp/mihomo-api-override.XXXXXX.yaml)" || {
+    rm -f -- "$temporary"
+    return 1
+  }
+  if ! render_local_api_config "$temporary" "$api_temporary"; then
+    rm -f -- "$temporary" "$api_temporary"
+    echo "无法将本机API设置合并到新订阅, 现有配置未改变."
+    return 1
+  fi
+  mv -f -- "$api_temporary" "$temporary"
+
+  run_cancellable_named "正在验证新订阅配置" 45 \
+    sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$temporary"
   status=$?
   if (( status == 130 )); then
     rm -f -- "$temporary"
@@ -2565,7 +2778,7 @@ download_and_apply_subscription() {
   }
   rm -f -- "$temporary"
 
-  if ! sudo systemctl restart mihomo; then
+  if ! run_blocking "正在重启 Mihomo 服务" 35 sudo -n systemctl restart mihomo; then
     if rollback_config "$backup"; then
       echo "新配置启动失败, 已自动回滚."
     else
@@ -2574,8 +2787,7 @@ download_and_apply_subscription() {
     return 1
   fi
 
-  sleep 2
-  if ! sudo systemctl is-active --quiet mihomo; then
+  if ! run_blocking "正在等待新订阅稳定运行" 15 wait_for_mihomo_stable 2; then
     if rollback_config "$backup"; then
       echo "新配置未能稳定运行, 已自动回滚."
     else
@@ -2612,6 +2824,7 @@ ensure_subscription_list() {
 
   temporary="$(mktemp /tmp/mihomo-subscriptions.XXXXXX)" || return
   if sudo test -f "$SUBSCRIPTION_LIST_FILE"; then
+    # shellcheck disable=SC2024
     sudo cat "$SUBSCRIPTION_LIST_FILE" >"$temporary" || {
       rm -f -- "$temporary"
       return 1
@@ -2697,6 +2910,7 @@ append_subscription_url() {
 
   temporary="$(mktemp /tmp/mihomo-subscriptions.XXXXXX)" || return
   if sudo test -f "$SUBSCRIPTION_LIST_FILE"; then
+    # shellcheck disable=SC2024
     sudo cat "$SUBSCRIPTION_LIST_FILE" >"$temporary" || {
       rm -f -- "$temporary"
       return 1
@@ -2901,6 +3115,7 @@ delete_managed_subscription() {
   esac
 
   temporary="$(mktemp /tmp/mihomo-subscriptions.XXXXXX)" || return
+  # shellcheck disable=SC2024
   sudo awk -v target="$url" '$0 != target' "$SUBSCRIPTION_LIST_FILE" >"$temporary" || {
     rm -f -- "$temporary"
     return 1
@@ -2927,8 +3142,8 @@ delete_managed_subscription() {
       rm -f -- "$temporary" "$config_temporary"
       return 1
     }
-    echo "正在验证无节点直连配置..."
-    run_cancellable sudo "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$config_temporary"
+    run_cancellable_named "正在验证无节点直连配置" 45 \
+      sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$config_temporary"
     status=$?
     if (( status != 0 )); then
       sudo rm -rf -- "$state_snapshot"
@@ -2950,8 +3165,8 @@ delete_managed_subscription() {
       rm -f -- "$temporary" "$config_temporary"
       return 1
     }
-    if ! sudo systemctl restart mihomo || ! wait_for_mihomo_stable 3; then
-      if ! rollback_config "$backup" || ! wait_for_mihomo_stable 3; then
+    if ! restart_mihomo_with_progress || ! wait_mihomo_with_progress 3; then
+      if ! rollback_config "$backup" || ! wait_mihomo_with_progress 3; then
         echo "严重错误: 原配置自动恢复失败, 请从 ${backup} 手动恢复."
       fi
       restore_manager_runtime_state "$state_snapshot" || true
@@ -3168,7 +3383,7 @@ missing_runtime_commands() {
   local command_name
   local missing=()
 
-  for command_name in awk curl cut find flock gzip grep ip jq sed setsid sha256sum sort ss stat sudo systemctl tr; do
+  for command_name in awk curl cut find flock gzip grep ip jq sed setsid sha256sum sort ss stat sudo systemctl timeout tr; do
     command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
   done
   printf '%s\n' "${missing[*]}"
@@ -3301,7 +3516,7 @@ EOF
 
 rollback_slot_path() {
   case "$1" in
-    core|geo|service) printf '%s/%s\n' "$ROLLBACK_DIR" "$1" ;;
+    core|geo|service|manager) printf '%s/%s\n' "$ROLLBACK_DIR" "$1" ;;
     *) return 1 ;;
   esac
 }
@@ -3354,6 +3569,24 @@ save_component_rollback() {
         sudo touch "${temporary}/absent" || return 1
       fi
       ;;
+    manager)
+      if sudo test -f "$MANAGER_INSTALLED_SCRIPT"; then
+        sudo install -m 755 "$MANAGER_INSTALLED_SCRIPT" "${temporary}/mipilot" || {
+          sudo rm -rf -- "$temporary"
+          return 1
+        }
+      else
+        sudo touch "${temporary}/absent" || return 1
+      fi
+      if sudo test -f "$INSTALL_MARKER"; then
+        sudo install -m 600 "$INSTALL_MARKER" "${temporary}/install-marker" || {
+          sudo rm -rf -- "$temporary"
+          return 1
+        }
+      else
+        sudo touch "${temporary}/install-marker.absent" || return 1
+      fi
+      ;;
   esac
   printf '%s\n' "$(date +%s)" | sudo tee "${temporary}/created_at" >/dev/null || {
     sudo rm -rf -- "$temporary"
@@ -3396,6 +3629,18 @@ restore_component_rollback() {
         sudo install -m 644 "${slot}/mihomo.service" "$SERVICE_FILE"
       fi
       ;;
+    manager)
+      if sudo test -f "${slot}/absent"; then
+        sudo rm -f -- "$MANAGER_INSTALLED_SCRIPT"
+      else
+        atomic_install_file 755 "${slot}/mipilot" "$MANAGER_INSTALLED_SCRIPT" || return 1
+      fi
+      if sudo test -f "${slot}/install-marker"; then
+        atomic_install_file 600 "${slot}/install-marker" "$INSTALL_MARKER" || return 1
+      elif sudo test -f "${slot}/install-marker.absent"; then
+        sudo rm -f -- "$INSTALL_MARKER" || return 1
+      fi
+      ;;
   esac
 }
 
@@ -3406,7 +3651,7 @@ cleanup_expired_rollbacks() {
 
   sudo test -d "$ROLLBACK_DIR" || return 0
   now="$(date +%s)"
-  for slot in core geo service; do
+  for slot in core geo service manager; do
     if sudo test -f "${ROLLBACK_DIR}/${slot}/created_at"; then
       created="$(sudo cat "${ROLLBACK_DIR}/${slot}/created_at" 2>/dev/null || printf '0')"
       if [[ $created =~ ^[0-9]+$ ]] && (( now - created > ROLLBACK_MAX_AGE )); then
@@ -3460,11 +3705,11 @@ wait_for_mihomo_stable() {
 
   for ((index = 0; index < checks; index++)); do
     sleep 1
-    sudo systemctl is-active --quiet mihomo || return 1
+    sudo -n systemctl is-active --quiet mihomo || return 1
   done
-  main_pid="$(sudo systemctl show mihomo -p MainPID --value 2>/dev/null || true)"
+  main_pid="$(sudo -n systemctl show mihomo -p MainPID --value 2>/dev/null || true)"
   [[ $main_pid =~ ^[1-9][0-9]*$ ]] || return 1
-  running_executable="$(sudo readlink -f "/proc/${main_pid}/exe" 2>/dev/null || true)"
+  running_executable="$(sudo -n readlink -f "/proc/${main_pid}/exe" 2>/dev/null || true)"
   [[ $running_executable == "$(readlink -f -- "$MIHOMO_BIN")" ]] || return 1
   refresh_api_config
   if [[ -n $API ]]; then
@@ -3618,7 +3863,9 @@ rollback_local_install() {
   sudo systemctl daemon-reload || failed=1
   if service_exists; then
     restored_version="$(current_core_version)"
-    if ! sudo systemctl enable --now mihomo || ! wait_for_mihomo_stable 3 "$restored_version"; then
+    if ! run_blocking "正在启用并启动 Mihomo 服务" 45 \
+         sudo -n systemctl enable --now mihomo || \
+       ! wait_mihomo_with_progress 3 "$restored_version"; then
       failed=1
     fi
   fi
@@ -3693,7 +3940,8 @@ install_from_local_bundle() {
   save_component_rollback geo || return 1
   save_component_rollback service || return 1
   if service_exists; then
-    if ! sudo systemctl disable --now mihomo; then
+    if ! run_blocking "正在停止旧 Mihomo 服务" 45 \
+         sudo -n systemctl disable --now mihomo; then
       echo "无法停止旧 Mihomo 服务, 尚未替换任何核心文件."
       return 1
     fi
@@ -3739,7 +3987,8 @@ install_from_local_bundle() {
     rollback_local_install "$config_backup" "$had_config"
     return 1
   fi
-  sudo systemctl enable --now mihomo || {
+  run_blocking "正在启用并启动 Mihomo 服务" 45 \
+    sudo -n systemctl enable --now mihomo || {
     rollback_local_install "$config_backup" "$had_config"
     return 1
   }
@@ -3923,10 +4172,33 @@ installed_manager_version() {
 version_is_newer() {
   local candidate="$1"
   local current="$2"
-  local newest
+  local candidate_core
+  local current_core
+  local candidate_pre=""
+  local current_pre=""
+  local -a candidate_parts
+  local -a current_parts
+  local index
 
-  newest="$(printf '%s\n%s\n' "$candidate" "$current" | sort -V | tail -n 1)"
-  [[ $newest == "$candidate" && $candidate != "$current" ]]
+  [[ $candidate =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || return 1
+  [[ $current =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || return 1
+  candidate_core="${candidate%%-*}"
+  current_core="${current%%-*}"
+  [[ $candidate == *-* ]] && candidate_pre="${candidate#*-}"
+  [[ $current == *-* ]] && current_pre="${current#*-}"
+  IFS=. read -r -a candidate_parts <<<"$candidate_core"
+  IFS=. read -r -a current_parts <<<"$current_core"
+  for index in 0 1 2; do
+    if (( 10#${candidate_parts[$index]} > 10#${current_parts[$index]} )); then
+      return 0
+    elif (( 10#${candidate_parts[$index]} < 10#${current_parts[$index]} )); then
+      return 1
+    fi
+  done
+  [[ -z $candidate_pre && -n $current_pre ]] && return 0
+  [[ -n $candidate_pre && -z $current_pre ]] && return 1
+  [[ -n $candidate_pre && -n $current_pre && $candidate_pre != "$current_pre" ]] || return 1
+  [[ $(printf '%s\n%s\n' "$candidate_pre" "$current_pre" | sort -V | tail -n 1) == "$candidate_pre" ]]
 }
 
 offer_local_manager_upgrade() {
@@ -3954,10 +4226,33 @@ current_core_version() {
   fi
 }
 
+start_mihomo_with_progress() {
+  ensure_sudo_access || return 1
+  run_blocking "正在启动 Mihomo 服务" 35 sudo -n systemctl start mihomo
+}
+
+restart_mihomo_with_progress() {
+  ensure_sudo_access || return 1
+  run_blocking "正在重启 Mihomo 服务" 35 sudo -n systemctl restart mihomo
+}
+
+stop_mihomo_with_progress() {
+  ensure_sudo_access || return 1
+  run_blocking "正在停止 Mihomo 服务" 35 sudo -n systemctl stop mihomo
+}
+
+wait_mihomo_with_progress() {
+  local checks="${1:-3}"
+  local expected_version="${2:-}"
+
+  run_blocking "正在等待 Mihomo 服务稳定" 20 \
+    wait_for_mihomo_stable "$checks" "$expected_version"
+}
+
 stop_mihomo_for_update() {
-  if ! sudo systemctl stop mihomo; then
+  if ! stop_mihomo_with_progress; then
     if ! sudo systemctl is-active --quiet mihomo; then
-      sudo systemctl start mihomo >/dev/null 2>&1 || true
+      start_mihomo_with_progress >/dev/null 2>&1 || true
     fi
     return 1
   fi
@@ -3965,7 +4260,7 @@ stop_mihomo_for_update() {
 }
 
 recover_core_after_failed_update() {
-  if restore_component_rollback core && sudo systemctl restart mihomo && wait_for_mihomo_stable 3; then
+  if restore_component_rollback core && restart_mihomo_with_progress && wait_mihomo_with_progress 3; then
     echo "新内核启动失败, 已恢复上一个版本."
     return 0
   fi
@@ -3974,7 +4269,7 @@ recover_core_after_failed_update() {
 }
 
 recover_geo_after_failed_update() {
-  if restore_component_rollback geo && sudo systemctl restart mihomo && wait_for_mihomo_stable 3; then
+  if restore_component_rollback geo && restart_mihomo_with_progress && wait_mihomo_with_progress 3; then
     echo "新地理数据未能稳定运行, 已恢复上一个版本."
     return 0
   fi
@@ -3999,7 +4294,8 @@ download_file() {
     else
       echo "正在重试: ${label} (${attempt}/3)"
     fi
-    run_cancellable curl -4 -fL -sS --show-error --connect-timeout 15 --max-time 180 \
+    run_cancellable_named "正在下载 ${label}" 185 \
+      curl -4 -fL -sS --show-error --connect-timeout 15 --max-time 180 \
       "$url" -o "$output_file"
     status=$?
     if (( status == 0 )); then
@@ -4060,8 +4356,8 @@ update_core_from_archive() {
     esac
   fi
 
-  echo "正在用新内核验证现有配置..."
-  run_cancellable sudo "$staged" -t -d "$CONFIG_DIR"
+  run_cancellable_named "正在用新内核验证现有配置" 45 \
+    sudo -n "$staged" -t -d "$CONFIG_DIR"
   status=$?
   if (( status != 0 )); then
     rm -f -- "$staged"
@@ -4082,7 +4378,7 @@ update_core_from_archive() {
     return 1
   }
   rm -f -- "$staged"
-  if ! sudo systemctl start mihomo || ! wait_for_mihomo_stable 3 "$new_version"; then
+  if ! start_mihomo_with_progress || ! wait_mihomo_with_progress 3 "$new_version"; then
     recover_core_after_failed_update || true
     return 1
   fi
@@ -4109,7 +4405,7 @@ rules:
   - GEOIP,cn,DIRECT,no-resolve
   - MATCH,DIRECT
 EOF
-  sudo "$MIHOMO_BIN" -t -d "$validation_dir" -f "${validation_dir}/config.yaml"
+  sudo -n "$MIHOMO_BIN" -t -d "$validation_dir" -f "${validation_dir}/config.yaml"
   local status=$?
   rm -rf -- "$validation_dir"
   return "$status"
@@ -4123,8 +4419,9 @@ update_geo_from_files() {
   local new_country_hash
   local new_geosite_hash
 
-  echo "正在验证 Country.mmdb 和 GeoSite.dat..."
-  validate_geo_files "$country_file" "$geosite_file" || return 1
+  ensure_sudo_access || return 1
+  run_blocking "正在验证 Country.mmdb 和 GeoSite.dat" 60 \
+    validate_geo_files "$country_file" "$geosite_file" || return 1
   if sudo test -f "${CONFIG_DIR}/Country.mmdb"; then
     current_country_hash="$(sudo sha256sum "${CONFIG_DIR}/Country.mmdb" | awk '{print $1}')"
   fi
@@ -4151,7 +4448,9 @@ update_geo_from_files() {
     recover_geo_after_failed_update || true
     return 1
   }
-  if ! sudo "$MIHOMO_BIN" -t -d "$CONFIG_DIR" || ! sudo systemctl start mihomo || ! wait_for_mihomo_stable 3; then
+  if ! run_cancellable_named "正在验证更新后的地理数据" 45 \
+       sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" || \
+     ! start_mihomo_with_progress || ! wait_mihomo_with_progress 3; then
     recover_geo_after_failed_update || true
     return 1
   fi
@@ -4215,6 +4514,120 @@ verify_sha256_sidecar() {
   expected="$(awk 'NR == 1 { print $1; exit }' "$sidecar")"
   actual="$(sha256sum "$file" | awk '{print $1}')"
   [[ $expected =~ ^[0-9a-fA-F]{64}$ && ${expected,,} == "$actual" ]]
+}
+
+manager_version_from_script() {
+  local script="$1"
+
+  awk -F'"' '
+    /^MANAGER_VERSION="[0-9]+[.][0-9]+[.][0-9]+(-[0-9A-Za-z.-]+)?"$/ {
+      count++
+      version = $2
+    }
+    END {
+      if (count == 1) print version
+      else exit 1
+    }
+  ' "$script"
+}
+
+write_manager_install_marker() {
+  local version="$1"
+  local temporary
+
+  temporary="$(mktemp /tmp/mipilot-marker.XXXXXX)" || return 1
+  {
+    printf 'version=%s\n' "$version"
+    printf 'installed_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'installed_by=%s\n' "${USER:-unknown}"
+  } >"$temporary"
+  atomic_install_file 600 "$temporary" "$INSTALL_MARKER"
+  local status=$?
+  rm -f -- "$temporary"
+  return "$status"
+}
+
+online_update_manager() {
+  local temporary_dir
+  local candidate
+  local sidecar
+  local candidate_version
+  local status
+
+  temporary_dir="$(mktemp -d /tmp/mipilot-manager-update.XXXXXX)" || return 1
+  candidate="${temporary_dir}/mipilot"
+  sidecar="${temporary_dir}/mipilot.sha256"
+  download_file "${MANAGER_RELEASE_BASE}/mipilot" "$candidate" "MiPilot 稳定版脚本" || {
+    rm -rf -- "$temporary_dir"
+    echo "无法下载稳定版管理脚本, 当前版本未改变."
+    return 1
+  }
+  download_file "${MANAGER_RELEASE_BASE}/mipilot.sha256" "$sidecar" "MiPilot 脚本摘要" || {
+    rm -rf -- "$temporary_dir"
+    echo "无法下载脚本摘要, 当前版本未改变."
+    return 1
+  }
+  if ! verify_sha256_sidecar "$candidate" "$sidecar"; then
+    rm -rf -- "$temporary_dir"
+    echo "MiPilot SHA-256 校验失败, 当前版本未改变."
+    return 1
+  fi
+  if ! head -n 1 "$candidate" | grep -Fqx '#!/usr/bin/env bash' || \
+     ! grep -Fq 'MANAGER_INSTALLED_SCRIPT=' "$candidate" || \
+     ! run_cancellable_named "正在检查新管理脚本语法" 20 bash -n "$candidate"; then
+    rm -rf -- "$temporary_dir"
+    echo "下载的文件不是有效的 MiPilot 管理脚本."
+    return 1
+  fi
+  candidate_version="$(manager_version_from_script "$candidate")" || {
+    rm -rf -- "$temporary_dir"
+    echo "无法识别新管理脚本版本."
+    return 1
+  }
+  if [[ ! $candidate_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    rm -rf -- "$temporary_dir"
+    echo "在线更新只接受稳定版本, 已拒绝 ${candidate_version}."
+    return 1
+  fi
+  echo "当前 MiPilot: ${MANAGER_VERSION}"
+  echo "最新稳定版: ${candidate_version}"
+  if [[ $candidate_version == "$MANAGER_VERSION" ]]; then
+    rm -rf -- "$temporary_dir"
+    echo "当前已经是最新稳定版."
+    return 0
+  fi
+  if ! version_is_newer "$candidate_version" "$MANAGER_VERSION"; then
+    rm -rf -- "$temporary_dir"
+    echo "稳定Release版本不高于当前版本, 已拒绝自动降级."
+    return 1
+  fi
+
+  read_line_or_back "确认更新 MiPilot 到 ${candidate_version}? (y/N, Esc返回): "
+  status=$?
+  if (( status != 0 )); then rm -rf -- "$temporary_dir"; return "$status"; fi
+  case "${INPUT_LINE,,}" in
+    y|yes) ;;
+    *) rm -rf -- "$temporary_dir"; echo "已取消管理器更新."; return 130 ;;
+  esac
+
+  ensure_sudo_access || { rm -rf -- "$temporary_dir"; return 1; }
+  save_component_rollback manager || {
+    rm -rf -- "$temporary_dir"
+    echo "无法保存当前管理器, 已取消更新."
+    return 1
+  }
+  chmod 755 "$candidate"
+  if ! atomic_install_file 755 "$candidate" "$MANAGER_INSTALLED_SCRIPT" || \
+     ! write_manager_install_marker "$candidate_version"; then
+    restore_component_rollback manager || true
+    rm -rf -- "$temporary_dir"
+    echo "管理器更新失败, 已尝试恢复原版本."
+    return 1
+  fi
+  rm -rf -- "$temporary_dir"
+  echo "MiPilot 已更新到 ${candidate_version}."
+  echo "当前菜单仍是旧进程, 退出后请重新执行 mipilot."
+  MANAGER_SHOULD_EXIT=1
 }
 
 online_update_geo() {
@@ -4295,21 +4708,21 @@ validate_combined_update() {
   local validation_dir
 
   validation_dir="$(mktemp -d /tmp/mihomo-combined-validation.XXXXXX)" || return 1
-  sudo cp -a "${CONFIG_DIR}/." "$validation_dir/" || {
-    sudo rm -rf -- "$validation_dir"
+  sudo -n cp -a "${CONFIG_DIR}/." "$validation_dir/" || {
+    sudo -n rm -rf -- "$validation_dir"
     return 1
   }
-  sudo install -m 644 "$country_file" "${validation_dir}/Country.mmdb" || {
-    sudo rm -rf -- "$validation_dir"
+  sudo -n install -m 644 "$country_file" "${validation_dir}/Country.mmdb" || {
+    sudo -n rm -rf -- "$validation_dir"
     return 1
   }
-  sudo install -m 644 "$geosite_file" "${validation_dir}/GeoSite.dat" || {
-    sudo rm -rf -- "$validation_dir"
+  sudo -n install -m 644 "$geosite_file" "${validation_dir}/GeoSite.dat" || {
+    sudo -n rm -rf -- "$validation_dir"
     return 1
   }
-  sudo "$staged_core" -t -d "$validation_dir"
+  sudo -n "$staged_core" -t -d "$validation_dir"
   local status=$?
-  sudo rm -rf -- "$validation_dir"
+  sudo -n rm -rf -- "$validation_dir"
   return "$status"
 }
 
@@ -4321,7 +4734,8 @@ recover_combined_update() {
 
   if (( restore_core == 1 )); then restore_component_rollback core || restored=1; fi
   if (( restore_geo == 1 )); then restore_component_rollback geo || restored=1; fi
-  if (( restored == 0 )) && sudo systemctl restart mihomo && wait_for_mihomo_stable 3 "$expected_old_version"; then
+  if (( restored == 0 )) && restart_mihomo_with_progress && \
+     wait_mihomo_with_progress 3 "$expected_old_version"; then
     echo "组件更新失败, 已恢复更新前的内核和地理数据."
     return 0
   fi
@@ -4380,8 +4794,8 @@ update_all_from_files() {
     return 0
   fi
 
-  echo "正在同时验证 ${source_label} 中的内核和地理数据..."
-  validate_combined_update "$staged_core" "$country_file" "$geosite_file" || {
+  run_blocking "正在验证 ${source_label} 中的内核和地理数据" 60 \
+    validate_combined_update "$staged_core" "$country_file" "$geosite_file" || {
     rm -f -- "$staged_core"
     return 1
   }
@@ -4409,9 +4823,10 @@ update_all_from_files() {
       }
   fi
   rm -f -- "$staged_core"
-  if ! sudo "$MIHOMO_BIN" -t -d "$CONFIG_DIR" ||
-     ! sudo systemctl restart mihomo ||
-     ! wait_for_mihomo_stable 3 "$new_version"; then
+  if ! run_cancellable_named "正在验证组合更新配置" 45 \
+       sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" ||
+     ! restart_mihomo_with_progress ||
+     ! wait_mihomo_with_progress 3 "$new_version"; then
     recover_combined_update "$core_changed" "$geo_changed" "$current_version" || true
     return 1
   fi
@@ -4489,6 +4904,7 @@ rollback_is_usable() {
   case "$kind" in
     core) sudo test -x "${slot}/mihomo" ;;
     geo) sudo test -f "${slot}/Country.mmdb" && sudo test -f "${slot}/GeoSite.dat" ;;
+    manager) sudo test -f "${slot}/mipilot" ;;
   esac
 }
 
@@ -4512,7 +4928,7 @@ manual_rollback_core() {
     return 1
   fi
   if ! restore_component_rollback core; then
-    if atomic_install_file 755 "$current" "$MIHOMO_BIN" && sudo systemctl start mihomo && wait_for_mihomo_stable 3 "$current_version"; then
+    if atomic_install_file 755 "$current" "$MIHOMO_BIN" && start_mihomo_with_progress && wait_mihomo_with_progress 3 "$current_version"; then
       sudo rm -f -- "$current"
       echo "回退文件写入失败, 已恢复回退前内核."
     else
@@ -4520,8 +4936,9 @@ manual_rollback_core() {
     fi
     return 1
   fi
-  if ! sudo "$MIHOMO_BIN" -t -d "$CONFIG_DIR" || ! sudo systemctl restart mihomo || ! wait_for_mihomo_stable 3; then
-    if atomic_install_file 755 "$current" "$MIHOMO_BIN" && sudo systemctl restart mihomo && wait_for_mihomo_stable 3; then
+  if ! run_cancellable_named "正在验证回退内核" 45 sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" || \
+     ! restart_mihomo_with_progress || ! wait_mihomo_with_progress 3; then
+    if atomic_install_file 755 "$current" "$MIHOMO_BIN" && restart_mihomo_with_progress && wait_mihomo_with_progress 3; then
       echo "回退内核未能运行, 已恢复回退前版本."
     else
       echo "严重错误: 回退内核和回退前版本均未能恢复, 当前副本位于 ${current}."
@@ -4561,7 +4978,7 @@ manual_rollback_geo() {
   if ! restore_component_rollback geo; then
     if atomic_install_file 644 "${current_dir}/Country.mmdb" "${CONFIG_DIR}/Country.mmdb" &&
        atomic_install_file 644 "${current_dir}/GeoSite.dat" "${CONFIG_DIR}/GeoSite.dat" &&
-       sudo systemctl start mihomo && wait_for_mihomo_stable 3 "$current_version"; then
+       start_mihomo_with_progress && wait_mihomo_with_progress 3 "$current_version"; then
       sudo rm -rf -- "$current_dir"
       echo "回退文件写入失败, 已恢复回退前地理数据."
     else
@@ -4569,10 +4986,11 @@ manual_rollback_geo() {
     fi
     return 1
   fi
-  if ! sudo "$MIHOMO_BIN" -t -d "$CONFIG_DIR" || ! sudo systemctl restart mihomo || ! wait_for_mihomo_stable 3; then
+  if ! run_cancellable_named "正在验证回退地理数据" 45 sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" || \
+     ! restart_mihomo_with_progress || ! wait_mihomo_with_progress 3; then
     if atomic_install_file 644 "${current_dir}/Country.mmdb" "${CONFIG_DIR}/Country.mmdb" &&
        atomic_install_file 644 "${current_dir}/GeoSite.dat" "${CONFIG_DIR}/GeoSite.dat" &&
-       sudo systemctl restart mihomo && wait_for_mihomo_stable 3; then
+       restart_mihomo_with_progress && wait_mihomo_with_progress 3; then
       sudo rm -rf -- "$current_dir"
       echo "回退地理数据未能运行, 已恢复回退前版本."
     else
@@ -4583,6 +5001,54 @@ manual_rollback_geo() {
   sudo rm -rf -- "$current_dir"
   sudo rm -rf -- "${ROLLBACK_DIR:?}/geo"
   echo "地理数据已回退到最近一次保留版本."
+}
+
+manual_rollback_manager() {
+  local current
+  local current_marker
+  local restored_version
+  local had_current_marker=0
+
+  rollback_is_usable manager || {
+    echo "没有可用的 MiPilot 管理器回退版本."
+    return 1
+  }
+  current="$(mktemp /tmp/mipilot-current-manager.XXXXXX)" || return 1
+  current_marker="$(mktemp /tmp/mipilot-current-marker.XXXXXX)" || {
+    rm -f -- "$current"
+    return 1
+  }
+  sudo install -m 755 "$MANAGER_INSTALLED_SCRIPT" "$current" || {
+    rm -f -- "$current" "$current_marker"
+    return 1
+  }
+  if sudo test -f "$INSTALL_MARKER"; then
+    had_current_marker=1
+    sudo install -m 600 "$INSTALL_MARKER" "$current_marker" || {
+      rm -f -- "$current" "$current_marker"
+      return 1
+    }
+  else
+    : >"$current_marker"
+  fi
+  if ! restore_component_rollback manager || \
+     ! sudo bash -n "$MANAGER_INSTALLED_SCRIPT"; then
+    atomic_install_file 755 "$current" "$MANAGER_INSTALLED_SCRIPT" || true
+    if (( had_current_marker == 1 )); then
+      atomic_install_file 600 "$current_marker" "$INSTALL_MARKER" || true
+    else
+      sudo rm -f -- "$INSTALL_MARKER" || true
+    fi
+    rm -f -- "$current" "$current_marker"
+    echo "管理器回退失败, 已尝试恢复回退前版本."
+    return 1
+  fi
+  restored_version="$(sudo awk -F'"' '/^MANAGER_VERSION=/{print $2; exit}' "$MANAGER_INSTALLED_SCRIPT")"
+  sudo rm -rf -- "${ROLLBACK_DIR:?}/manager"
+  rm -f -- "$current" "$current_marker"
+  echo "MiPilot 已回退到 ${restored_version:-上一版本}."
+  echo "当前菜单仍是旧进程, 退出后请重新执行 mipilot."
+  MANAGER_SHOULD_EXIT=1
 }
 
 rollback_components_menu() {
@@ -4599,6 +5065,10 @@ rollback_components_menu() {
     kinds+=("geo")
     options+=("Country.mmdb + GeoSite.dat [保存于: $(rollback_created_label geo)]")
   fi
+  if rollback_is_usable manager; then
+    kinds+=("manager")
+    options+=("MiPilot 管理器 [保存于: $(rollback_created_label manager)]")
+  fi
   if (( ${#options[@]} == 0 )); then
     echo "没有仍在72小时保留期内的组件版本."
     return 0
@@ -4609,6 +5079,7 @@ rollback_components_menu() {
       case "${kinds[$index]}" in
         core) manual_rollback_core ;;
         geo) manual_rollback_geo ;;
+        manager) manual_rollback_manager ;;
       esac
       return $?
     fi
@@ -4633,6 +5104,7 @@ show_component_status() {
   echo "配置备份: $(sudo find "$BACKUP_DIR" -maxdepth 1 -type f -name 'config-*.yaml' 2>/dev/null | wc -l | tr -d ' ') / ${BACKUP_LIMIT}"
   if rollback_is_usable core; then echo "可回退内核: $(rollback_created_label core)前版本"; fi
   if rollback_is_usable geo; then echo "可回退地理数据: $(rollback_created_label geo)前版本"; fi
+  if rollback_is_usable manager; then echo "可回退管理器: $(rollback_created_label manager)前版本"; fi
 }
 
 update_menu() {
@@ -4643,11 +5115,12 @@ update_menu() {
     clear
     echo "================ 更新与版本回退 ================"
     echo " 1) 在线更新全部组件"
-    echo " 2) 在线更新 Mihomo 内核"
-    echo " 3) 在线更新 Country.mmdb 和 GeoSite.dat"
-    echo " 4) 使用本地文件更新"
-    echo " 5) 回退最近一次内核或数据更新"
-    echo " 6) 显示手动下载说明"
+    echo " 2) 在线更新 MiPilot 管理器"
+    echo " 3) 在线更新 Mihomo 内核"
+    echo " 4) 在线更新 Country.mmdb 和 GeoSite.dat"
+    echo " 5) 使用本地文件更新"
+    echo " 6) 回退最近一次更新"
+    echo " 7) 显示手动下载说明"
     echo " 0) 返回"
     echo "=================================================="
     read_choice_or_back "请选择(Esc/0返回): " || return 130
@@ -4655,11 +5128,12 @@ update_menu() {
     echo
     case "$choice" in
       1) run_action online_update_all ;;
-      2) run_action online_update_core ;;
-      3) run_action online_update_geo ;;
-      4) run_action local_update_all ;;
-      5) run_action rollback_components_menu ;;
-      6) run_action show_manual_download_help ;;
+      2) run_action online_update_manager; (( MANAGER_SHOULD_EXIT == 1 )) && return 130 ;;
+      3) run_action online_update_core ;;
+      4) run_action online_update_geo ;;
+      5) run_action local_update_all ;;
+      6) run_action rollback_components_menu; (( MANAGER_SHOULD_EXIT == 1 )) && return 130 ;;
+      7) run_action show_manual_download_help ;;
       0) return 130 ;;
       *) echo "无效选项."; pause ;;
     esac
@@ -4712,7 +5186,8 @@ restore_config_backup_menu() {
   [[ -n $selected_backup ]] || return 1
   selected_copy="$(mktemp /tmp/mihomo-restore-config.XXXXXX.yaml)" || return 1
   sudo install -m 600 "$selected_backup" "$selected_copy" || return 1
-  run_cancellable sudo "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$selected_copy" || {
+  run_cancellable_named "正在验证备份配置" 45 \
+    sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$selected_copy" || {
     sudo rm -f -- "$selected_copy"
     echo "备份配置验证失败, 未执行恢复."
     return 1
@@ -4726,8 +5201,8 @@ restore_config_backup_menu() {
     return 1
   }
   sudo rm -f -- "$selected_copy"
-  if ! sudo systemctl restart mihomo || ! wait_for_mihomo_stable 3; then
-    if rollback_config "$current_backup" && wait_for_mihomo_stable 3; then
+  if ! restart_mihomo_with_progress || ! wait_mihomo_with_progress 3; then
+    if rollback_config "$current_backup" && wait_mihomo_with_progress 3; then
       echo "恢复后的配置无法运行, 已自动恢复原配置."
     else
       echo "严重错误: 配置恢复失败且原配置未能自动恢复, 请使用 ${current_backup} 手动处理."
@@ -4764,12 +5239,11 @@ backup_menu() {
 }
 
 toggle_service_state() {
+  ensure_sudo_access || return 1
   if systemctl is-active --quiet mihomo; then
-    echo "正在停止 Mihomo 服务..."
-    sudo systemctl stop mihomo
+    stop_mihomo_with_progress
   else
-    echo "正在启动 Mihomo 服务..."
-    sudo systemctl start mihomo
+    start_mihomo_with_progress
   fi
   echo "当前状态: $(systemctl is-active mihomo 2>/dev/null || true)"
 }
@@ -4782,9 +5256,10 @@ redact_sensitive_output() {
 }
 
 generate_diagnostic_report() {
-  local report="${USER_HOME}/mihomo-diagnostic-$(date +%Y%m%d-%H%M%S).txt"
+  local report
   local validation
 
+  report="${USER_HOME}/mihomo-diagnostic-$(date +%Y%m%d-%H%M%S).txt"
   validation="$(sudo "$MIHOMO_BIN" -t -d "$CONFIG_DIR" 2>&1 || true)"
   {
     echo "mipilot Diagnostic"
@@ -4830,8 +5305,8 @@ repair_installation_menu() {
          ! install_manager_files ||
          ! sudo systemctl daemon-reload ||
          ! sudo systemctl enable mihomo ||
-         ! sudo systemctl restart mihomo ||
-         ! wait_for_mihomo_stable 3 "$current_version"; then
+         ! restart_mihomo_with_progress ||
+         ! wait_mihomo_with_progress 3 "$current_version"; then
         if restore_component_rollback service && sudo systemctl daemon-reload; then
           if service_exists; then
             sudo systemctl enable --now mihomo >/dev/null 2>&1 || true
@@ -4879,7 +5354,8 @@ remove_managed_installation() {
   unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY no_proxy NO_PROXY
   export MIHOMO_PROXY_ENABLED=0
   if service_exists || systemctl is-active --quiet mihomo 2>/dev/null; then
-    if ! sudo systemctl disable --now mihomo; then
+    if ! run_blocking "正在停止并禁用 Mihomo 服务" 45 \
+         sudo -n systemctl disable --now mihomo; then
       echo "无法停止 Mihomo 服务, 为避免残留运行进程, 已中止卸载."
       return 1
     fi
@@ -4963,8 +5439,9 @@ uninstall_menu() {
 test_and_restart() {
   local status
 
-  echo "正在验证配置, 按 Esc 取消..."
-  run_cancellable sudo "$MIHOMO_BIN" -t -d "$CONFIG_DIR"
+  ensure_sudo_access || return 1
+  run_cancellable_named "正在验证 Mihomo 配置" 45 \
+    sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR"
   status=$?
   if (( status == 130 )); then return 130; fi
   if (( status != 0 )); then
@@ -4972,12 +5449,11 @@ test_and_restart() {
     return 1
   fi
 
-  echo "配置验证成功, 正在重启服务; 此阶段不应中断."
-  if ! sudo systemctl restart mihomo; then
+  if ! restart_mihomo_with_progress; then
     echo "服务重启失败."
     return 1
   fi
-  sleep 1
+  wait_mihomo_with_progress 1 || return 1
   sudo systemctl status mihomo --no-pager -l
 }
 
@@ -5020,7 +5496,7 @@ EOF
       4) run_action show_component_status ;;
       5) update_menu ;;
       6) backup_menu ;;
-      7) run_action generate_diagnostic_report ;;
+      7) run_action run_blocking "正在生成脱敏诊断报告" 60 generate_diagnostic_report ;;
       8) run_action repair_installation_menu ;;
       9) run_action uninstall_menu ;;
       0) return 130 ;;
@@ -5033,7 +5509,7 @@ check_dependencies() {
   local missing=()
   local command_name
 
-  for command_name in awk curl cut find flock gzip grep ip jq sed setsid sha256sum sort ss stat sudo systemctl tr; do
+  for command_name in awk curl cut find flock gzip grep ip jq sed setsid sha256sum sort ss stat sudo systemctl timeout tr; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
       missing+=("$command_name")
     fi
@@ -5128,8 +5604,10 @@ main() {
   migrate_legacy_backups || true
   cleanup_expired_rollbacks || true
   if [[ $(tun_config_value) == true ]]; then
-    refresh_tun_bypass_ports || echo "警告: 无法刷新公网服务端口保护列表."
-    sync_tun_bypass_rules || echo "警告: 无法同步公网服务返回流量保护规则."
+    run_blocking "正在刷新公网服务端口保护" 15 refresh_tun_bypass_ports || \
+      echo "警告: 无法刷新公网服务端口保护列表."
+    run_blocking "正在同步公网服务返回路由" 15 sync_tun_bypass_rules || \
+      echo "警告: 无法同步公网服务返回流量保护规则."
   fi
   refresh_api_config
   sync_proxy_state

@@ -58,6 +58,12 @@ assert_line_count() {
   assert_equal "$expected" "$actual" "$description"
 }
 
+run_as_mock_sudo() {
+  while [[ ${1:-} == -n ]]; do shift; done
+  [[ ${1:-} == -v ]] && return 0
+  "$@"
+}
+
 make_temp_dir() {
   mktemp -d "${TMPDIR:-/tmp}/mipilot-test.XXXXXX"
 }
@@ -68,6 +74,7 @@ register_temp_dir_cleanup() {
 }
 
 load_manager() {
+  # shellcheck disable=SC2034
   MIPILOT_TESTING=1
   # shellcheck source=/dev/null
   source "$MANAGER_SCRIPT"
@@ -201,7 +208,7 @@ test_prune_config_backups() {
   printf 'keep\n' >"$BACKUP_DIR/nested/config-nested.yaml"
 
   sudo() {
-    command "$@"
+    run_as_mock_sudo "$@"
   }
 
   prune_config_backups 3 || return 1
@@ -232,7 +239,7 @@ test_cleanup_expired_rollbacks() {
   printf '%s\n' "$((now - 71 * 60 * 60))" >"$ROLLBACK_DIR/geo/created_at"
 
   sudo() {
-    command "$@"
+    run_as_mock_sudo "$@"
   }
 
   cleanup_expired_rollbacks || return 1
@@ -252,6 +259,7 @@ test_detect_install_state() {
 
   MIHOMO_BIN="$root/usr/local/bin/mihomo"
   CONFIG_FILE="$root/etc/mihomo/config.yaml"
+  # shellcheck disable=SC2034
   SERVICE_FILE="$root/etc/systemd/system/mihomo.service"
   CLEANUP_SERVICE_FILE="$root/etc/systemd/system/mipilot-cleanup.service"
   CLEANUP_TIMER_FILE="$root/etc/systemd/system/mipilot-cleanup.timer"
@@ -262,6 +270,7 @@ test_detect_install_state() {
   MOCK_SYSTEMCTL_SERVICE=0
 
   sudo() {
+    while [[ ${1:-} == -n ]]; do shift; done
     if [[ ${1:-} == test ]]; then
       shift
       builtin test "$@"
@@ -325,7 +334,7 @@ test_manager_lock_release() {
   LOCK_FILE="$root/mipilot.lock"
 
   sudo() {
-    command "$@"
+    run_as_mock_sudo "$@"
   }
 
   acquire_manager_lock || return 1
@@ -366,7 +375,8 @@ test_download_uses_curl_without_forced_proxy() {
   load_manager || return 1
   arguments_file="$root/curl-arguments"
 
-  run_cancellable() {
+  run_cancellable_named() {
+    shift 2
     printf '%s\n' "$@" >>"$arguments_file"
     return 0
   }
@@ -411,8 +421,12 @@ test_detect_public_service_ports() {
     fi
     return 0
   }
-  sudo() {
+  timeout() {
+    shift
     "$@"
+  }
+  sudo() {
+    run_as_mock_sudo "$@"
   }
 
   output="$(detect_public_service_ports)" || return 1
@@ -432,7 +446,7 @@ test_sync_tun_bypass_rules() {
   : >"$rules_file"
 
   sudo() {
-    "$@"
+    run_as_mock_sudo "$@"
   }
   ip() {
     if [[ ${1:-} == rule && ${2:-} == show ]]; then
@@ -470,7 +484,7 @@ test_render_tun_server_compatibility() {
   register_temp_dir_cleanup "$root"
   load_manager || return 1
   sudo() {
-    "$@"
+    run_as_mock_sudo "$@"
   }
   input_file="$root/input.yaml"
   output_file="$root/output.yaml"
@@ -506,6 +520,7 @@ test_render_minimal_config() {
   printf 'secret: old-secret\n' >"$CONFIG_FILE"
 
   sudo() {
+    while [[ ${1:-} == -n ]]; do shift; done
     if [[ ${1:-} == test ]]; then
       shift
       builtin test "$@"
@@ -634,6 +649,205 @@ test_version_is_newer() {
     fail "downgrade version must not be considered newer"
     return 1
   fi
+  version_is_newer "1.0.0" "1.0.0-dev" || {
+    fail "stable release was not considered newer than development build"
+    return 1
+  }
+  if version_is_newer "1.0.0-dev" "1.0.0"; then
+    fail "development build must not replace the matching stable release"
+    return 1
+  fi
+  if version_is_newer "invalid" "1.0.0"; then
+    fail "invalid semantic version was accepted"
+    return 1
+  fi
+}
+
+test_progress_runner_non_tty() {
+  local output
+  local status=0
+
+  load_manager || return 1
+  progress_fixture() {
+    sleep 0.4
+    printf 'result'
+  }
+  output="$(run_blocking "测试耗时操作" 3 progress_fixture 2>&1)" || status=$?
+  assert_equal "0" "$status" "progress runner status" || return 1
+  [[ $output == *"测试耗时操作..."* ]] || fail "non-TTY progress start was missing"
+  [[ $output == *"result"* ]] || fail "progress command output was missing"
+  [[ $output != *"Done"* ]] || fail "background completion noise leaked into output"
+}
+
+test_api_secret_not_in_arguments() {
+  local root
+  local args_file
+  local header_file
+  local header_path_file
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  args_file="$root/args"
+  header_path_file="$root/header-path"
+  # shellcheck disable=SC2034
+  API_SECRET="secret-value"
+  curl() {
+    printf '%s\n' "$@" >"$args_file"
+    while (( $# > 0 )); do
+      if [[ $1 == -H && ${2:-} == @* ]]; then
+        header_file="${2#@}"
+        printf '%s\n' "$header_file" >"$header_path_file"
+        grep -Fq 'Authorization: Bearer secret-value' "$header_file" || return 1
+        shift 2
+      else
+        shift
+      fi
+    done
+    printf '{}'
+  }
+  api_quick 'http://127.0.0.1:9090/configs' >/dev/null || return 1
+  if grep -Fq 'secret-value' "$args_file"; then
+    fail "API secret leaked into curl arguments"
+    return 1
+  fi
+  header_file="$(cat "$header_path_file")"
+  [[ -n ${header_file:-} && ! -e $header_file ]] || fail "temporary API header file was not removed"
+}
+
+test_secure_subscription_curl_config() {
+  local root
+  local config
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  config="$root/curl.conf"
+  create_curl_url_config 'https://example.test/sub?token=abc' "$config" || return 1
+  assert_file_has_line "$config" 'url = "https://example.test/sub?token=abc"' "subscription curl config" || return 1
+  if create_curl_url_config $'https://example.test/sub\nheader=x' "$config"; then
+    fail "subscription URL containing a newline was accepted"
+    return 1
+  fi
+}
+
+test_local_api_config_rendering() {
+  local root
+  local input_file
+  local output_file
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  input_file="$root/input.yaml"
+  output_file="$root/output.yaml"
+  printf '%s\n' \
+    'mixed-port: 7890' \
+    "external-controller: '0.0.0.0:9090'" \
+    'rules:' \
+    '  - MATCH,DIRECT' >"$input_file"
+
+  render_local_api_config "$input_file" "$output_file" || return 1
+  assert_file_has_line "$output_file" "external-controller: '127.0.0.1:9090'" "local API controller" || return 1
+  if grep -Fq '0.0.0.0:9090' "$output_file"; then
+    fail "public API controller was retained"
+    return 1
+  fi
+  assert_line_count "$output_file" "external-controller: '127.0.0.1:9090'" 1 "API controller count" || return 1
+
+  grep -v '^external-controller:' "$input_file" >"$root/without-controller.yaml"
+  render_local_api_config "$root/without-controller.yaml" "$output_file" || return 1
+  assert_line_count "$output_file" "external-controller: '127.0.0.1:9090'" 1 "appended API controller count" || return 1
+}
+
+test_manager_candidate_validation_helpers() {
+  local root
+  local candidate
+  local sidecar
+  local hash
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  candidate="$root/mipilot"
+  sidecar="$root/mipilot.sha256"
+  printf '#!/usr/bin/env bash\nMANAGER_VERSION="1.2.3"\n' >"$candidate"
+  assert_equal "1.2.3" "$(manager_version_from_script "$candidate")" "candidate manager version" || return 1
+  hash="$(sha256sum "$candidate" | awk '{print $1}')"
+  printf '%s  mipilot\n' "$hash" >"$sidecar"
+  verify_sha256_sidecar "$candidate" "$sidecar" || fail "valid manager sidecar was rejected"
+  printf '0%.0s' {1..64} >"$sidecar"
+  if verify_sha256_sidecar "$candidate" "$sidecar"; then
+    fail "invalid manager sidecar was accepted"
+    return 1
+  fi
+}
+
+test_online_manager_update_and_rollback() {
+  local root
+  local release_script
+  local release_sidecar
+  local hash
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  MANAGER_VERSION="1.0.0-dev"
+  MANAGER_LIB_DIR="$root/usr/local/lib/mipilot"
+  MANAGER_INSTALLED_SCRIPT="$MANAGER_LIB_DIR/mipilot"
+  INSTALL_MARKER="$root/var/lib/mipilot/install-marker"
+  ROLLBACK_DIR="$root/var/lib/mipilot/rollback"
+  mkdir -p -- "$MANAGER_LIB_DIR" "$(dirname -- "$INSTALL_MARKER")"
+  printf '#!/usr/bin/env bash\nMANAGER_VERSION="1.0.0-dev"\n' >"$MANAGER_INSTALLED_SCRIPT"
+  chmod 755 "$MANAGER_INSTALLED_SCRIPT"
+  printf 'version=1.0.0-dev\n' >"$INSTALL_MARKER"
+
+  release_script="$root/release-mipilot"
+  release_sidecar="$root/release-mipilot.sha256"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'MANAGER_VERSION="1.0.0"' \
+    'MANAGER_INSTALLED_SCRIPT="/usr/local/lib/mipilot/mipilot"' >"$release_script"
+  hash="$(sha256sum "$release_script" | awk '{print $1}')"
+  printf '%s  mipilot\n' "$hash" >"$release_sidecar"
+
+  download_file() {
+    case "$1" in
+      */mipilot) cp -- "$release_script" "$2" ;;
+      */mipilot.sha256) cp -- "$release_sidecar" "$2" ;;
+      *) return 1 ;;
+    esac
+  }
+  read_line_or_back() {
+    # shellcheck disable=SC2034
+    INPUT_LINE="y"
+    return 0
+  }
+  ensure_sudo_access() {
+    return 0
+  }
+  run_cancellable_named() {
+    shift 2
+    "$@"
+  }
+  sudo() {
+    while [[ ${1:-} == -n ]]; do shift; done
+    if [[ ${1:-} == install && ${2:-} == -d ]]; then
+      mkdir -p -- "${@: -1}"
+      return 0
+    fi
+    run_as_mock_sudo "$@"
+  }
+
+  online_update_manager || return 1
+  grep -Fq 'MANAGER_VERSION="1.0.0"' "$MANAGER_INSTALLED_SCRIPT" || fail "manager update did not install candidate"
+  grep -Fq 'MANAGER_VERSION="1.0.0-dev"' "$ROLLBACK_DIR/manager/mipilot" || fail "manager rollback copy was not saved"
+  assert_equal "1" "$MANAGER_SHOULD_EXIT" "manager update exit flag" || return 1
+
+  MANAGER_SHOULD_EXIT=0
+  manual_rollback_manager || return 1
+  grep -Fq 'MANAGER_VERSION="1.0.0-dev"' "$MANAGER_INSTALLED_SCRIPT" || fail "manager rollback did not restore previous script"
+  assert_equal "1" "$MANAGER_SHOULD_EXIT" "manager rollback exit flag"
 }
 
 test_subscription_activation_marker_rollback() {
@@ -650,7 +864,7 @@ test_subscription_activation_marker_rollback() {
   printf '%s\n' 'https://old.example/sub' >"$SUBSCRIPTION_FILE"
 
   sudo() {
-    command "$@"
+    run_as_mock_sudo "$@"
   }
   download_and_apply_subscription() {
     return 1
@@ -686,7 +900,7 @@ test_reset_runtime_state() {
   printf 'export MIHOMO_PROXY_ENABLED=1\n' >"$PROXY_STATE_FILE"
 
   sudo() {
-    command "$@"
+    run_as_mock_sudo "$@"
   }
 
   clear_manager_runtime_state || return 1
@@ -716,6 +930,7 @@ test_uninstall_stops_before_delete() {
     return 0
   }
   sudo() {
+    while [[ ${1:-} == -n ]]; do shift; done
     if [[ ${1:-} == systemctl && ${2:-} == disable ]]; then
       return 1
     fi
@@ -764,6 +979,12 @@ run_test "minimal direct configuration" test_render_minimal_config
 run_test "SHA256 sidecar verification" test_verify_sha256_sidecar
 run_test "idempotent shell integration" test_shell_integration_idempotent
 run_test "manager version comparison" test_version_is_newer
+run_test "progress runner non-TTY behavior" test_progress_runner_non_tty
+run_test "API secret argument protection" test_api_secret_not_in_arguments
+run_test "secure subscription curl config" test_secure_subscription_curl_config
+run_test "local API config rendering" test_local_api_config_rendering
+run_test "manager candidate validation helpers" test_manager_candidate_validation_helpers
+run_test "online manager update and rollback" test_online_manager_update_and_rollback
 run_test "subscription activation marker rollback" test_subscription_activation_marker_rollback
 run_test "reset runtime state" test_reset_runtime_state
 run_test "uninstall stop-before-delete guard" test_uninstall_stops_before_delete
