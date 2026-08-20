@@ -94,6 +94,20 @@ test_manager_release_version() {
   assert_equal "1.0.1" "$MANAGER_VERSION" "manager release version"
 }
 
+test_strategy_group_ui_labels() {
+  grep -Fq '  4) 策略组管理' "$MANAGER_SCRIPT" || fail "main menu strategy group label is missing"
+  grep -Fq '================ 策略组管理 ==================' "$MANAGER_SCRIPT" || fail "strategy group page title is missing"
+  grep -Fq '规则模式入口策略组:' "$MANAGER_SCRIPT" || fail "rule entry strategy group label is missing"
+  if grep -Fq '地区分组管理' "$MANAGER_SCRIPT"; then
+    fail "legacy region group management label remains"
+    return 1
+  fi
+  if grep -Fq '将挂载到' "$MANAGER_SCRIPT"; then
+    fail "internal mounting terminology remains"
+    return 1
+  fi
+}
+
 test_source_testing_guard() {
   local output
 
@@ -1065,7 +1079,10 @@ test_custom_region_group_rendering() {
 
   apply_region_groups_to_config "$input_file" "$output_file" "$state_file" || return 1
   assert_file_has_line "$output_file" '  - name: "MiPilot-亚洲优选"' "custom group definition" || return 1
-  assert_file_has_line "$output_file" '      - "MiPilot-亚洲优选"' "custom group parent reference" || return 1
+  if grep -Fq '      - "MiPilot-亚洲优选"' "$output_file"; then
+    fail "custom group was nested under a subscription selector"
+    return 1
+  fi
   assert_file_has_line "$output_file" '    type: fallback' "custom group fallback type" || return 1
   assert_file_has_line "$output_file" '    type: select' "custom group manual selection type" || return 1
   assert_file_has_line "$output_file" '    type: url-test' "legacy group automatic selection type" || return 1
@@ -1075,6 +1092,7 @@ test_custom_region_group_rendering() {
 test_rule_mode_selects_managed_group() {
   local root
   local api_calls
+  local saved_selection
   local choices_file
   local api_response
   local item
@@ -1083,10 +1101,12 @@ test_rule_mode_selects_managed_group() {
   register_temp_dir_cleanup "$root"
   load_manager || return 1
   CONFIG_FILE="$root/config.yaml"
+  MANAGER_CONFIG_FILE="$root/config.json"
   REGION_STATE_FILE="$root/region-groups.conf"
   # shellcheck disable=SC2034
   API='http://127.0.0.1:9090'
   api_calls="$root/api-calls"
+  saved_selection="$root/saved-selection"
   choices_file="$root/choices"
   printf '%s\n' 'custom-1;MiPilot-亚洲优选;Japan|Singapore' >"$REGION_STATE_FILE"
   printf '%s\n' \
@@ -1095,7 +1115,8 @@ test_rule_mode_selects_managed_group() {
     '    type: select' \
     'rules:' \
     '  - MATCH,🚀节点选择' >"$CONFIG_FILE"
-  api_response='{"proxies":{"🚀节点选择":{"type":"Selector","all":["DIRECT","自动选择","MiPilot-亚洲优选"],"now":"自动选择"},"自动选择":{"type":"URLTest","all":["香港01","日本01"],"now":"香港01"},"MiPilot-亚洲优选":{"type":"URLTest","all":["日本01","新加坡01"],"now":"新加坡01"},"香港01":{"type":"Vmess"},"日本01":{"type":"Vmess"},"新加坡01":{"type":"Vmess"}}}'
+  printf '%s\n' '{"rule_selection":{"parent":"🚀节点选择","group":"🚀节点选择"}}' >"$MANAGER_CONFIG_FILE"
+  api_response='{"proxies":{"MiPilot-规则选择":{"type":"Selector","all":["🚀节点选择","自动选择","MiPilot-亚洲优选"],"now":"🚀节点选择"},"🚀节点选择":{"type":"Selector","all":["DIRECT","自动选择"],"now":"自动选择"},"自动选择":{"type":"URLTest","all":["香港01","日本01"],"now":"香港01"},"MiPilot-亚洲优选":{"type":"URLTest","all":["日本01","新加坡01"],"now":"新加坡01"},"香港01":{"type":"Vmess"},"日本01":{"type":"Vmess"},"新加坡01":{"type":"Vmess"}}}'
 
   sudo() {
     run_as_mock_sudo "$@"
@@ -1118,12 +1139,99 @@ test_rule_mode_selects_managed_group() {
     done
     return 1
   }
+  update_mipilot_selection() {
+    printf '%s\n' "$*" >"$saved_selection"
+  }
+  restart_mihomo_with_progress() {
+    fail "rule strategy API selection unexpectedly restarted Mihomo"
+    return 1
+  }
 
   manage_rule_nodes >/dev/null || return 1
   grep -Fq '自动选择' "$choices_file" || fail "subscription strategy group was not listed"
   grep -Fq 'MiPilot-亚洲优选' "$choices_file" || fail "custom strategy group was not listed"
-  grep -Fq 'MiPilot-亚洲优选' "$api_calls" || fail "managed group API selection was missing"
-  grep -Fq '/proxies/%F0%9F%9A%80%E8%8A%82%E7%82%B9%E9%80%89%E6%8B%A9' "$api_calls" || fail "managed parent group API target was incorrect"
+  grep -Fq '/proxies/MiPilot-%E8%A7%84%E5%88%99%E9%80%89%E6%8B%A9' "$api_calls" || fail "MiPilot rule selector API target was missing" || return 1
+  grep -Fq 'MiPilot-亚洲优选' "$api_calls" || fail "custom strategy API selection was missing" || return 1
+  assert_equal 'rule 🚀节点选择 MiPilot-亚洲优选' "$(cat "$saved_selection")" "persisted rule strategy selection"
+}
+
+test_direct_rule_strategy_rendering() {
+  local root
+  local input_file
+  local output_file
+  local second_output
+  local manager_file
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  input_file="$root/input.yaml"
+  output_file="$root/output.yaml"
+  second_output="$root/output-second.yaml"
+  manager_file="$root/manager.json"
+  MANAGER_CONFIG_FILE="$manager_file"
+  printf '%s\n' '{"rule_selection":{"parent":"Proxy","group":"Proxy"}}' >"$manager_file"
+  printf '%s\n' \
+    'proxy-groups:' \
+    '  - name: Proxy' \
+    '    type: select' \
+    '  - name: "MiPilot-日本"' \
+    '    type: url-test' \
+    'rules:' \
+    '  - DOMAIN-SUFFIX,example.com,"Proxy" # keep' \
+    '  - IP-CIDR,1.1.1.1/32,Proxy,no-resolve' \
+    '  - DOMAIN-SUFFIX,internal.example,DIRECT' \
+    '  - DOMAIN-SUFFIX,blocked.example,REJECT' \
+    '  - MATCH,Proxy' >"$input_file"
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+
+  apply_rule_selector_to_config "$input_file" "$output_file" Proxy || return 1
+  assert_file_has_line "$output_file" '  - name: "MiPilot-规则选择"' "MiPilot rule selector definition" || return 1
+  assert_file_has_line "$output_file" '      - "Proxy"' "subscription strategy selector member" || return 1
+  assert_file_has_line "$output_file" '      - "MiPilot-日本"' "custom strategy selector member" || return 1
+  assert_file_has_line "$output_file" '  - DOMAIN-SUFFIX,example.com,"MiPilot-规则选择" # keep' "quoted rule selector target" || return 1
+  assert_file_has_line "$output_file" '  - IP-CIDR,1.1.1.1/32,MiPilot-规则选择,no-resolve' "no-resolve rule selector target" || return 1
+  assert_file_has_line "$output_file" '  - DOMAIN-SUFFIX,internal.example,DIRECT' "DIRECT rule preserved" || return 1
+  assert_file_has_line "$output_file" '  - DOMAIN-SUFFIX,blocked.example,REJECT' "REJECT rule preserved" || return 1
+  assert_file_has_line "$output_file" '  - MATCH,MiPilot-规则选择' "MATCH rule selector target" || return 1
+  apply_rule_selector_to_config "$output_file" "$second_output" Proxy || return 1
+  assert_line_count "$second_output" '  - name: "MiPilot-规则选择"' 1 "idempotent MiPilot rule selector" || return 1
+  assert_file_has_line "$second_output" '  - MATCH,MiPilot-规则选择' "idempotent rule selector target"
+}
+
+test_rule_selector_selection_restore() {
+  local root
+  local api_calls
+  local api_response
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  MANAGER_CONFIG_FILE="$root/config.json"
+  api_calls="$root/api-calls"
+  printf '%s\n' '{"rule_selection":{"parent":"Proxy","group":"MiPilot-日本"},"selector_selections":{},"global_selection":{"node":""}}' >"$MANAGER_CONFIG_FILE"
+  api_response='{"proxies":{"MiPilot-规则选择":{"type":"Selector","all":["Proxy","MiPilot-日本"],"now":"Proxy"},"Proxy":{"type":"Selector","all":["DIRECT"],"now":"DIRECT"},"MiPilot-日本":{"type":"URLTest","all":["日本01"],"now":"日本01"}}}'
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+  mipilot_config_is_valid() {
+    return 0
+  }
+  api_quick() {
+    if (( $# == 1 )); then
+      printf '%s\n' "$api_response"
+    else
+      printf '%s\n' "$*" >>"$api_calls"
+    fi
+  }
+
+  restore_mipilot_selections || return 1
+  grep -Fq '/proxies/MiPilot-%E8%A7%84%E5%88%99%E9%80%89%E6%8B%A9' "$api_calls" || fail "rule selector restore API target was missing" || return 1
+  grep -Fq 'MiPilot-日本' "$api_calls" || fail "saved rule strategy was not restored"
 }
 
 test_dynamic_region_parent_selection() {
@@ -1192,7 +1300,7 @@ test_unreferenced_selector_uses_managed_rule_outlet() {
     '  - MATCH,实际出口' >"$CONFIG_FILE"
   rm -f -- "$REGION_PARENT_FILE"
   ensure_region_parent "$response" >/dev/null || return 1
-  assert_equal "$REGION_MANAGED_PARENT" "$REGION_PARENT" "unreferenced selector must not be selected"
+  assert_equal '实际出口' "$REGION_PARENT" "MATCH strategy target"
 }
 
 test_custom_region_group_without_subscription_groups() {
@@ -1200,6 +1308,8 @@ test_custom_region_group_without_subscription_groups() {
   local input_file
   local output_file
   local state_file
+  local with_selector
+  local stale_parent_selector
 
   root="$(make_temp_dir)" || return 1
   register_temp_dir_cleanup "$root"
@@ -1207,6 +1317,10 @@ test_custom_region_group_without_subscription_groups() {
   input_file="$root/input.yaml"
   output_file="$root/output.yaml"
   state_file="$root/region-groups.conf"
+  with_selector="$root/with-selector.yaml"
+  stale_parent_selector="$root/stale-parent-selector.yaml"
+  MANAGER_CONFIG_FILE="$root/manager.json"
+  printf '%s\n' '{"rule_selection":{"parent":"DIRECT","group":"MiPilot-日本优选"}}' >"$MANAGER_CONFIG_FILE"
   printf '%s\n' \
     'proxies:' \
     '  - name: 日本01' \
@@ -1221,13 +1335,21 @@ test_custom_region_group_without_subscription_groups() {
     run_as_mock_sudo "$@"
   }
 
-  apply_region_groups_to_config \
-    "$input_file" "$output_file" "$state_file" "$REGION_MANAGED_PARENT" || return 1
+  apply_region_groups_to_config "$input_file" "$output_file" "$state_file" || return 1
   assert_file_has_line "$output_file" '  - name: "MiPilot-日本优选"' "standalone custom group definition" || return 1
-  assert_file_has_line "$output_file" '  - name: "MiPilot-规则出口"' "managed rule outlet definition" || return 1
-  assert_file_has_line "$output_file" '      - "MiPilot-日本优选"' "managed outlet custom group reference" || return 1
   assert_file_has_line "$output_file" '  - GEOIP,CN,DIRECT' "preserved direct rule" || return 1
-  assert_file_has_line "$output_file" '  - MATCH,"MiPilot-规则出口"' "managed outlet match rule"
+  assert_file_has_line "$output_file" '  - MATCH,DIRECT' "preserved match rule" || return 1
+  apply_rule_selector_to_config "$output_file" "$with_selector" DIRECT || return 1
+  assert_file_has_line "$with_selector" '  - name: "MiPilot-规则选择"' "standalone MiPilot rule selector" || return 1
+  assert_file_has_line "$with_selector" '      - "MiPilot-日本优选"' "standalone custom strategy selector member" || return 1
+  assert_file_has_line "$with_selector" '      - "DIRECT"' "standalone original rule fallback member" || return 1
+  assert_file_has_line "$with_selector" '  - MATCH,MiPilot-规则选择' "standalone rule selector target" || return 1
+  apply_rule_selector_to_config "$output_file" "$stale_parent_selector" OldParent || return 1
+  if grep -Fq 'OldParent' "$stale_parent_selector"; then
+    fail "stale missing rule parent was added to MiPilot rule selector"
+    return 1
+  fi
+  assert_file_has_line "$stale_parent_selector" '      - "DIRECT"' "stale-parent current rule fallback member"
 }
 
 test_region_group_strategy_refresh() {
@@ -1330,7 +1452,7 @@ test_missing_selector_uses_managed_rule_outlet() {
   }
 
   ensure_region_parent "$response" >/dev/null || return 1
-  assert_equal "$REGION_MANAGED_PARENT" "$REGION_PARENT" "selected managed rule outlet"
+  assert_equal 'DIRECT' "$REGION_PARENT" "direct MATCH fallback target"
 }
 
 test_managed_outlet_keeps_subscription_groups() {
@@ -1360,10 +1482,10 @@ test_managed_outlet_keeps_subscription_groups() {
     run_as_mock_sudo "$@"
   }
 
-  apply_region_groups_to_config \
-    "$input_file" "$output_file" "$state_file" "$REGION_MANAGED_PARENT" || return 1
-  assert_file_has_line "$output_file" '      - "订阅自动选择"' "managed outlet subscription group reference" || return 1
-  assert_file_has_line "$output_file" '      - "MiPilot-日本优选"' "managed outlet custom group reference"
+  apply_region_groups_to_config "$input_file" "$output_file" "$state_file" || return 1
+  assert_file_has_line "$output_file" '  - name: "订阅自动选择"' "subscription group preserved" || return 1
+  assert_file_has_line "$output_file" '  - name: "MiPilot-日本优选"' "custom group added at same level" || return 1
+  assert_file_has_line "$output_file" '  - MATCH,订阅自动选择' "subscription rule target preserved"
 }
 
 test_render_minimal_config() {
@@ -1964,7 +2086,7 @@ test_stale_saved_parent_is_ignored() {
   }
 
   ensure_region_parent "$response" >/dev/null || return 1
-  assert_equal 'Proxy' "$REGION_PARENT" "stale unreferenced saved parent"
+  assert_equal 'OldParent' "$REGION_PARENT" "saved original rule parent remains available after direct selection"
 }
 
 test_inline_rules_rejected_for_managed_outlet() {
@@ -1985,7 +2107,7 @@ test_inline_rules_rejected_for_managed_outlet() {
     run_as_mock_sudo "$@"
   }
 
-  if render_managed_rule_outlet "$input_file" "$output_file" >/dev/null 2>&1; then
+  if render_rule_strategy_selection "$input_file" "$output_file" DIRECT Proxy >/dev/null 2>&1; then
     fail "inline rules unexpectedly accepted"
     return 1
   fi
@@ -2234,6 +2356,7 @@ run_test() {
 
 run_test "bash -n" test_bash_syntax
 run_test "manager release version" test_manager_release_version
+run_test "strategy group UI labels" test_strategy_group_ui_labels
 run_test "testing source guard" test_source_testing_guard
 run_test "source preserves enabled shell options" test_source_preserves_enabled_shell_options
 run_test "dependency install survives partial APT update failure" test_dependency_install_continues_after_partial_apt_update
@@ -2261,6 +2384,8 @@ run_test "mode switch persistence" test_mode_switch_persists_config
 run_test "selected-node persistence rendering" test_render_store_selected_config
 run_test "custom region group rendering" test_custom_region_group_rendering
 run_test "rule mode managed-group selection" test_rule_mode_selects_managed_group
+run_test "MiPilot rule selector rendering" test_direct_rule_strategy_rendering
+run_test "MiPilot rule selector selection restore" test_rule_selector_selection_restore
 run_test "dynamic region parent selection" test_dynamic_region_parent_selection
 run_test "unreferenced selector falls back to managed outlet" test_unreferenced_selector_uses_managed_rule_outlet
 run_test "custom region group without subscription groups" test_custom_region_group_without_subscription_groups

@@ -43,19 +43,20 @@ diff -u /tmp/mipilot-network-before.txt /tmp/mipilot-network-after.txt || true
 | N15 | 公网探测地址不可达 | 仅阻断 `cp.cloudflare.com` | 显示探测警告; 其他实际网站正常时不自动回滚 |
 | N16 | Mihomo API不可用 | 错误密钥或停止API监听 | TUN验证失败, 不显示启用成功 |
 | N17 | Mihomo重启失败 | 使用无法启动的临时配置复现 | 配置和 `tun.state` 一起恢复 |
-| N18 | 订阅更新期间TUN开启 | 更新为节点名称变化的订阅 | TUN保持开启; 空地区组明确告警; 原运行模式不变化 |
+| N18 | 订阅更新期间TUN开启 | 更新为节点名称变化的订阅 | TUN保持开启; 空自定义策略组明确告警; 原运行模式不变化 |
 | N19 | DHCP地址和网关变化 | TUN运行时续租或切换网关 | 自动出口重新识别;新旧路由没有残留冲突 |
 | N20 | VPN与TUN叠加 | 先连接WireGuard/OpenVPN再开启TUN | 明确验证出口、内网网段和DNS; 不出现路由环路 |
 | N21 | 系统重启 | TUN开启状态重启服务器 | Mihomo启动; `inet mipilot_tun`和受管ip rule恢复; TUN状态和规则模式保持 |
 | N22 | 快速连续启停 | 连续执行5次启用/关闭 | 配置始终可验证; 状态文件与API一致; 路由无累积残留 |
 | N23 | 全局模式启停TUN | 选择全局节点, 连续启停TUN | `mode`仍为global; 全局节点选择保持; MiPilot配置未丢字段 |
-| N24 | 规则模式更新订阅 | 选择自定义地区组后更新订阅 | 当前模式、地区组策略及仍存在的节点选择自动恢复 |
+| N24 | 规则模式更新订阅 | 选择自定义策略组后更新订阅 | 当前模式、自定义策略组类型及仍存在的节点选择自动恢复 |
 | N25 | 内核和管理器升级 | 升级前配置订阅、TUN、分组和节点 | `/etc/mipilot/config.json`内容保持; 生成配置与持久设置一致 |
 | N26 | 配置包恢复 | 修改多项设置后恢复历史备份 | Mihomo配置与配套MiPilot配置同时恢复, 不出现状态错位 |
 | N27 | TUN后安装Docker | 无Docker时开启TUN, 再安装Docker并启动端口发布服务 | 不重启TUN即可访问发布端口; 容器主动出站仍经过Mihomo |
 | N28 | TUN后更新容器网络 | TUN运行时新增端口、删除并重建Compose bridge | 新DNAT连接自动受回程保护; 无需更新MiPilot端口或网段配置 |
 | N29 | Podman bridge | 创建managed bridge并发布端口 | 容器出站经过Mihomo; 外部入站回包保持原路径 |
 | N30 | MiPilot资源冲突 | 预占8990优先级和一个候选fwmark后开启TUN | 自动选择空闲资源并写入状态; 不删除预存规则 |
+| N31 | 规则策略无重启切换 | 在订阅策略组与自定义策略组之间连续切换 | `MiPilot-规则选择`通过API更新; Mihomo进程PID不变; TUN和现有连接不因服务重启中断 |
 
 ## 必须收集的证据
 

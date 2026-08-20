@@ -31,6 +31,7 @@ TUN_BYPASS_STATE_FILE="${CONFIG_DIR}/tun-bypass-ports.conf"
 REGION_STATE_FILE="${CONFIG_DIR}/region-groups.conf"
 REGION_PARENT_FILE="${CONFIG_DIR}/region-parent.conf"
 REGION_MANAGED_PARENT="MiPilot-规则出口"
+RULE_SELECTOR_GROUP="MiPilot-规则选择"
 BACKUP_DIR="${CONFIG_DIR}/backups"
 BACKUP_LIMIT=3
 MANAGER_LIB_DIR="${MIPILOT_LIB_DIR:-/usr/local/lib/mipilot}"
@@ -797,6 +798,7 @@ reconcile_runtime_config_from_mipilot() {
   local tun_temporary
   local region_temporary=""
   local region_parent
+  local selector_temporary
   local current_hash
   local candidate_hash
   local backup
@@ -822,13 +824,25 @@ reconcile_runtime_config_from_mipilot() {
       rm -f -- "$mode_temporary" "$tun_temporary"
       return 1
     }
-    if ! apply_region_groups_to_config "$tun_temporary" "$region_temporary" "$REGION_STATE_FILE" "$region_parent"; then
+    if ! apply_region_groups_to_config "$tun_temporary" "$region_temporary" "$REGION_STATE_FILE"; then
       rm -f -- "$mode_temporary" "$tun_temporary" "$region_temporary"
-      echo "无法把持久化地区分组合并到 Mihomo 配置."
+      echo "无法把持久化自定义策略组合并到 Mihomo 配置."
       return 1
     fi
     mv -f -- "$region_temporary" "$tun_temporary"
   fi
+  region_parent="$(sudo jq -r '.rule_selection.parent // empty' "$MANAGER_CONFIG_FILE")"
+  [[ -n $region_parent ]] || region_parent="$(managed_region_parent)"
+  selector_temporary="$(mktemp /tmp/mipilot-reconcile-selector.XXXXXX.yaml)" || {
+    rm -f -- "$mode_temporary" "$tun_temporary"
+    return 1
+  }
+  if ! apply_rule_selector_to_config "$tun_temporary" "$selector_temporary" "$region_parent"; then
+    rm -f -- "$mode_temporary" "$tun_temporary" "$selector_temporary"
+    echo "无法恢复 MiPilot 规则选择策略组."
+    return 1
+  fi
+  mv -f -- "$selector_temporary" "$tun_temporary"
   current_hash="$(sudo sha256sum "$CONFIG_FILE" | awk '{print $1}')"
   candidate_hash="$(sha256sum "$tun_temporary" | awk '{print $1}')"
   if [[ $current_hash == "$candidate_hash" ]]; then
@@ -921,7 +935,10 @@ update_mipilot_selection() {
   case "$kind" in
     rule)
       # shellcheck disable=SC2024
-      sudo jq --arg value "$value" '.rule_selection.group = $value' "$MANAGER_CONFIG_FILE" >"$temporary"
+      sudo jq --arg parent "$group" --arg value "$value" '
+        .rule_selection.parent = $parent
+        | .rule_selection.group = $value
+      ' "$MANAGER_CONFIG_FILE" >"$temporary"
       ;;
     global)
       # shellcheck disable=SC2024
@@ -2559,6 +2576,131 @@ list_config_rule_policy_names() {
   ' "$config_file"
 }
 
+config_match_policy() {
+  local config_file="$1"
+
+  sudo awk '
+    function trim(value) {
+      sub(/^[[:space:]"\047]+/, "", value)
+      sub(/[[:space:]"\047]+$/, "", value)
+      return value
+    }
+
+    /^rules:[[:space:]]*(#.*)?$/ { in_rules = 1; next }
+    in_rules && /^[^[:space:]#][^:]*:/ { exit }
+    in_rules && /^[[:space:]]*-[[:space:]]*["\047]?MATCH[[:space:]]*,/ {
+      line = $0
+      sub(/^[[:space:]]*-[[:space:]]*/, "", line)
+      sub(/[[:space:]]+#.*$/, "", line)
+      count = split(line, fields, ",")
+      if (count >= 2) policy = trim(fields[2])
+    }
+    END { if (policy != "") print policy }
+  ' "$config_file"
+}
+
+config_rules_reference_policy() {
+  local config_file="$1"
+  local target="$2"
+
+  sudo awk -v target="$target" '
+    function trim(value) {
+      sub(/^[[:space:]"\047]+/, "", value)
+      sub(/[[:space:]"\047]+$/, "", value)
+      return value
+    }
+
+    /^rules:[[:space:]]*(#.*)?$/ { in_rules = 1; next }
+    in_rules && /^[^[:space:]#][^:]*:/ { exit }
+    in_rules && /^[[:space:]]*-[[:space:]]*/ {
+      line = $0
+      sub(/^[[:space:]]*-[[:space:]]*/, "", line)
+      sub(/[[:space:]]+#.*$/, "", line)
+      count = split(line, fields, ",")
+      if (count < 2) next
+      policy_index = count
+      if (tolower(trim(fields[count])) == "no-resolve") policy_index--
+      if (trim(fields[policy_index]) == target) found = 1
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$config_file"
+}
+
+render_rule_strategy_selection() {
+  local input_file="$1"
+  local output_file="$2"
+  local source_policy="$3"
+  local selected_group="$4"
+
+  [[ -n $source_policy && -n $selected_group ]] || return 1
+  [[ $source_policy != *','* && $selected_group != *','* ]] || return 1
+  # The input needs sudo; the caller-owned output path intentionally does not.
+  # shellcheck disable=SC2024
+  sudo awk -v source="$source_policy" -v selected="$selected_group" '
+    function trim(value) {
+      sub(/^[[:space:]"\047]+/, "", value)
+      sub(/[[:space:]"\047]+$/, "", value)
+      return value
+    }
+
+    function replace_policy(line, raw, value, leading, trailing, quote) {
+      raw = fields[policy_index]
+      value = raw
+      sub(/^[[:space:]]*/, "", value)
+      leading = substr(raw, 1, length(raw) - length(value))
+      value = raw
+      sub(/[[:space:]]*$/, "", value)
+      trailing = substr(raw, length(value) + 1)
+      value = trim(raw)
+      quote = ""
+      if (substr(raw, index(raw, value) - 1, 1) == "\"" || substr(raw, index(raw, value) - 1, 1) == "\047") {
+        quote = substr(raw, index(raw, value) - 1, 1)
+      }
+      fields[policy_index] = leading (quote == "" ? selected : quote selected quote) trailing
+      output = fields[1]
+      for (field_index = 2; field_index <= count; field_index++) output = output "," fields[field_index]
+      return prefix output comment
+    }
+
+    {
+      line = $0
+      if (line ~ /^rules:[[:space:]]*[^[:space:]#]/) inline_rules = 1
+      if (line ~ /^rules:[[:space:]]*(#.*)?$/) { in_rules = 1; print; next }
+      if (in_rules && line ~ /^[^[:space:]#][^:]*:/) in_rules = 0
+      if (!in_rules || line !~ /^[[:space:]]*-[[:space:]]*/) { print; next }
+
+      prefix = line
+      sub(/[^[:space:]].*$/, "", prefix)
+      sub(/^[[:space:]]*-[[:space:]]*/, "", line)
+      prefix = prefix "- "
+      comment = ""
+      comment_pos = index(line, " #")
+      if (comment_pos > 0) {
+        comment = substr(line, comment_pos)
+        line = substr(line, 1, comment_pos - 1)
+      }
+      count = split(line, fields, ",")
+      if (count < 2) { print $0; next }
+      policy_index = count
+      if (tolower(trim(fields[count])) == "no-resolve") policy_index--
+      if (trim(fields[policy_index]) == source) {
+        print replace_policy(line)
+        changed++
+      } else print $0
+    }
+    END {
+      if (inline_rules) {
+        print "不支持行内 rules 配置, 未修改文件." > "/dev/stderr"
+        exit 42
+      }
+      if (source != selected && changed == 0) {
+        print "规则中找不到当前策略目标 " source ", 未修改文件." > "/dev/stderr"
+        exit 42
+      }
+    }
+  ' "$input_file" >"$output_file"
+}
+
 list_rule_selector_names() {
   local config_file="$1"
 
@@ -2641,27 +2783,15 @@ prepare_region_overlay() {
   local state_file="$2"
   local refs_file="$3"
   local definitions_file="$4"
-  local parent="${5:-$(managed_region_parent)}"
   local code
   local name
   local pattern
   local group_mode
   local exclude_pattern
-  local parent_missing=0
-  local gateway_refs
 
   : >"$refs_file"
   : >"$definitions_file"
   exclude_pattern="$(region_exclude_pattern)"
-
-  if ! config_has_group "$config_file" "$parent"; then
-    if [[ $parent == "$REGION_MANAGED_PARENT" ]]; then
-      parent_missing=1
-    else
-      echo "配置中找不到已保存的主策略组 ${parent}, 无法挂载地区组."
-      return 1
-    fi
-  fi
 
   while IFS=';' read -r code name pattern group_mode; do
     [[ -z $code || -z $name || -z $pattern ]] && continue
@@ -2704,28 +2834,7 @@ prepare_region_overlay() {
       } >>"$definitions_file"
     fi
 
-    if ! parent_group_has_child "$config_file" "$parent" "$name"; then
-      printf '%s\n' "$name" >>"$refs_file"
-    fi
   done < <(sudo cat "$state_file")
-
-  if (( parent_missing == 1 )); then
-    gateway_refs="$(mktemp /tmp/mihomo-region-gateway-refs.XXXXXX)" || return 1
-    {
-      list_config_group_names "$config_file"
-      cat "$refs_file"
-    } | awk -v outlet="$REGION_MANAGED_PARENT" '$0 != outlet && !seen[$0]++' >"$gateway_refs"
-    {
-      printf '%s\n' "- name: \"${REGION_MANAGED_PARENT}\""
-      printf '%s\n' '  type: select'
-      printf '%s\n' '  proxies:'
-      while IFS= read -r name; do
-        [[ -n $name ]] && printf '%s\n' "    - \"${name}\""
-      done <"$gateway_refs"
-    } >>"$definitions_file"
-    rm -f -- "$gateway_refs"
-    : >"$refs_file"
-  fi
 }
 
 refresh_saved_region_definitions() {
@@ -2897,7 +3006,7 @@ refresh_saved_region_definitions() {
       END {
         finish_managed_group()
         if (unsupported) {
-          print "已保存的地区组使用不支持的单行定义, 未修改文件." > "/dev/stderr"
+          print "已保存的自定义策略组使用不支持的单行定义, 未修改文件." > "/dev/stderr"
           exit 42
         }
       }
@@ -3184,7 +3293,6 @@ apply_region_groups_to_config() {
   local input_file="$1"
   local output_file="$2"
   local state_file="$3"
-  local parent="${4:-${REGION_PARENT:-$(managed_region_parent)}}"
   local refs_file
   local definitions_file
   local refreshed_file
@@ -3208,24 +3316,128 @@ apply_region_groups_to_config() {
   refresh_saved_region_definitions "$input_file" "$refreshed_file" "$state_file"
   status=$?
   if (( status == 0 )); then
-    prepare_region_overlay "$refreshed_file" "$state_file" "$refs_file" "$definitions_file" "$parent"
+    prepare_region_overlay "$refreshed_file" "$state_file" "$refs_file" "$definitions_file"
     status=$?
   fi
   if (( status == 0 )); then
-    render_region_overlay "$refreshed_file" "$overlay_file" "$refs_file" "$definitions_file" "$parent"
+    render_region_overlay "$refreshed_file" "$overlay_file" "$refs_file" "$definitions_file"
     status=$?
   fi
   if (( status == 0 )); then
-    if [[ $parent == "$REGION_MANAGED_PARENT" ]]; then
-      render_managed_rule_outlet "$overlay_file" "$output_file"
-      status=$?
-    else
-      mv -f -- "$overlay_file" "$output_file"
-      status=$?
-    fi
+    mv -f -- "$overlay_file" "$output_file"
+    status=$?
   fi
 
   rm -f -- "$refs_file" "$definitions_file" "$refreshed_file" "$overlay_file"
+  return "$status"
+}
+
+apply_rule_selector_to_config() {
+  local input_file="$1"
+  local output_file="$2"
+  local source_policy="${3:-}"
+  local selected_group
+  local current_policy
+  local without_selector
+  local refs_file
+  local definitions_file
+  local with_selector
+  local group_name
+  local escaped_name
+  local status=0
+  local group_count=0
+  local source_included=0
+  local current_included=0
+  local source_available=0
+
+  without_selector="$(mktemp /tmp/mihomo-rule-selector-base.XXXXXX.yaml)" || return 1
+  refs_file="$(mktemp /tmp/mihomo-rule-selector-refs.XXXXXX)" || {
+    rm -f -- "$without_selector"
+    return 1
+  }
+  definitions_file="$(mktemp /tmp/mihomo-rule-selector-definition.XXXXXX)" || {
+    rm -f -- "$without_selector" "$refs_file"
+    return 1
+  }
+  with_selector="$(mktemp /tmp/mihomo-rule-selector-config.XXXXXX.yaml)" || {
+    rm -f -- "$without_selector" "$refs_file" "$definitions_file"
+    return 1
+  }
+
+  selected_group="$(sudo jq -r '.rule_selection.group // empty' "$MANAGER_CONFIG_FILE" 2>/dev/null || true)"
+  if config_rules_reference_policy "$input_file" "$RULE_SELECTOR_GROUP"; then
+    current_policy="$RULE_SELECTOR_GROUP"
+  elif [[ -n $selected_group ]] && config_rules_reference_policy "$input_file" "$selected_group"; then
+    current_policy="$selected_group"
+  elif [[ -n $source_policy ]] && config_rules_reference_policy "$input_file" "$source_policy"; then
+    current_policy="$source_policy"
+  else
+    current_policy="$(config_match_policy "$input_file")"
+  fi
+  if [[ $source_policy == DIRECT || $source_policy == REJECT || $source_policy == PASS ]] ||
+     config_rules_reference_policy "$input_file" "$source_policy" ||
+     parent_group_has_child "$input_file" "$RULE_SELECTOR_GROUP" "$source_policy"; then
+    source_available=1
+  fi
+
+  render_without_region_group "$input_file" "$without_selector" "$RULE_SELECTOR_GROUP" || status=$?
+  : >"$refs_file"
+  if (( status == 0 )); then
+    {
+      printf '%s\n' "- name: \"${RULE_SELECTOR_GROUP}\""
+      printf '%s\n' '  type: select'
+      printf '%s\n' '  proxies:'
+      while IFS= read -r group_name; do
+        [[ -n $group_name ]] || continue
+        [[ $group_name == "$RULE_SELECTOR_GROUP" || $group_name == "$REGION_MANAGED_PARENT" ]] && continue
+        escaped_name="${group_name//\\/\\\\}"
+        escaped_name="${escaped_name//\"/\\\"}"
+        printf '    - "%s"\n' "$escaped_name"
+        group_count=$((group_count + 1))
+        if [[ $group_name == "$source_policy" ]]; then
+          source_included=1
+        fi
+        if [[ $group_name == "$current_policy" ]]; then
+          current_included=1
+        fi
+      done < <(list_config_group_names "$without_selector")
+      if [[ -n $source_policy && $source_policy != "$RULE_SELECTOR_GROUP" ]] &&
+         (( source_included == 0 && source_available == 1 )); then
+        escaped_name="${source_policy//\\/\\\\}"
+        escaped_name="${escaped_name//\"/\\\"}"
+        printf '    - "%s"\n' "$escaped_name"
+        group_count=$((group_count + 1))
+        if [[ $current_policy == "$source_policy" ]]; then
+          current_included=1
+        fi
+      fi
+      if [[ -n $current_policy && $current_policy != "$RULE_SELECTOR_GROUP" ]] && (( current_included == 0 )); then
+        escaped_name="${current_policy//\\/\\\\}"
+        escaped_name="${escaped_name//\"/\\\"}"
+        printf '    - "%s"\n' "$escaped_name"
+        group_count=$((group_count + 1))
+      fi
+      if (( group_count == 0 )); then
+        printf '%s\n' '    - DIRECT'
+      fi
+    } >"$definitions_file"
+    render_region_overlay "$without_selector" "$with_selector" "$refs_file" "$definitions_file" || status=$?
+  fi
+
+  if (( status == 0 )); then
+    if [[ $current_policy == "$RULE_SELECTOR_GROUP" ]]; then
+      mv -f -- "$with_selector" "$output_file" || status=$?
+    else
+      if [[ -z $current_policy ]]; then
+        echo "当前配置没有可识别的规则策略目标." >&2
+        status=1
+      else
+        render_rule_strategy_selection "$with_selector" "$output_file" "$current_policy" "$RULE_SELECTOR_GROUP" || status=$?
+      fi
+    fi
+  fi
+
+  rm -f -- "$without_selector" "$refs_file" "$definitions_file" "$with_selector"
   return "$status"
 }
 
@@ -3329,21 +3541,21 @@ auto_add_region_groups() {
   if [[ -s $dedup_state ]] && ! region_group_rules_current "$CONFIG_FILE" "$dedup_state"; then
     rules_need_refresh=1
     needs_apply=1
-    echo "  修正已有自动地区组的筛选规则."
+    echo "  生成或更新自动策略组的节点筛选规则."
   fi
 
   if (( needs_apply == 0 )); then
-    echo "  地区组已完整, 筛选规则无需更新."
+    echo "  自动策略组已完整, 节点筛选规则无需更新."
     rm -f -- "$nodes_file" "$groups_file" "$existing_state" "$candidate_state" "$dedup_state"
     return 0
   fi
 
   echo
   if (( added_count > 0 )); then
-    echo "新增地区组将使用 URLTest 自动测速, 并加入 ${REGION_PARENT:-$(managed_region_parent)}."
+    echo "新增策略组将使用 url-test 自动测速, 并加入规则模式可选列表."
   fi
   if (( rules_need_refresh > 0 )); then
-    echo "已有自动地区组将更新匹配规则并排除流量、到期等提示节点."
+    echo "自动策略组将生成或更新节点筛选规则, 并排除流量、到期等提示节点."
   fi
   read_line_or_back "确认生成并应用? (y/N, Esc返回): "
   status=$?
@@ -3401,13 +3613,11 @@ preferred_rule_parent_for_config() {
   local candidate
   local candidates=()
 
+  if [[ -n $saved_parent ]] && config_rules_reference_policy "$config_file" "$saved_parent"; then
+    printf '%s\n' "$saved_parent"
+    return 0
+  fi
   mapfile -t candidates < <(list_rule_selector_names "$config_file")
-  for candidate in "${candidates[@]}"; do
-    if [[ -n $saved_parent && $saved_parent != "$REGION_MANAGED_PARENT" && $candidate == "$saved_parent" ]]; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  done
   for preferred in "🚀节点选择" "节点选择" "代理选择" "Proxy" "手动选择"; do
     for candidate in "${candidates[@]}"; do
       if [[ $candidate == "$preferred" ]]; then
@@ -3419,7 +3629,8 @@ preferred_rule_parent_for_config() {
   if (( ${#candidates[@]} == 1 )); then
     printf '%s\n' "${candidates[0]}"
   else
-    printf '%s\n' "$REGION_MANAGED_PARENT"
+    candidate="$(config_match_policy "$config_file")"
+    [[ -n $candidate ]] && printf '%s\n' "$candidate"
   fi
 }
 
@@ -3434,8 +3645,9 @@ ensure_region_parent() {
   REGION_PARENT=""
   saved_parent="$(managed_region_parent)"
   mapfile -t candidates < <(list_rule_selector_names "$config_file")
-  if [[ $saved_parent == "$REGION_MANAGED_PARENT" ]] &&
-     jq -e --arg parent "$saved_parent" '.proxies[$parent].type == "Selector"' <<<"$response" >/dev/null; then
+  if [[ -n $saved_parent ]] &&
+     { jq -e --arg parent "$saved_parent" '.proxies[$parent].all != null' <<<"$response" >/dev/null ||
+       [[ $saved_parent == DIRECT || $saved_parent == REJECT || $saved_parent == PASS ]]; }; then
     REGION_PARENT="$saved_parent"
     return 0
   fi
@@ -3447,8 +3659,11 @@ ensure_region_parent() {
     fi
   done
   if (( ${#candidates[@]} == 0 )); then
-    REGION_PARENT="$REGION_MANAGED_PARENT"
-    echo "当前规则没有引用可切换的手动策略组, 将创建 MiPilot 自有规则出口."
+    REGION_PARENT="$(config_match_policy "$config_file")"
+    [[ -n $REGION_PARENT ]] || {
+      echo "当前配置没有可识别的规则策略目标."
+      return 1
+    }
     return 0
   fi
   for preferred in "🚀节点选择" "节点选择" "代理选择" "Proxy" "手动选择"; do
@@ -3463,10 +3678,9 @@ ensure_region_parent() {
     REGION_PARENT="${candidates[0]}"
   fi
   if [[ -z $REGION_PARENT ]]; then
-    choose_item "选择 MiPilot 地区分组要挂载的主策略组:" "${candidates[@]}" || return
+    choose_item "选择规则模式入口策略组:" "${candidates[@]}" || return
     REGION_PARENT="$SELECTED"
   fi
-  echo "MiPilot 地区分组将挂载到: ${REGION_PARENT}"
 }
 
 apply_region_group_state() {
@@ -3475,20 +3689,31 @@ apply_region_group_state() {
   local success_message="$3"
   local base_config="${4:-$CONFIG_FILE}"
   local temporary_config
+  local selector_config
   local backup
   local status
-  local parent="${REGION_PARENT:-$(managed_region_parent)}"
+  local parent
   local previous_state
-  local previous_parent
   local had_state=0
-  local had_parent=0
 
   temporary_config="$(mktemp /tmp/mihomo-region-config.XXXXXX.yaml)" || return 1
-  if ! apply_region_groups_to_config "$base_config" "$temporary_config" "$candidate_state" "$parent"; then
+  if ! apply_region_groups_to_config "$base_config" "$temporary_config" "$candidate_state"; then
     rm -f -- "$temporary_config"
     echo "无法安全合并地区策略组, 现有配置未改变."
     return 1
   fi
+  parent="$(sudo jq -r '.rule_selection.parent // empty' "$MANAGER_CONFIG_FILE" 2>/dev/null || true)"
+  [[ -n $parent ]] || parent="$(managed_region_parent)"
+  selector_config="$(mktemp /tmp/mihomo-rule-selector-apply.XXXXXX.yaml)" || {
+    rm -f -- "$temporary_config"
+    return 1
+  }
+  if ! apply_rule_selector_to_config "$temporary_config" "$selector_config" "$parent"; then
+    rm -f -- "$temporary_config" "$selector_config"
+    echo "无法生成 MiPilot 规则选择策略组, 现有配置未改变."
+    return 1
+  fi
+  mv -f -- "$selector_config" "$temporary_config"
   run_cancellable_named "正在验证地区策略组配置" 45 \
     sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$temporary_config"
   status=$?
@@ -3506,40 +3731,26 @@ apply_region_group_state() {
     rm -f -- "$temporary_config"
     return 1
   }
-  previous_parent="$(mktemp /tmp/mihomo-region-parent-previous.XXXXXX)" || {
-    rm -f -- "$temporary_config" "$previous_state"
-    return 1
-  }
   if sudo test -f "$REGION_STATE_FILE"; then
     had_state=1
     sudo install -m 600 "$REGION_STATE_FILE" "$previous_state" || {
       rm -f -- "$temporary_config"
-      sudo rm -f -- "$previous_state" "$previous_parent"
+      sudo rm -f -- "$previous_state"
       return 1
     }
   fi
-  if sudo test -f "$REGION_PARENT_FILE"; then
-    had_parent=1
-    sudo install -m 600 "$REGION_PARENT_FILE" "$previous_parent" || {
-      rm -f -- "$temporary_config"
-      sudo rm -f -- "$previous_state" "$previous_parent"
-      return 1
-    }
-  fi
-  if ! atomic_install_file 600 "$candidate_state" "$REGION_STATE_FILE" || ! save_region_parent "$parent"; then
+  if ! atomic_install_file 600 "$candidate_state" "$REGION_STATE_FILE" || ! sync_mipilot_config_from_state; then
     restore_optional_managed_file "$previous_state" "$had_state" "$REGION_STATE_FILE" || true
-    restore_optional_managed_file "$previous_parent" "$had_parent" "$REGION_PARENT_FILE" || true
     sync_mipilot_config_from_state || true
-    sudo rm -f -- "$previous_state" "$previous_parent"
+    sudo rm -f -- "$previous_state"
     rm -f -- "$temporary_config"
-    echo "无法保存地区组状态, 现有配置未改变."
+    echo "无法保存自定义策略组状态, 现有配置未改变."
     return 1
   fi
   atomic_install_file 600 "$temporary_config" "$CONFIG_FILE" || {
     restore_optional_managed_file "$previous_state" "$had_state" "$REGION_STATE_FILE" || true
-    restore_optional_managed_file "$previous_parent" "$had_parent" "$REGION_PARENT_FILE" || true
     sync_mipilot_config_from_state || true
-    sudo rm -f -- "$previous_state" "$previous_parent"
+    sudo rm -f -- "$previous_state"
     rm -f -- "$temporary_config"
     return 1
   }
@@ -3547,16 +3758,15 @@ apply_region_group_state() {
   if ! restart_mihomo_with_progress || ! wait_mihomo_with_progress 2; then
     if rollback_config "$backup"; then
       restore_optional_managed_file "$previous_state" "$had_state" "$REGION_STATE_FILE" || true
-      restore_optional_managed_file "$previous_parent" "$had_parent" "$REGION_PARENT_FILE" || true
       sync_mipilot_config_from_state || true
     else
       echo "严重错误: 地区策略组配置回滚未完成, 已保留与当前配置对应的新状态."
     fi
-    sudo rm -f -- "$previous_state" "$previous_parent"
+    sudo rm -f -- "$previous_state"
     echo "地区策略组应用失败, 已尝试恢复原配置."
     return 1
   fi
-  sudo rm -f -- "$previous_state" "$previous_parent"
+  sudo rm -f -- "$previous_state"
   refresh_api_config
   echo "$success_message"
   echo "备份文件: ${backup}"
@@ -3569,7 +3779,7 @@ select_managed_region_record() {
 
   SELECTED_REGION_RECORD=""
   sudo test -s "$REGION_STATE_FILE" || {
-    echo "尚未创建 MiPilot 地区分组."
+    echo "尚未创建 MiPilot 自定义策略组."
     return 1
   }
   while IFS= read -r record; do
@@ -3590,7 +3800,7 @@ view_managed_region_group_nodes() {
   select_managed_region_record "选择要查看的 MiPilot 分组:" || return
   IFS=';' read -r _ name _ _ <<<"$SELECTED_REGION_RECORD"
   if ! jq -e --arg name "$name" '.proxies[$name].all != null' <<<"$response" >/dev/null; then
-    echo "当前运行配置中找不到分组 ${name}, 请重新应用地区分组."
+    echo "当前运行配置中找不到策略组 ${name}, 请重新应用自定义策略组."
     return 1
   fi
   group_type="$(jq -r --arg name "$name" '.proxies[$name].type // "未知"' <<<"$response")"
@@ -3611,7 +3821,7 @@ warn_empty_managed_region_groups() {
   while IFS=';' read -r _ name _ _; do
     [[ -n $name ]] || continue
     if ! jq -e --arg name "$name" '.proxies[$name].all != null and (.proxies[$name].all | length) > 0' <<<"$response" >/dev/null; then
-      echo "警告: 自定义分组 ${name} 在新订阅中没有匹配节点, 该组当前会回退到 REJECT."
+      echo "警告: 自定义策略组 ${name} 在新订阅中没有匹配节点, 该组当前会回退到 REJECT."
       empty_count=$((empty_count + 1))
     fi
   done < <(sudo cat "$REGION_STATE_FILE")
@@ -3734,6 +3944,8 @@ delete_managed_region_group() {
   local name
   local candidate_state
   local base_config
+  local parent
+  local selected_group
   local status
 
   select_managed_region_record "选择要删除的 MiPilot 分组:" || return
@@ -3754,12 +3966,17 @@ delete_managed_region_group() {
     rm -f -- "$candidate_state" "$base_config"
     return 1
   }
+  parent="$(sudo jq -r '.rule_selection.parent // empty' "$MANAGER_CONFIG_FILE" 2>/dev/null || true)"
+  selected_group="$(sudo jq -r '.rule_selection.group // empty' "$MANAGER_CONFIG_FILE" 2>/dev/null || true)"
   render_without_region_group "$CONFIG_FILE" "$base_config" "$name" || {
     rm -f -- "$candidate_state" "$base_config"
     return 1
   }
   apply_region_group_state "$candidate_state" region-delete "分组已删除: ${name}" "$base_config"
   status=$?
+  if (( status == 0 )) && [[ $selected_group == "$name" ]]; then
+    update_mipilot_selection rule "$parent" "$parent" || status=1
+  fi
   rm -f -- "$candidate_state" "$base_config"
   return "$status"
 }
@@ -3773,10 +3990,10 @@ show_managed_region_groups() {
   local index=1
 
   if ! sudo test -s "$REGION_STATE_FILE"; then
-    echo "尚未创建 MiPilot 地区分组."
+    echo "尚未创建 MiPilot 自定义策略组."
     return 0
   fi
-  echo "MiPilot 受管地区分组:"
+  echo "MiPilot 自定义策略组:"
   while IFS=';' read -r code name pattern group_mode; do
     [[ -n $code && -n $name && -n $pattern ]] || continue
     case "${group_mode:-url-test}" in
@@ -3812,13 +4029,6 @@ create_custom_region_group() {
   local index=1
   local region_codes=()
   local region_patterns=()
-  local parent
-
-  parent="${REGION_PARENT:-$(managed_region_parent)}"
-  if [[ $parent != "$REGION_MANAGED_PARENT" ]] && ! config_has_group "$CONFIG_FILE" "$parent"; then
-    echo "配置中找不到主策略组 ${parent}, 无法挂载自定义分组."
-    return 1
-  fi
   echo "可组合的地区:"
   while IFS=';' read -r code name pattern; do
     [[ -n $code && -n $name && -n $pattern ]] || continue
@@ -3850,7 +4060,7 @@ create_custom_region_group() {
   done
   [[ -n $combined_pattern ]] || return 1
 
-  read_line_or_back "自定义分组名称(将自动添加 MiPilot- 前缀): "
+  read_line_or_back "自定义策略组名称(将自动添加 MiPilot- 前缀): "
   status=$?
   if (( status != 0 )); then return "$status"; fi
   group_name="$INPUT_LINE"
@@ -3866,7 +4076,7 @@ create_custom_region_group() {
   fi
   if config_has_group "$CONFIG_FILE" "$group_name"; then
     echo "当前订阅已经存在同名策略组: ${group_name}"
-    echo "请使用其他名称, 避免把订阅分组误认为 MiPilot 自定义分组."
+    echo "请使用其他名称, 避免把订阅策略组误认为 MiPilot 自定义策略组."
     return 1
   fi
 
@@ -3919,7 +4129,7 @@ create_custom_region_group() {
     }
   fi
   printf 'custom-%s;%s;%s;%s\n' "$(date +%s%N)" "$group_name" "$combined_pattern" "$group_mode" >>"$candidate_state"
-  apply_region_group_state "$candidate_state" custom-group "自定义分组已创建: ${group_name}"
+  apply_region_group_state "$candidate_state" custom-group "自定义策略组已创建: ${group_name}"
   status=$?
   rm -f -- "$candidate_state"
   return "$status"
@@ -3932,15 +4142,15 @@ manage_region_groups() {
 
   while true; do
     clear
-    echo "================ 地区分组管理 ================"
+    echo "================ 策略组管理 =================="
     show_managed_region_groups
     cat <<'EOF'
 
- 1) 自动扫描并补充常用地区组
- 2) 创建自定义组合地区组
- 3) 查看分组匹配节点
- 4) 修改分组策略
- 5) 删除分组
+ 1) 按地区自动创建常用策略组
+ 2) 创建自定义策略组(可组合地区)
+ 3) 查看策略组匹配节点
+ 4) 修改策略组类型
+ 5) 删除自定义策略组
  0) 返回主菜单
 ================================================
 EOF
@@ -3953,10 +4163,6 @@ EOF
         require_api || { status=$?; }
         if [[ ${status:-0} == 0 ]]; then
           response="$(api "${API}/proxies")"
-          status=$?
-        fi
-        if (( status == 0 )); then
-          ensure_region_parent "$response"
           status=$?
         fi
         if (( status == 0 )); then
@@ -3980,7 +4186,7 @@ EOF
 manage_rule_nodes() {
   local response
   local parent
-  local parent_url
+  local selector_url
   local current
   local group
   local group_type
@@ -3989,27 +4195,23 @@ manage_rule_nodes() {
   local node_count
   local selected_label
   local index
-  local data
   local status
+  local data
   local groups=()
   local display_groups=()
 
   response="$(api "${API}/proxies")" || return
   ensure_region_parent "$response" || return
   parent="$REGION_PARENT"
-  if ! jq -e --arg parent "$parent" '.proxies[$parent].type == "Selector"' <<<"$response" >/dev/null; then
-    echo "当前订阅没有可挂载 MiPilot 分组的 ${parent} 策略组."
+  if ! jq -e --arg selector "$RULE_SELECTOR_GROUP" '.proxies[$selector].type == "Selector"' <<<"$response" >/dev/null; then
+    echo "当前运行配置中缺少 MiPilot 规则选择策略组, 请先运行维护或重新应用订阅."
     return 1
   fi
-  current="$(jq -r --arg parent "$parent" '.proxies[$parent].now // ""' <<<"$response")"
-  if [[ $parent == "$REGION_MANAGED_PARENT" ]]; then
-    echo "当前使用 MiPilot 兜底规则出口; 选择只影响 MATCH 及其他明确指向该出口的规则."
-  fi
+  current="$(jq -r --arg selector "$RULE_SELECTOR_GROUP" '.proxies[$selector].now // empty' <<<"$response")"
   mapfile -t groups < <(
-    jq -r --arg parent "$parent" '
+    jq -r --arg selector "$RULE_SELECTOR_GROUP" '
       . as $root
-      | $root.proxies[$parent].all[]
-      | select(. != $parent and . != "GLOBAL")
+      | $root.proxies[$selector].all[]?
       | . as $name
       | select($root.proxies[$name].all != null)
     ' <<<"$response"
@@ -4032,8 +4234,8 @@ manage_rule_nodes() {
     fi
   done
   if (( ${#groups[@]} == 0 )); then
-    echo "当前规则入口下没有可选择的策略组."
-    echo "可以从 [地区分组管理] 创建 MiPilot 自定义分组."
+    echo "当前配置没有可选择的策略组."
+    echo "可以从 [策略组管理] 创建 MiPilot 自定义策略组."
     return 1
   fi
 
@@ -4052,25 +4254,28 @@ manage_rule_nodes() {
     echo "无法识别策略组选择结果."
     return 1
   }
-  parent_url="$(urlencode "$parent")"
-  data="$(jq -nc --arg name "$group" '{name: $name}')"
-  api -X PUT -H 'Content-Type: application/json' --data "$data" \
-    "${API}/proxies/${parent_url}" >/dev/null
-  status=$?
-  if (( status == 130 )); then return 130; fi
-  if (( status != 0 )); then
-    echo "规则模式策略组切换失败."
-    return 1
-  fi
-  if ! update_mipilot_selection rule "$parent" "$group"; then
-    data="$(jq -nc --arg name "$current" '{name: $name}')"
+  if [[ $group != "$current" ]]; then
+    selector_url="$(urlencode "$RULE_SELECTOR_GROUP")"
+    data="$(jq -nc --arg name "$group" '{name: $name}')"
     api -X PUT -H 'Content-Type: application/json' --data "$data" \
-      "${API}/proxies/${parent_url}" >/dev/null 2>&1 || true
-    echo "MiPilot 配置保存失败, 已尝试恢复原规则策略组."
-    return 1
+      "${API}/proxies/${selector_url}" >/dev/null
+    status=$?
+    if (( status == 130 )); then return 130; fi
+    if (( status != 0 )); then
+      echo "规则模式策略组切换失败."
+      return 1
+    fi
+    if ! update_mipilot_selection rule "$parent" "$group"; then
+      data="$(jq -nc --arg name "$current" '{name: $name}')"
+      api -X PUT -H 'Content-Type: application/json' --data "$data" \
+        "${API}/proxies/${selector_url}" >/dev/null 2>&1 || true
+      echo "MiPilot 配置保存失败, 已尝试恢复原策略组."
+      return 1
+    fi
+    echo "规则模式已切换到策略组: ${group}"
+    response="$(api "${API}/proxies")" || return
   fi
   group_type="$(jq -r --arg group "$group" '.proxies[$group].type // ""' <<<"$response")"
-  echo "规则模式已切换到: ${group}"
   case "$group_type" in
     URLTest) echo "该组会自动测速并选择合适节点." ;;
     Fallback) echo "该组会在节点不可用时自动回退." ;;
@@ -4687,6 +4892,10 @@ download_and_apply_subscription() {
   local api_temporary
   local region_parent
   local region_parent_migrated=0
+  local selected_group
+  local previous_group
+  local selector_temporary
+  local rule_selection_changed=0
   local previous_parent
   local had_parent=0
   local backup
@@ -4742,28 +4951,46 @@ download_and_apply_subscription() {
     fi
   fi
 
+  previous_group="$(sudo jq -r '.rule_selection.group // empty' "$MANAGER_CONFIG_FILE" 2>/dev/null || true)"
+  region_parent="$(preferred_rule_parent_for_config "$temporary" "$(managed_region_parent)")"
+  [[ -n $region_parent ]] || {
+    rm -f -- "$temporary"
+    echo "新订阅没有可识别的规则策略目标, 现有配置未改变."
+    return 1
+  }
+  if [[ $region_parent != "$(managed_region_parent)" ]]; then
+    region_parent_migrated=1
+  fi
+
   if sudo test -s "$REGION_STATE_FILE"; then
-    region_parent="$(preferred_rule_parent_for_config "$temporary" "$(managed_region_parent)")"
-    if [[ $region_parent != "$(managed_region_parent)" ]]; then
-      if [[ $region_parent == "$REGION_MANAGED_PARENT" ]]; then
-        echo "新订阅没有唯一可确认的规则入口, 将迁移到 MiPilot 自有规则出口."
-      else
-        echo "新订阅提供了明确的规则入口, 将自定义分组挂载到 ${region_parent}."
-      fi
-      region_parent_migrated=1
-    fi
     region_temporary="$(mktemp /tmp/mihomo-region-override.XXXXXX.yaml)" || {
       rm -f -- "$temporary"
       return 1
     }
-    echo "正在重新合并已保存的地区策略组..."
-    if ! apply_region_groups_to_config "$temporary" "$region_temporary" "$REGION_STATE_FILE" "$region_parent"; then
+    echo "正在重新合并已保存的自定义策略组..."
+    if ! apply_region_groups_to_config "$temporary" "$region_temporary" "$REGION_STATE_FILE"; then
       rm -f -- "$temporary" "$region_temporary"
-      echo "无法将地区策略组合并到新订阅, 现有配置未改变."
+      echo "无法将自定义策略组合并到新订阅, 现有配置未改变."
       return 1
     fi
     mv -f -- "$region_temporary" "$temporary"
   fi
+
+  selected_group="$previous_group"
+  if [[ -z $selected_group ]] || ! config_has_group "$temporary" "$selected_group"; then
+    selected_group="$region_parent"
+  fi
+  [[ $selected_group == "$previous_group" ]] || rule_selection_changed=1
+  selector_temporary="$(mktemp /tmp/mihomo-rule-selector-override.XXXXXX.yaml)" || {
+    rm -f -- "$temporary"
+    return 1
+  }
+  if ! apply_rule_selector_to_config "$temporary" "$selector_temporary" "$region_parent"; then
+    rm -f -- "$temporary" "$selector_temporary"
+    echo "无法生成 MiPilot 规则选择策略组, 现有配置未改变."
+    return 1
+  fi
+  mv -f -- "$selector_temporary" "$temporary"
 
   mode_override="$(sudo jq -r '.mode // empty' "$MANAGER_CONFIG_FILE" 2>/dev/null || true)"
   if [[ $mode_override == rule || $mode_override == global || $mode_override == direct ]]; then
@@ -4831,7 +5058,7 @@ download_and_apply_subscription() {
     return 1
   }
 
-  if (( region_parent_migrated == 1 )); then
+  if (( region_parent_migrated == 1 || rule_selection_changed == 1 )); then
     previous_parent="$(mktemp /tmp/mihomo-subscription-parent-previous.XXXXXX)" || {
       rm -f -- "$temporary"
       return 1
@@ -4844,7 +5071,8 @@ download_and_apply_subscription() {
         return 1
       }
     fi
-    if ! save_region_parent "$region_parent"; then
+    if ! save_region_parent "$region_parent" ||
+       ! update_mipilot_selection rule "$region_parent" "$selected_group"; then
       rm -f -- "$temporary"
       sudo rm -f -- "$previous_parent"
       echo "无法保存新的规则入口, 现有配置未改变."
@@ -4853,9 +5081,10 @@ download_and_apply_subscription() {
   fi
 
   atomic_install_file 600 "$temporary" "$CONFIG_FILE" || {
-    if (( region_parent_migrated == 1 )); then
+    if (( region_parent_migrated == 1 || rule_selection_changed == 1 )); then
       restore_optional_managed_file "$previous_parent" "$had_parent" "$REGION_PARENT_FILE" || true
       sync_mipilot_config_from_state || true
+      update_mipilot_selection rule "$(managed_region_parent)" "$previous_group" || true
       sudo rm -f -- "$previous_parent"
     fi
     rm -f -- "$temporary"
@@ -4865,29 +5094,31 @@ download_and_apply_subscription() {
 
   if ! restart_mihomo_with_progress; then
     if rollback_config "$backup"; then
-      if (( region_parent_migrated == 1 )); then
+      if (( region_parent_migrated == 1 || rule_selection_changed == 1 )); then
         restore_optional_managed_file "$previous_parent" "$had_parent" "$REGION_PARENT_FILE" || true
         sync_mipilot_config_from_state || true
+        update_mipilot_selection rule "$(managed_region_parent)" "$previous_group" || true
       fi
       echo "新配置启动失败, 已自动回滚."
     else
       echo "新配置启动失败且自动回滚未完成, 请立即检查 ${backup}."
     fi
-    if (( region_parent_migrated == 1 )); then sudo rm -f -- "$previous_parent"; fi
+    if (( region_parent_migrated == 1 || rule_selection_changed == 1 )); then sudo rm -f -- "$previous_parent"; fi
     return 1
   fi
 
   if ! run_blocking "正在等待新订阅稳定运行" 15 wait_for_mihomo_stable 2; then
     if rollback_config "$backup"; then
-      if (( region_parent_migrated == 1 )); then
+      if (( region_parent_migrated == 1 || rule_selection_changed == 1 )); then
         restore_optional_managed_file "$previous_parent" "$had_parent" "$REGION_PARENT_FILE" || true
         sync_mipilot_config_from_state || true
+        update_mipilot_selection rule "$(managed_region_parent)" "$previous_group" || true
       fi
       echo "新配置未能稳定运行, 已自动回滚."
     else
       echo "新配置未稳定运行且自动回滚未完成, 请立即检查 ${backup}."
     fi
-    if (( region_parent_migrated == 1 )); then sudo rm -f -- "$previous_parent"; fi
+    if (( region_parent_migrated == 1 || rule_selection_changed == 1 )); then sudo rm -f -- "$previous_parent"; fi
     return 1
   fi
 
@@ -4895,14 +5126,13 @@ download_and_apply_subscription() {
   restore_mipilot_selections || true
   sync_proxy_state
   warn_empty_managed_region_groups || true
-  if (( region_parent_migrated == 1 )); then sudo rm -f -- "$previous_parent"; fi
+  if (( region_parent_migrated == 1 || rule_selection_changed == 1 )); then sudo rm -f -- "$previous_parent"; fi
   echo "订阅更新成功."
   echo "备份文件: ${backup}"
 }
 
 restore_mipilot_selections() {
   local response
-  local parent
   local group
   local node
   local target_url
@@ -4911,12 +5141,11 @@ restore_mipilot_selections() {
 
   mipilot_config_is_valid || return 0
   response="$(api_quick "${API}/proxies")" || return 1
-  parent="$(sudo jq -r '.rule_selection.parent // empty' "$MANAGER_CONFIG_FILE")"
   group="$(sudo jq -r '.rule_selection.group // empty' "$MANAGER_CONFIG_FILE")"
-  if [[ -n $parent && -n $group ]] && \
-     jq -e --arg parent "$parent" --arg group "$group" \
-       '.proxies[$parent].all | index($group) != null' <<<"$response" >/dev/null; then
-    target_url="$(urlencode "$parent")"
+  if [[ -n $group ]] &&
+     jq -e --arg selector "$RULE_SELECTOR_GROUP" --arg group "$group" \
+       '.proxies[$selector].all | index($group) != null' <<<"$response" >/dev/null; then
+    target_url="$(urlencode "$RULE_SELECTOR_GROUP")"
     data="$(jq -nc --arg name "$group" '{name: $name}')"
     api_quick -X PUT -H 'Content-Type: application/json' --data "$data" \
       "${API}/proxies/${target_url}" >/dev/null || failed=1
@@ -8101,7 +8330,7 @@ main_menu() {
   1) 查看运行状态
   2) 管理订阅
   3) 节点管理
-  4) 地区分组管理
+  4) 策略组管理
   5) 切换规则/全局/直连模式
 EOF
     printf '  6) %s\n' "$(terminal_proxy_action_label)"
