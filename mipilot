@@ -6022,9 +6022,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStartPre="${MANAGER_COMMAND}" --reconcile-tun-routing
+ExecStartPre=+${MANAGER_COMMAND} --reconcile-tun-routing
 ExecStart="${MIHOMO_BIN}" -d "${CONFIG_DIR}"
-ExecStopPost="${MANAGER_COMMAND}" --remove-tun-routing
+ExecStopPost=+${MANAGER_COMMAND} --remove-tun-routing
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1048576
@@ -6071,6 +6071,15 @@ wait_for_mihomo_stable() {
     version_response="$(api_quick "${API}/version")" || return 1
     running_version="$(jq -r '.version // empty' <<<"$version_response")"
     [[ ${running_version#v} == "${expected_version#v}" ]] || return 1
+  fi
+}
+
+show_mihomo_service_failure() {
+  echo "Mihomo 服务启动失败, 回滚前诊断如下:"
+  sudo -n systemctl status mihomo --no-pager --full 2>&1 || true
+  if command -v journalctl >/dev/null 2>&1; then
+    echo "最近的 Mihomo 服务日志:"
+    sudo -n journalctl -u mihomo -n 40 --no-pager 2>&1 || true
   fi
 }
 
@@ -6357,6 +6366,7 @@ install_from_local_bundle() {
   if [[ $runtime_mode == service ]]; then
     run_blocking "正在启用并启动 Mihomo 服务" 45 \
       sudo -n systemctl enable --now mihomo || {
+      show_mihomo_service_failure
       rollback_local_install "$config_backup" "$had_config"
       if [[ -n $runtime_snapshot ]] && restore_manager_runtime_state "$runtime_snapshot"; then
         sudo rm -rf -- "$runtime_snapshot"
@@ -6364,6 +6374,7 @@ install_from_local_bundle() {
       return 1
     }
     if ! wait_for_mihomo_stable 3; then
+      show_mihomo_service_failure
       rollback_local_install "$config_backup" "$had_config" || true
       if [[ -n $runtime_snapshot ]] && restore_manager_runtime_state "$runtime_snapshot"; then
         sudo rm -rf -- "$runtime_snapshot"

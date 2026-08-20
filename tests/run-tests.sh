@@ -605,8 +605,9 @@ test_service_unit_reconciles_tun_routing() {
   }
 
   write_service_unit || return 1
-  assert_file_has_line "$SERVICE_FILE" "ExecStartPre=\"${MANAGER_COMMAND}\" --reconcile-tun-routing" "service TUN routing setup" || return 1
-  assert_file_has_line "$SERVICE_FILE" "ExecStopPost=\"${MANAGER_COMMAND}\" --remove-tun-routing" "service TUN routing cleanup"
+  assert_file_has_line "$SERVICE_FILE" "ExecStartPre=+${MANAGER_COMMAND} --reconcile-tun-routing" "privileged service TUN routing setup" || return 1
+  assert_file_has_line "$SERVICE_FILE" "ExecStart=\"${MIHOMO_BIN}\" -d \"${CONFIG_DIR}\"" "restricted Mihomo service process" || return 1
+  assert_file_has_line "$SERVICE_FILE" "ExecStopPost=+${MANAGER_COMMAND} --remove-tun-routing" "privileged service TUN routing cleanup"
 }
 
 test_tun_routing_action_uses_independent_lock() {
