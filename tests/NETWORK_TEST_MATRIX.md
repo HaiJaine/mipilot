@@ -33,8 +33,8 @@ diff -u /tmp/mipilot-network-before.txt /tmp/mipilot-network-after.txt || true
 | N05 | DNS服务器不可达 | 临时阻断原DNS后开启TUN | DNS劫持接管或明确报错; IP直连与域名失败能够区分 |
 | N06 | nftables防火墙 | 启用默认拒绝出站规则 | TUN检查给出公网失败;放行Mihomo TUN网卡后恢复 |
 | N07 | iptables防火墙 | 使用iptables后端重复N06 | 行为与nftables场景一致 |
-| N08 | Docker bridge | TUN前启动现有容器, 测试容器出站 | 宿主机与容器原有访问能力不被破坏 |
-| N09 | Docker端口映射 | 从另一台机器访问容器映射端口 | 开关TUN前后端口均可访问, 不依赖按源端口旁路规则 |
+| N08 | Docker bridge | TUN前启动现有容器, 测试容器出站 | 宿主机和容器均可出站; 容器公网流量由Mihomo处理 |
+| N09 | Docker端口映射 | 从另一台机器访问容器映射端口, 同时抓取物理网卡与bridge | 开关TUN前后端口均可访问; 回包走原物理网卡; 不依赖按端口旁路 |
 | N10 | 宿主机公网监听端口 | 测试SSH和一个临时HTTP服务 | 新连接和已有连接均正常回程 |
 | N11 | IPv4/IPv6双栈 | 分别访问IPv4、IPv6测试地址 | IPv4正常; 系统有IPv6默认路由时IPv6正常或明确禁用 |
 | N12 | 仅IPv4系统 | 没有IPv6地址时开启TUN | 不因缺少IPv6导致整体失败 |
@@ -46,12 +46,16 @@ diff -u /tmp/mipilot-network-before.txt /tmp/mipilot-network-after.txt || true
 | N18 | 订阅更新期间TUN开启 | 更新为节点名称变化的订阅 | TUN保持开启; 空地区组明确告警; 原运行模式不变化 |
 | N19 | DHCP地址和网关变化 | TUN运行时续租或切换网关 | 自动出口重新识别;新旧路由没有残留冲突 |
 | N20 | VPN与TUN叠加 | 先连接WireGuard/OpenVPN再开启TUN | 明确验证出口、内网网段和DNS; 不出现路由环路 |
-| N21 | 系统重启 | TUN开启状态重启服务器 | Mihomo启动; TUN状态和规则模式保持; 无旧端口旁路服务 |
+| N21 | 系统重启 | TUN开启状态重启服务器 | Mihomo启动; `inet mipilot_tun`和受管ip rule恢复; TUN状态和规则模式保持 |
 | N22 | 快速连续启停 | 连续执行5次启用/关闭 | 配置始终可验证; 状态文件与API一致; 路由无累积残留 |
 | N23 | 全局模式启停TUN | 选择全局节点, 连续启停TUN | `mode`仍为global; 全局节点选择保持; MiPilot配置未丢字段 |
 | N24 | 规则模式更新订阅 | 选择自定义地区组后更新订阅 | 当前模式、地区组策略及仍存在的节点选择自动恢复 |
 | N25 | 内核和管理器升级 | 升级前配置订阅、TUN、分组和节点 | `/etc/mipilot/config.json`内容保持; 生成配置与持久设置一致 |
 | N26 | 配置包恢复 | 修改多项设置后恢复历史备份 | Mihomo配置与配套MiPilot配置同时恢复, 不出现状态错位 |
+| N27 | TUN后安装Docker | 无Docker时开启TUN, 再安装Docker并启动端口发布服务 | 不重启TUN即可访问发布端口; 容器主动出站仍经过Mihomo |
+| N28 | TUN后更新容器网络 | TUN运行时新增端口、删除并重建Compose bridge | 新DNAT连接自动受回程保护; 无需更新MiPilot端口或网段配置 |
+| N29 | Podman bridge | 创建managed bridge并发布端口 | 容器出站经过Mihomo; 外部入站回包保持原路径 |
+| N30 | MiPilot资源冲突 | 预占8990优先级和一个候选fwmark后开启TUN | 自动选择空闲资源并写入状态; 不删除预存规则 |
 
 ## 必须收集的证据
 
@@ -64,6 +68,7 @@ ip -details rule show
 ip -4 route show table all
 ip -6 route show table all
 sudo nft list ruleset 2>/dev/null || sudo iptables-save
+sudo mipilot --doctor
 ```
 
 不得只以 `systemctl is-active mihomo` 或HTTP 200判断成功。必须同时确认API TUN状态、路由、DNS、代理出站和SSH回程。

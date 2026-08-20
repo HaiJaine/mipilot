@@ -42,14 +42,19 @@ CLEANUP_SERVICE_FILE="${MIPILOT_CLEANUP_SERVICE_FILE:-/etc/systemd/system/mipilo
 CLEANUP_TIMER_FILE="${MIPILOT_CLEANUP_TIMER_FILE:-/etc/systemd/system/mipilot-cleanup.timer}"
 TUN_BYPASS_SERVICE_FILE="${MIPILOT_TUN_BYPASS_SERVICE_FILE:-/etc/systemd/system/mipilot-tun-bypass.service}"
 STATE_DIR="${MIPILOT_STATE_DIR:-/var/lib/mipilot}"
+TUN_ROUTING_STATE_FILE="${MIPILOT_TUN_ROUTING_STATE_FILE:-${STATE_DIR}/tun-routing.state}"
+TUN_ROUTING_TABLE="mipilot_tun"
 ROLLBACK_DIR="${STATE_DIR}/rollback"
 INSTALL_MARKER="${STATE_DIR}/installed"
 MANUAL_LOG_FILE="${MIPILOT_MANUAL_LOG_FILE:-${STATE_DIR}/mihomo.log}"
 MANUAL_PID_FILE="${MIPILOT_MANUAL_PID_FILE:-/run/mipilot/mihomo.pid}"
 LOCK_FILE="${MIPILOT_LOCK_FILE:-/run/lock/mipilot.lock}"
+TUN_ROUTING_LOCK_FILE="${MIPILOT_TUN_ROUTING_LOCK_FILE:-/run/lock/mipilot-tun-routing.lock}"
 ROLLBACK_MAX_AGE=$((72 * 60 * 60))
 MANAGER_RELEASE_BASE="https://github.com/HaiJaine/mipilot/releases/latest/download"
 TUN_BYPASS_RULE_PRIORITY=8990
+TUN_ROUTING_PRIORITY_MAX=8990
+TUN_ROUTING_PRIORITY_MIN=8950
 SHELL_INTEGRATION_BEGIN="# >>> mipilot managed >>>"
 SHELL_INTEGRATION_END="# <<< mipilot managed <<<"
 LEGACY_MIHOMOCTL_BEGIN="# >>> mihomoctl managed >>>"
@@ -1027,7 +1032,7 @@ render_tun_config() {
       if (tun_enabled == "true") {
         if (!stack_seen) print "  stack: mixed"
         if (!auto_route_seen) print "  auto-route: true"
-        if (!auto_redirect_seen) print "  auto-redirect: true"
+        if (!auto_redirect_seen) print "  auto-redirect: false"
         if (!auto_detect_seen) print "  auto-detect-interface: true"
         if (!dns_hijack_seen) {
           print "  dns-hijack:"
@@ -1080,7 +1085,7 @@ render_tun_config() {
         if ($0 ~ /^[[:space:]]+auto-redirect:[[:space:]]*/) {
           auto_redirect_seen = 1
           if (tun_enabled == "true") {
-            print replace_boolean($0, "auto-redirect", "true")
+            print replace_boolean($0, "auto-redirect", "false")
             next
           }
         }
@@ -1109,7 +1114,7 @@ render_tun_config() {
         print "  enable: " tun_enabled
         print "  stack: mixed"
         print "  auto-route: true"
-        print "  auto-redirect: true"
+        print "  auto-redirect: false"
         print "  auto-detect-interface: true"
         print "  dns-hijack:"
         print "    - any:53"
@@ -1254,6 +1259,375 @@ cleanup_legacy_tun_bypass() {
   return "$failed"
 }
 
+tun_routing_state_value() {
+  local key="$1"
+
+  sudo -n awk -F= -v key="$key" '$1 == key { print $2; exit }' "$TUN_ROUTING_STATE_FILE" 2>/dev/null
+}
+
+tun_routing_state_is_valid() {
+  local version
+  local table
+  local priority
+  local mark
+
+  sudo -n test -f "$TUN_ROUTING_STATE_FILE" || return 1
+  version="$(tun_routing_state_value version)"
+  table="$(tun_routing_state_value table)"
+  priority="$(tun_routing_state_value priority)"
+  mark="$(tun_routing_state_value mark)"
+  [[ $version == 1 && $table == "$TUN_ROUTING_TABLE" ]] || return 1
+  [[ $priority =~ ^[0-9]+$ ]] || return 1
+  (( priority >= TUN_ROUTING_PRIORITY_MIN && priority <= TUN_ROUTING_PRIORITY_MAX )) || return 1
+  case "$mark" in
+    0x40000000|0x20000000|0x10000000|0x08000000) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+tun_routing_priority_in_use() {
+  local priority="$1"
+
+  ip -4 rule show 2>/dev/null | grep -Eq "^[[:space:]]*${priority}:" && return 0
+  ip -6 rule show 2>/dev/null | grep -Eq "^[[:space:]]*${priority}:" && return 0
+  return 1
+}
+
+select_tun_routing_priority() {
+  local priority
+
+  for ((priority = TUN_ROUTING_PRIORITY_MAX; priority >= TUN_ROUTING_PRIORITY_MIN; priority--)); do
+    if ! tun_routing_priority_in_use "$priority"; then
+      printf '%s\n' "$priority"
+      return 0
+    fi
+  done
+  return 1
+}
+
+tun_routing_mark_in_use() {
+  local mark="$1"
+  local decimal=$((mark))
+  local pattern
+
+  pattern="${mark}|${decimal}"
+  ip -4 rule show 2>/dev/null \
+    | grep -Eiq "(^|[^[:alnum:]_])(${pattern})([^[:alnum:]_]|$)" && return 0
+  ip -6 rule show 2>/dev/null \
+    | grep -Eiq "(^|[^[:alnum:]_])(${pattern})([^[:alnum:]_]|$)" && return 0
+  sudo -n nft list ruleset 2>/dev/null \
+    | grep -Eiq "(^|[^[:alnum:]_])(${pattern})([^[:alnum:]_]|$)" && return 0
+  return 1
+}
+
+select_tun_routing_mark() {
+  local mark
+
+  for mark in 0x40000000 0x20000000 0x10000000 0x08000000; do
+    if ! tun_routing_mark_in_use "$mark"; then
+      printf '%s\n' "$mark"
+      return 0
+    fi
+  done
+  return 1
+}
+
+tun_routing_rule_exists() {
+  local family="$1"
+  local priority="$2"
+  local mark="$3"
+
+  ip "$family" rule show 2>/dev/null \
+    | grep -Eq "^[[:space:]]*${priority}:[[:space:]].*fwmark ${mark}/${mark}.*lookup main([[:space:]]|$)"
+}
+
+tun_routing_nft_rules_ready() {
+  local mark="$1"
+  local decimal=$((mark))
+  local chain
+  local original_rule
+  local reply_rule
+
+  chain="$(sudo -n nft list chain inet "$TUN_ROUTING_TABLE" prerouting 2>/dev/null)" || return 1
+  original_rule="$(grep -F 'ct direction original' <<<"$chain" | grep -F 'ct status dnat' | grep -F 'ct mark set' || true)"
+  reply_rule="$(grep -F 'ct direction reply' <<<"$chain" | grep -F 'meta mark set' || true)"
+  [[ -n $original_rule && -n $reply_rule ]] || return 1
+  grep -Eiq "(^|[^[:alnum:]_])((${mark})|(${decimal}))([^[:alnum:]_]|$)" <<<"$original_rule" || return 1
+  grep -Eiq "(^|[^[:alnum:]_])((${mark})|(${decimal}))([^[:alnum:]_]|$)" <<<"$reply_rule"
+}
+
+tun_routing_rules_ready() {
+  local priority
+  local mark
+  local family
+  local families=(-4)
+
+  tun_routing_state_is_valid || return 1
+  priority="$(tun_routing_state_value priority)"
+  mark="$(tun_routing_state_value mark)"
+  [[ $priority =~ ^[0-9]+$ && $mark =~ ^0x[0-9a-fA-F]+$ ]] || return 1
+  tun_routing_nft_rules_ready "$mark" || return 1
+  ip -6 rule show >/dev/null 2>&1 && families+=(-6)
+  for family in "${families[@]}"; do
+    tun_routing_rule_exists "$family" "$priority" "$mark" || return 1
+  done
+}
+
+remove_tun_routing_rules() {
+  local priority=""
+  local mark=""
+  local family
+  local failed=0
+  local families=(-4)
+
+  ip -6 rule show >/dev/null 2>&1 && families+=(-6)
+
+  if sudo -n test -f "$TUN_ROUTING_STATE_FILE"; then
+    priority="$(tun_routing_state_value priority)"
+    mark="$(tun_routing_state_value mark)"
+    if ! tun_routing_state_is_valid; then
+      echo "MiPilot TUN 路由状态文件格式异常, 未自动删除未知网络规则."
+      return 1
+    fi
+    for family in "${families[@]}"; do
+      while tun_routing_rule_exists "$family" "$priority" "$mark"; do
+        sudo -n ip "$family" rule del priority "$priority" fwmark "${mark}/${mark}" lookup main || {
+          failed=1
+          break
+        }
+      done
+    done
+  fi
+
+  if sudo -n nft list table inet "$TUN_ROUTING_TABLE" >/dev/null 2>&1; then
+    if sudo -n test -f "$TUN_ROUTING_STATE_FILE"; then
+      sudo -n nft delete table inet "$TUN_ROUTING_TABLE" || failed=1
+    else
+      echo "检测到非受管的 nftables 表 inet ${TUN_ROUTING_TABLE}, 未自动删除."
+      failed=1
+    fi
+  fi
+
+  if (( failed == 0 )); then
+    sudo -n rm -f -- "$TUN_ROUTING_STATE_FILE"
+  fi
+  return "$failed"
+}
+
+write_tun_routing_state() {
+  local priority="$1"
+  local mark="$2"
+  local temporary
+
+  temporary="$(mktemp /tmp/mipilot-tun-routing-state.XXXXXX)" || return 1
+  printf 'version=1\ntable=%s\npriority=%s\nmark=%s\n' \
+    "$TUN_ROUTING_TABLE" "$priority" "$mark" >"$temporary"
+  sudo -n install -d -m 700 "$STATE_DIR" || {
+    rm -f -- "$temporary"
+    return 1
+  }
+  atomic_install_file 600 "$temporary" "$TUN_ROUTING_STATE_FILE"
+  local status=$?
+  rm -f -- "$temporary"
+  return "$status"
+}
+
+setup_tun_routing_rules() {
+  local priority
+  local mark
+  local rules_file
+  local family
+  local cleanup_family
+  local families=(-4)
+
+  ip -6 rule show >/dev/null 2>&1 && families+=(-6)
+
+  command -v nft >/dev/null 2>&1 || {
+    echo "缺少 nft 命令, 无法建立 TUN 入站连接回程保护."
+    return 1
+  }
+  tun_routing_rules_ready && return 0
+
+  if sudo -n test -f "$TUN_ROUTING_STATE_FILE"; then
+    priority="$(tun_routing_state_value priority)"
+    mark="$(tun_routing_state_value mark)"
+    tun_routing_state_is_valid || {
+      echo "MiPilot TUN 路由状态文件格式异常."
+      return 1
+    }
+    remove_tun_routing_rules || return 1
+    if tun_routing_priority_in_use "$priority"; then
+      priority="$(select_tun_routing_priority)" || {
+        echo "无法重新分配 TUN 回程规则优先级."
+        return 1
+      }
+    fi
+    if tun_routing_mark_in_use "$mark"; then
+      mark="$(select_tun_routing_mark)" || {
+        echo "无法重新分配 TUN 回程连接标记."
+        return 1
+      }
+    fi
+  else
+    if sudo -n nft list table inet "$TUN_ROUTING_TABLE" >/dev/null 2>&1; then
+      echo "nftables 表 inet ${TUN_ROUTING_TABLE} 已存在但不属于当前 MiPilot 状态."
+      return 1
+    fi
+    priority="$(select_tun_routing_priority)" || {
+      echo "无法在 ${TUN_ROUTING_PRIORITY_MIN}-${TUN_ROUTING_PRIORITY_MAX} 中分配 TUN 回程规则优先级."
+      return 1
+    }
+    mark="$(select_tun_routing_mark)" || {
+      echo "无法分配不冲突的 TUN 回程连接标记."
+      return 1
+    }
+  fi
+
+  rules_file="$(mktemp /tmp/mipilot-tun-routing.XXXXXX.nft)" || return 1
+  cat >"$rules_file" <<EOF
+table inet ${TUN_ROUTING_TABLE} {
+  chain prerouting {
+    type filter hook prerouting priority -90; policy accept;
+    ct direction original ct status dnat ct mark set ct mark | ${mark}
+    ct direction reply ct mark & ${mark} == ${mark} meta mark set meta mark | ${mark}
+  }
+}
+EOF
+  if ! sudo -n nft -f "$rules_file"; then
+    rm -f -- "$rules_file"
+    return 1
+  fi
+  rm -f -- "$rules_file"
+
+  for family in "${families[@]}"; do
+    if ! sudo -n ip "$family" rule add priority "$priority" fwmark "${mark}/${mark}" lookup main; then
+      for cleanup_family in "${families[@]}"; do
+        sudo -n ip "$cleanup_family" rule del priority "$priority" fwmark "${mark}/${mark}" lookup main >/dev/null 2>&1 || true
+      done
+      sudo -n nft delete table inet "$TUN_ROUTING_TABLE" >/dev/null 2>&1 || true
+      return 1
+    fi
+  done
+
+  if ! write_tun_routing_state "$priority" "$mark"; then
+    for family in "${families[@]}"; do
+      sudo -n ip "$family" rule del priority "$priority" fwmark "${mark}/${mark}" lookup main >/dev/null 2>&1 || true
+    done
+    sudo -n nft delete table inet "$TUN_ROUTING_TABLE" >/dev/null 2>&1 || true
+    return 1
+  fi
+}
+
+reconcile_tun_routing_rules() {
+  case "$(tun_config_value)" in
+    true) setup_tun_routing_rules ;;
+    false) remove_tun_routing_rules ;;
+    *) echo "无法识别 TUN 状态, 未调整 MiPilot 网络规则."; return 1 ;;
+  esac
+}
+
+run_tun_routing_action() {
+  local action="$1"
+  local internal_action
+
+  case "$action" in
+    reconcile) internal_action=--reconcile-tun-routing-unlocked ;;
+    remove) internal_action=--remove-tun-routing-unlocked ;;
+    *) return 1 ;;
+  esac
+  sudo -n flock --exclusive --wait 30 "$TUN_ROUTING_LOCK_FILE" \
+    env MIPILOT_CONFIG_DIR="$CONFIG_DIR" \
+        MIPILOT_STATE_DIR="$STATE_DIR" \
+        MIPILOT_TUN_ROUTING_STATE_FILE="$TUN_ROUTING_STATE_FILE" \
+        bash "$SCRIPT_PATH" "$internal_action"
+}
+
+tun_routing_status_label() {
+  case "$(tun_config_value)" in
+    false) printf '未启用' ;;
+    true)
+      if tun_routing_rules_ready; then
+        printf '已就绪'
+      elif sudo -n test -f "$TUN_ROUTING_STATE_FILE"; then
+        printf '规则不完整'
+      else
+        printf '未建立'
+      fi
+      ;;
+    *) printf '状态未知' ;;
+  esac
+}
+
+list_network_interfaces_by_role() {
+  ip -o link show 2>/dev/null \
+    | awk -F': ' '{ name = $2; sub(/@.*/, "", name); print name }' \
+    | grep -E '^(tun|tap|wg|tailscale|zt|docker|podman|br-|virbr|lxdbr|cni|flannel|veth)' \
+    | sort -u
+}
+
+show_tun_network_warnings() {
+  local default_route_count
+  local tunnel_interfaces
+
+  default_route_count="$(ip -4 route show default 2>/dev/null | awk 'NF { count++ } END { print count + 0 }')"
+  if (( default_route_count > 1 )); then
+    echo "提示: 检测到 ${default_route_count} 条 IPv4 默认路由, 启用后需要确认实际出口和回程网卡."
+  fi
+  tunnel_interfaces="$(list_network_interfaces_by_role | grep -E '^(tun|tap|wg|tailscale|zt)' || true)"
+  if [[ -n $tunnel_interfaces ]]; then
+    echo "提示: 检测到其他隧道接口: $(tr '\n' ' ' <<<"$tunnel_interfaces" | sed 's/[[:space:]]*$//')"
+    echo "MiPilot 不会自动改变这些隧道的优先级, 请确认对应内网和远程管理链路."
+  fi
+}
+
+show_network_compatibility_report() {
+  local priority
+  local mark
+  local interfaces
+
+  echo "MiPilot 网络兼容性检查"
+  echo "TUN 配置: $(tun_status_label)"
+  echo "TUN 回程保护: $(tun_routing_status_label)"
+  if sudo -n test -f "$TUN_ROUTING_STATE_FILE"; then
+    priority="$(tun_routing_state_value priority)"
+    mark="$(tun_routing_state_value mark)"
+    echo "受管路由优先级: ${priority:-读取失败}"
+    echo "受管连接标记: ${mark:-读取失败}"
+  fi
+  echo
+  echo "IPv4 默认路由:"
+  ip -4 route show default 2>/dev/null || true
+  echo
+  echo "IPv6 默认路由:"
+  ip -6 route show default 2>/dev/null || true
+  echo
+  echo "相关网络接口:"
+  interfaces="$(list_network_interfaces_by_role || true)"
+  if [[ -n $interfaces ]]; then
+    printf '%s\n' "$interfaces"
+  else
+    echo "未检测到常见容器、虚拟机或隧道接口."
+  fi
+  echo
+  echo "MiPilot 路由规则:"
+  if sudo -n test -f "$TUN_ROUTING_STATE_FILE"; then
+    ip -4 rule show 2>/dev/null | grep -E "^[[:space:]]*${priority}:" || true
+    ip -6 rule show 2>/dev/null | grep -E "^[[:space:]]*${priority}:" || true
+  else
+    echo "无受管规则状态."
+  fi
+  echo
+  echo "MiPilot nftables 表:"
+  sudo -n nft list table inet "$TUN_ROUTING_TABLE" 2>/dev/null || echo "未建立."
+  if command -v ss >/dev/null 2>&1; then
+    echo
+    echo "本机 DNS 监听:"
+    sudo -n ss -lntu 2>/dev/null | awk 'NR == 1 || $5 ~ /:53$|\]:53$/' || true
+  fi
+  echo
+  show_tun_network_warnings
+}
+
 verify_tun_runtime_network() {
   local config_response
   local ssh_client=""
@@ -1263,6 +1637,10 @@ verify_tun_runtime_network() {
   [[ -n $API ]] || return 1
   config_response="$(api_quick "${API}/configs")" || return 1
   jq -e '.tun.enable == true' <<<"$config_response" >/dev/null || return 1
+  if ! tun_routing_rules_ready; then
+    echo "MiPilot TUN 入站连接回程保护未正确建立."
+    return 1
+  fi
   ip route get 1.1.1.1 >/dev/null 2>&1 || return 1
 
   default_route_count="$(ip -4 route show default 2>/dev/null | awk 'NF { count++ } END { print count + 0 }')"
@@ -1409,6 +1787,7 @@ enable_tun_mode() {
 
   echo "开启 TUN 会修改服务器路由和 DNS, 远程 SSH 连接可能受到影响."
   echo "当前终端代理: $(proxy_status_label)"
+  show_tun_network_warnings
 
   if [[ ${MIHOMO_PROXY_ENABLED:-0} == 1 || -n ${http_proxy:-} || -n ${https_proxy:-} || -n ${all_proxy:-} || -n ${HTTP_PROXY:-} || -n ${HTTPS_PROXY:-} || -n ${ALL_PROXY:-} ]]; then
     read_line_or_back "检测到系统代理已开启, 是否先关闭? (Y/n, Esc返回): "
@@ -1982,6 +2361,7 @@ show_overview() {
     echo "开机启动: 不适用(手动模式)"
   fi
   echo "TUN 模式: $(tun_status_label)"
+  echo "TUN 回程保护: $(tun_routing_status_label)"
   echo "订阅链接: $(subscription_status_label)"
   echo
   echo "监听配置:"
@@ -5112,6 +5492,7 @@ tun:
   enable: false
   stack: mixed
   auto-route: true
+  auto-redirect: false
   auto-detect-interface: true
 proxies: []
 proxy-groups: []
@@ -5196,6 +5577,7 @@ manual_start() {
   local pid_directory
 
   manual_is_active && return 0
+  run_tun_routing_action reconcile || return 1
   pid_directory="$(dirname -- "$MANUAL_PID_FILE")"
   sudo install -d -m 700 "$STATE_DIR" "$pid_directory" || return 1
   sudo rm -f -- "$MANUAL_PID_FILE" || return 1
@@ -5238,11 +5620,17 @@ runtime_start() {
 }
 
 runtime_stop() {
+  local status
+
   if [[ $(installed_runtime_mode) == service ]]; then
     sudo -n systemctl stop mihomo
+    status=$?
   else
     manual_stop
+    status=$?
   fi
+  (( status == 0 )) || return "$status"
+  run_tun_routing_action remove
 }
 
 runtime_restart() {
@@ -5314,7 +5702,7 @@ missing_runtime_commands() {
   local command_name
   local missing=()
 
-  for command_name in awk curl cut find flock gzip grep ip jq sed setsid sha256sum sort stat sudo systemctl timeout tr; do
+  for command_name in awk curl cut find flock gzip grep ip jq nft sed setsid sha256sum sort stat sudo systemctl timeout tr; do
     command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
   done
   printf '%s\n' "${missing[*]}"
@@ -5341,7 +5729,7 @@ ensure_install_dependencies() {
 
   echo "正在更新软件源并安装依赖, 此过程可能需要几分钟..."
   sudo apt-get update || return 1
-  sudo apt-get install -y ca-certificates coreutils curl findutils gzip iproute2 jq util-linux || return 1
+  sudo apt-get install -y ca-certificates coreutils curl findutils gzip iproute2 jq nftables util-linux || return 1
   missing="$(missing_runtime_commands)"
   if [[ -n $missing ]]; then
     echo "依赖安装后仍缺少命令: ${missing}"
@@ -5349,7 +5737,7 @@ ensure_install_dependencies() {
   fi
 }
 
-LOCAL_MIHOMO_ARCHIVE=""
+LOCAL_MIHOMO_SOURCE=""
 LOCAL_COUNTRY_MMDB=""
 LOCAL_GEOSITE_DAT=""
 STAGED_MIHOMO_BIN=""
@@ -5360,7 +5748,7 @@ find_local_assets() {
   local candidates=()
   local sorted=()
 
-  LOCAL_MIHOMO_ARCHIVE=""
+  LOCAL_MIHOMO_SOURCE=""
   LOCAL_COUNTRY_MMDB=""
   LOCAL_GEOSITE_DAT=""
   [[ -d $directory ]] || return 1
@@ -5370,9 +5758,11 @@ find_local_assets() {
       candidates+=("$candidate")
     fi
   done < <(find "$directory" -maxdepth 1 -type f -name 'mihomo-linux-amd64-v*.gz' -print0 2>/dev/null)
-  if (( ${#candidates[@]} > 0 )); then
+  if [[ -s $directory/mihomo ]]; then
+    LOCAL_MIHOMO_SOURCE="$directory/mihomo"
+  elif (( ${#candidates[@]} > 0 )); then
     mapfile -t sorted < <(printf '%s\n' "${candidates[@]}" | sort -V)
-    LOCAL_MIHOMO_ARCHIVE="${sorted[$((${#sorted[@]} - 1))]}"
+    LOCAL_MIHOMO_SOURCE="${sorted[$((${#sorted[@]} - 1))]}"
   fi
 
   for candidate in "$directory/country.mmdb" "$directory/Country.mmdb"; do
@@ -5382,7 +5772,7 @@ find_local_assets() {
     if [[ -s $candidate ]]; then LOCAL_GEOSITE_DAT="$candidate"; break; fi
   done
 
-  [[ -n $LOCAL_MIHOMO_ARCHIVE && -n $LOCAL_COUNTRY_MMDB && -n $LOCAL_GEOSITE_DAT ]]
+  [[ -n $LOCAL_MIHOMO_SOURCE && -n $LOCAL_COUNTRY_MMDB && -n $LOCAL_GEOSITE_DAT ]]
 }
 
 show_required_local_assets() {
@@ -5390,6 +5780,9 @@ show_required_local_assets() {
 请把以下文件放到同一目录后重试:
   country.mmdb
   geosite.dat
+  mihomo
+
+也兼容官方压缩文件:
   mihomo-linux-amd64-v<版本>.gz
 
 官方地址:
@@ -5398,24 +5791,34 @@ show_required_local_assets() {
 EOF
 }
 
+stage_mihomo_source() {
+  local source_file="$1"
+  local output_file="$2"
+
+  [[ -s $source_file ]] || return 1
+  if [[ $source_file == *.gz ]]; then
+    gzip -t "$source_file" || return 1
+    gzip -dc "$source_file" >"$output_file"
+  else
+    cp -- "$source_file" "$output_file"
+  fi
+  chmod 755 "$output_file"
+}
+
 validate_local_assets() {
   local validation_dir
   local validation_config
 
-  [[ -s $LOCAL_MIHOMO_ARCHIVE && -s $LOCAL_COUNTRY_MMDB && -s $LOCAL_GEOSITE_DAT ]] || return 1
-  gzip -t "$LOCAL_MIHOMO_ARCHIVE" || {
-    echo "Mihomo 压缩包校验失败: ${LOCAL_MIHOMO_ARCHIVE}"
-    return 1
-  }
+  [[ -s $LOCAL_MIHOMO_SOURCE && -s $LOCAL_COUNTRY_MMDB && -s $LOCAL_GEOSITE_DAT ]] || return 1
   STAGED_MIHOMO_BIN="$(mktemp /tmp/mipilot-core.XXXXXX)" || return 1
-  gzip -dc "$LOCAL_MIHOMO_ARCHIVE" >"$STAGED_MIHOMO_BIN" || {
+  stage_mihomo_source "$LOCAL_MIHOMO_SOURCE" "$STAGED_MIHOMO_BIN" || {
+    echo "Mihomo 文件校验失败: ${LOCAL_MIHOMO_SOURCE}"
     rm -f -- "$STAGED_MIHOMO_BIN"
     STAGED_MIHOMO_BIN=""
     return 1
   }
-  chmod 755 "$STAGED_MIHOMO_BIN"
   "$STAGED_MIHOMO_BIN" -v | grep -Fq 'Mihomo Meta' || {
-    echo "压缩包中的程序不是有效的 Mihomo 内核."
+    echo "提供的程序不是有效的 Mihomo 内核."
     rm -f -- "$STAGED_MIHOMO_BIN"
     STAGED_MIHOMO_BIN=""
     return 1
@@ -5517,6 +5920,14 @@ save_component_rollback() {
       else
         sudo touch "${temporary}/install-marker.absent" || return 1
       fi
+      if sudo test -f "$SERVICE_FILE"; then
+        sudo install -m 644 "$SERVICE_FILE" "${temporary}/mihomo.service" || {
+          sudo rm -rf -- "$temporary"
+          return 1
+        }
+      else
+        sudo touch "${temporary}/mihomo.service.absent" || return 1
+      fi
       ;;
   esac
   printf '%s\n' "$(date +%s)" | sudo tee "${temporary}/created_at" >/dev/null || {
@@ -5571,6 +5982,11 @@ restore_component_rollback() {
       elif sudo test -f "${slot}/install-marker.absent"; then
         sudo rm -f -- "$INSTALL_MARKER" || return 1
       fi
+      if sudo test -f "${slot}/mihomo.service"; then
+        sudo install -m 644 "${slot}/mihomo.service" "$SERVICE_FILE" || return 1
+      elif sudo test -f "${slot}/mihomo.service.absent"; then
+        sudo rm -f -- "$SERVICE_FILE" || return 1
+      fi
       ;;
   esac
 }
@@ -5604,7 +6020,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+ExecStartPre="${MANAGER_COMMAND}" --reconcile-tun-routing
 ExecStart="${MIHOMO_BIN}" -d "${CONFIG_DIR}"
+ExecStopPost="${MANAGER_COMMAND}" --remove-tun-routing
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1048576
@@ -5795,6 +6213,7 @@ clear_manager_runtime_state() {
   sudo rm -f -- "$MANAGER_CONFIG_FILE" || return 1
   save_tun_state false || return 1
   cleanup_legacy_tun_bypass || return 1
+  run_tun_routing_action remove || return 1
   disable_proxy_state
 }
 
@@ -6273,23 +6692,19 @@ download_file() {
 }
 
 update_core_from_archive() {
-  local archive="$1"
+  local source_file="$1"
   local source_label="${2:-本地文件}"
   local staged
   local current_version
   local new_version
   local status
 
-  gzip -t "$archive" || {
-    echo "内核压缩包校验失败: ${archive}"
-    return 1
-  }
   staged="$(mktemp /tmp/mipilot-update-core.XXXXXX)" || return 1
-  gzip -dc "$archive" >"$staged" || {
+  stage_mihomo_source "$source_file" "$staged" || {
+    echo "内核文件校验失败: ${source_file}"
     rm -f -- "$staged"
     return 1
   }
-  chmod 755 "$staged"
   new_version="$("$staged" -v 2>/dev/null | awk 'NR == 1 { print $3; exit }')"
   current_version="$(current_core_version)"
   if [[ -z $new_version || $new_version != v* ]]; then
@@ -6581,8 +6996,11 @@ online_update_manager() {
   }
   chmod 755 "$candidate"
   if ! atomic_install_file 755 "$candidate" "$MANAGER_INSTALLED_SCRIPT" || \
-     ! write_manager_install_marker "$candidate_version"; then
+     ! write_manager_install_marker "$candidate_version" || \
+     { [[ $(installed_runtime_mode) != service ]] || write_service_unit; } || \
+     ! sudo systemctl daemon-reload; then
     restore_component_rollback manager || true
+    sudo systemctl daemon-reload || true
     rm -rf -- "$temporary_dir"
     echo "管理器更新失败, 已尝试恢复原版本."
     return 1
@@ -6707,7 +7125,7 @@ recover_combined_update() {
 }
 
 update_all_from_files() {
-  local archive="$1"
+  local source_file="$1"
   local country_file="$2"
   local geosite_file="$3"
   local source_label="${4:-本地文件}"
@@ -6722,10 +7140,11 @@ update_all_from_files() {
   local geo_changed=1
   local status
 
-  gzip -t "$archive" || return 1
   staged_core="$(mktemp /tmp/mihomo-combined-core.XXXXXX)" || return 1
-  gzip -dc "$archive" >"$staged_core" || return 1
-  chmod 755 "$staged_core"
+  stage_mihomo_source "$source_file" "$staged_core" || {
+    rm -f -- "$staged_core"
+    return 1
+  }
   new_version="$("$staged_core" -v 2>/dev/null | awk 'NR == 1 { print $3; exit }')"
   current_version="$(current_core_version)"
   [[ -n $new_version && $new_version == v* ]] || {
@@ -6828,7 +7247,7 @@ local_update_all() {
     show_required_local_assets
     return 1
   fi
-  update_all_from_files "$LOCAL_MIHOMO_ARCHIVE" "$LOCAL_COUNTRY_MMDB" "$LOCAL_GEOSITE_DAT" "本地文件"
+  update_all_from_files "$LOCAL_MIHOMO_SOURCE" "$LOCAL_COUNTRY_MMDB" "$LOCAL_GEOSITE_DAT" "本地文件"
 }
 
 show_manual_download_help() {
@@ -6969,8 +7388,10 @@ manual_rollback_geo() {
 manual_rollback_manager() {
   local current
   local current_marker
+  local current_service
   local restored_version
   local had_current_marker=0
+  local had_current_service=0
 
   rollback_is_usable manager || {
     echo "没有可用的 MiPilot 管理器回退版本."
@@ -6981,34 +7402,54 @@ manual_rollback_manager() {
     rm -f -- "$current"
     return 1
   }
-  sudo install -m 755 "$MANAGER_INSTALLED_SCRIPT" "$current" || {
+  current_service="$(mktemp /tmp/mipilot-current-service.XXXXXX)" || {
     rm -f -- "$current" "$current_marker"
+    return 1
+  }
+  sudo install -m 755 "$MANAGER_INSTALLED_SCRIPT" "$current" || {
+    rm -f -- "$current" "$current_marker" "$current_service"
     return 1
   }
   if sudo test -f "$INSTALL_MARKER"; then
     had_current_marker=1
     sudo install -m 600 "$INSTALL_MARKER" "$current_marker" || {
-      rm -f -- "$current" "$current_marker"
+      rm -f -- "$current" "$current_marker" "$current_service"
       return 1
     }
   else
     : >"$current_marker"
   fi
+  if sudo test -f "$SERVICE_FILE"; then
+    had_current_service=1
+    sudo install -m 644 "$SERVICE_FILE" "$current_service" || {
+      rm -f -- "$current" "$current_marker" "$current_service"
+      return 1
+    }
+  else
+    : >"$current_service"
+  fi
   if ! restore_component_rollback manager || \
-     ! sudo bash -n "$MANAGER_INSTALLED_SCRIPT"; then
+     ! sudo bash -n "$MANAGER_INSTALLED_SCRIPT" || \
+     ! sudo systemctl daemon-reload; then
     atomic_install_file 755 "$current" "$MANAGER_INSTALLED_SCRIPT" || true
     if (( had_current_marker == 1 )); then
       atomic_install_file 600 "$current_marker" "$INSTALL_MARKER" || true
     else
       sudo rm -f -- "$INSTALL_MARKER" || true
     fi
-    rm -f -- "$current" "$current_marker"
+    if (( had_current_service == 1 )); then
+      atomic_install_file 644 "$current_service" "$SERVICE_FILE" || true
+    else
+      sudo rm -f -- "$SERVICE_FILE" || true
+    fi
+    sudo systemctl daemon-reload || true
+    rm -f -- "$current" "$current_marker" "$current_service"
     echo "管理器回退失败, 已尝试恢复回退前版本."
     return 1
   fi
   restored_version="$(sudo awk -F'"' '/^MANAGER_VERSION=/{print $2; exit}' "$MANAGER_INSTALLED_SCRIPT")"
   sudo rm -rf -- "${ROLLBACK_DIR:?}/manager"
-  rm -f -- "$current" "$current_marker"
+  rm -f -- "$current" "$current_marker" "$current_service"
   echo "MiPilot 已回退到 ${restored_version:-上一版本}."
   echo "当前菜单仍是旧进程, 退出后请重新执行 mipilot."
   MANAGER_SHOULD_EXIT=1
@@ -7321,6 +7762,8 @@ generate_diagnostic_report() {
     echo "config_validation:"
     printf '%s\n' "$validation" \
       | redact_sensitive_output
+    echo "network_compatibility:"
+    show_network_compatibility_report | redact_sensitive_output
     echo "recent_logs:"
     if [[ $(installed_runtime_mode) == service ]]; then
       sudo journalctl -u mihomo -n 50 --no-pager 2>/dev/null
@@ -7422,6 +7865,10 @@ remove_managed_installation() {
     fi
   fi
   cleanup_legacy_tun_bypass || echo "警告: 旧版TUN端口旁路未完全清理."
+  run_tun_routing_action remove || {
+    echo "MiPilot TUN 路由规则清理失败, 已中止卸载以保留修复所需状态."
+    return 1
+  }
   sudo systemctl disable --now "$(basename -- "$CLEANUP_TIMER_FILE")" >/dev/null 2>&1 || true
   sudo rm -f -- "$SERVICE_FILE" "$CLEANUP_SERVICE_FILE" "$CLEANUP_TIMER_FILE" "$TUN_BYPASS_SERVICE_FILE" || return 1
   sudo systemctl daemon-reload || return 1
@@ -7554,6 +8001,7 @@ service_menu() {
  8) 修复或重新安装
  9) 切换手动/系统服务模式
 10) 卸载
+11) 网络兼容性检查
  0) 返回主菜单
 ==========================================
 EOF
@@ -7574,6 +8022,7 @@ EOF
       8) run_action repair_installation_menu ;;
       9) run_action switch_runtime_mode ;;
       10) run_action uninstall_menu ;;
+      11) run_action show_network_compatibility_report ;;
       0) return 130 ;;
       *) echo "无效选项."; pause ;;
     esac
@@ -7584,7 +8033,7 @@ check_dependencies() {
   local missing=()
   local command_name
 
-  for command_name in awk curl cut find flock gzip grep ip jq sed setsid sha256sum sort stat sudo systemctl timeout tr; do
+  for command_name in awk curl cut find flock gzip grep ip jq nft sed setsid sha256sum sort stat sudo systemctl timeout tr; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
       missing+=("$command_name")
     fi
@@ -7707,6 +8156,31 @@ entrypoint() {
       release_manager_lock
       return "$cleanup_status"
       ;;
+    --reconcile-tun-routing)
+      ensure_sudo_access || return 1
+      run_tun_routing_action reconcile
+      return $?
+      ;;
+    --remove-tun-routing)
+      ensure_sudo_access || return 1
+      run_tun_routing_action remove
+      return $?
+      ;;
+    --reconcile-tun-routing-unlocked)
+      ensure_sudo_access || return 1
+      reconcile_tun_routing_rules
+      return $?
+      ;;
+    --remove-tun-routing-unlocked)
+      ensure_sudo_access || return 1
+      remove_tun_routing_rules
+      return $?
+      ;;
+    --doctor)
+      ensure_sudo_access || return 1
+      show_network_compatibility_report
+      return $?
+      ;;
     --menu)
       main
       return $?
@@ -7714,7 +8188,7 @@ entrypoint() {
     ""|--install) ;;
     *)
       echo "未知参数: ${action}"
-      echo "用法: mipilot [--version|--cleanup]"
+      echo "用法: mipilot [--version|--doctor|--cleanup]"
       return 1
       ;;
   esac

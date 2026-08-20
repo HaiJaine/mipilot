@@ -5,6 +5,8 @@ set -o pipefail
 
 CONFIG_FILE="${MIPILOT_CONFIG_FILE:-/etc/mihomo/config.yaml}"
 MIHOMO_BIN="${MIPILOT_MIHOMO_BIN:-/usr/local/bin/mihomo}"
+TUN_ROUTING_STATE_FILE="${MIPILOT_TUN_ROUTING_STATE_FILE:-/var/lib/mipilot/tun-routing.state}"
+TUN_ROUTING_TABLE="mipilot_tun"
 EXPECTED_TUN="${1:-any}"
 PASSED=0
 WARNED=0
@@ -121,6 +123,47 @@ if route_v4="$(ip -4 route get 1.1.1.1 2>/dev/null)"; then
   printf '       %s\n' "$route_v4"
 else
   fail "IPv4路由无法解析"
+fi
+
+if [[ $EXPECTED_TUN == on ]]; then
+  if [[ -r $TUN_ROUTING_STATE_FILE ]]; then
+    routing_priority="$(awk -F= '$1 == "priority" { print $2; exit }' "$TUN_ROUTING_STATE_FILE")"
+    routing_mark="$(awk -F= '$1 == "mark" { print $2; exit }' "$TUN_ROUTING_STATE_FILE")"
+    if [[ $routing_priority =~ ^[0-9]+$ && $routing_mark =~ ^0x[0-9a-fA-F]+$ ]]; then
+      pass "MiPilot TUN路由状态可读取"
+    else
+      fail "MiPilot TUN路由状态格式异常"
+    fi
+  else
+    fail "缺少MiPilot TUN路由状态: ${TUN_ROUTING_STATE_FILE}"
+  fi
+  routing_chain="$(nft list chain inet "$TUN_ROUTING_TABLE" prerouting 2>/dev/null || true)"
+  routing_original_rule="$(grep -F 'ct direction original' <<<"$routing_chain" | grep -F 'ct status dnat' | grep -F 'ct mark set' || true)"
+  routing_reply_rule="$(grep -F 'ct direction reply' <<<"$routing_chain" | grep -F 'meta mark set' || true)"
+  if [[ ${routing_mark:-} =~ ^0x[0-9a-fA-F]+$ ]]; then
+    routing_mark_decimal=$((routing_mark))
+  else
+    routing_mark_decimal=""
+  fi
+  if [[ ${routing_mark:-} =~ ^0x[0-9a-fA-F]+$ && -n $routing_original_rule && -n $routing_reply_rule ]] &&
+     grep -Eiq "(^|[^[:alnum:]_])((${routing_mark})|(${routing_mark_decimal}))([^[:alnum:]_]|$)" <<<"$routing_original_rule" &&
+     grep -Eiq "(^|[^[:alnum:]_])((${routing_mark})|(${routing_mark_decimal}))([^[:alnum:]_]|$)" <<<"$routing_reply_rule"; then
+    pass "MiPilot nftables回程规则完整"
+  else
+    fail "MiPilot nftables回程规则缺失或标记不匹配"
+  fi
+  if [[ ${routing_priority:-} =~ ^[0-9]+$ && ${routing_mark:-} =~ ^0x[0-9a-fA-F]+$ ]] &&
+     ip -4 rule show 2>/dev/null | grep -Eq "^[[:space:]]*${routing_priority}:.*fwmark ${routing_mark}/${routing_mark}.*lookup main"; then
+    pass "MiPilot IPv4回程策略规则已建立"
+  else
+    fail "MiPilot IPv4回程策略规则不存在"
+  fi
+elif [[ $EXPECTED_TUN == off ]]; then
+  if [[ ! -e $TUN_ROUTING_STATE_FILE ]] && ! nft list table inet "$TUN_ROUTING_TABLE" >/dev/null 2>&1; then
+    pass "TUN关闭后没有MiPilot回程规则残留"
+  else
+    fail "TUN关闭后仍有MiPilot回程状态或nftables表"
+  fi
 fi
 
 mapfile -t default_routes < <(ip -4 route show default 2>/dev/null)

@@ -146,12 +146,13 @@ test_find_local_assets() {
   local root
   local country_name
   local geosite_name
+  local staged
 
   root="$(make_temp_dir)" || return 1
   register_temp_dir_cleanup "$root"
   load_manager || return 1
 
-  mkdir -p -- "$root/lower" "$root/upper" "$root/wrong-arch"
+  mkdir -p -- "$root/lower" "$root/upper" "$root/plain" "$root/wrong-arch"
 
   printf 'country\n' >"$root/lower/country.mmdb"
   printf 'geosite\n' >"$root/lower/geosite.dat"
@@ -164,7 +165,7 @@ test_find_local_assets() {
     fail "lowercase local assets were not detected"
     return 1
   }
-  assert_equal "$root/lower/mihomo-linux-amd64-v1.20.1.gz" "$LOCAL_MIHOMO_ARCHIVE" "highest amd64 version" || return 1
+  assert_equal "$root/lower/mihomo-linux-amd64-v1.20.1.gz" "$LOCAL_MIHOMO_SOURCE" "highest amd64 version" || return 1
   assert_equal "$root/lower/country.mmdb" "$LOCAL_COUNTRY_MMDB" "lowercase country database" || return 1
   assert_equal "$root/lower/geosite.dat" "$LOCAL_GEOSITE_DAT" "lowercase geosite database" || return 1
 
@@ -181,6 +182,21 @@ test_find_local_assets() {
   assert_equal "country.mmdb" "${country_name,,}" "uppercase country database" || return 1
   assert_equal "geosite.dat" "${geosite_name,,}" "uppercase geosite database" || return 1
 
+  printf 'plain-mihomo\n' >"$root/plain/mihomo"
+  printf 'country\n' >"$root/plain/country.mmdb"
+  printf 'geosite\n' >"$root/plain/geosite.dat"
+  printf 'compressed-mihomo\n' | gzip >"$root/plain/mihomo-linux-amd64-v9.9.9.gz"
+  find_local_assets "$root/plain" || {
+    fail "uncompressed Mihomo asset was not detected"
+    return 1
+  }
+  assert_equal "$root/plain/mihomo" "$LOCAL_MIHOMO_SOURCE" "preferred uncompressed Mihomo" || return 1
+  staged="$root/staged-mihomo"
+  stage_mihomo_source "$LOCAL_MIHOMO_SOURCE" "$staged" || return 1
+  assert_equal "plain-mihomo" "$(cat "$staged")" "staged uncompressed Mihomo" || return 1
+  stage_mihomo_source "$root/plain/mihomo-linux-amd64-v9.9.9.gz" "$staged" || return 1
+  assert_equal "compressed-mihomo" "$(cat "$staged")" "staged compressed Mihomo" || return 1
+
   printf 'country\n' >"$root/wrong-arch/country.mmdb"
   printf 'geosite\n' >"$root/wrong-arch/geosite.dat"
   : >"$root/wrong-arch/mihomo-linux-arm64-v3.0.0.gz"
@@ -190,7 +206,7 @@ test_find_local_assets() {
     fail "wrong-architecture or malformed archives must be rejected"
     return 1
   fi
-  assert_equal "" "$LOCAL_MIHOMO_ARCHIVE" "rejected archive selection" || return 1
+  assert_equal "" "$LOCAL_MIHOMO_SOURCE" "rejected archive selection" || return 1
 }
 
 test_prune_config_backups() {
@@ -482,6 +498,9 @@ test_runtime_backend_dispatch() {
   manual_stop() {
     selected="manual-stop"
   }
+  run_tun_routing_action() {
+    return 0
+  }
   runtime_start || return 1
   assert_equal "manual-start" "$selected" "manual start dispatch" || return 1
   runtime_stop || return 1
@@ -517,6 +536,73 @@ test_install_runtime_choice_defaults_manual() {
   }
   choose_install_runtime_mode || return 1
   assert_equal "service" "$SELECTED" "explicit service install runtime"
+}
+
+test_service_unit_reconciles_tun_routing() {
+  local root
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  SERVICE_FILE="$root/etc/systemd/system/mihomo.service"
+  MANAGER_COMMAND="$root/usr/local/bin/mipilot"
+  MIHOMO_BIN="$root/usr/local/bin/mihomo"
+  CONFIG_DIR="$root/etc/mihomo"
+
+  sudo() {
+    while [[ ${1:-} == -n ]]; do shift; done
+    if [[ ${1:-} == install && ${2:-} == -d ]]; then
+      mkdir -p -- "${@: -1}"
+      return
+    fi
+    run_as_mock_sudo "$@"
+  }
+  atomic_install_file() {
+    local source_file="$2"
+    local destination="$3"
+
+    mkdir -p -- "$(dirname -- "$destination")"
+    cp -- "$source_file" "$destination"
+  }
+
+  write_service_unit || return 1
+  assert_file_has_line "$SERVICE_FILE" "ExecStartPre=\"${MANAGER_COMMAND}\" --reconcile-tun-routing" "service TUN routing setup" || return 1
+  assert_file_has_line "$SERVICE_FILE" "ExecStopPost=\"${MANAGER_COMMAND}\" --remove-tun-routing" "service TUN routing cleanup"
+}
+
+test_tun_routing_action_uses_independent_lock() {
+  local root
+  local invocation_file
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  invocation_file="$root/invocation"
+  TUN_ROUTING_LOCK_FILE="$root/tun-routing.lock"
+  SCRIPT_PATH="$root/mipilot"
+
+  sudo() {
+    while [[ ${1:-} == -n ]]; do shift; done
+    printf '%s\n' "$*" >"$invocation_file"
+  }
+
+  run_tun_routing_action reconcile || return 1
+  assert_equal "flock --exclusive --wait 30 ${TUN_ROUTING_LOCK_FILE} env MIPILOT_CONFIG_DIR=${CONFIG_DIR} MIPILOT_STATE_DIR=${STATE_DIR} MIPILOT_TUN_ROUTING_STATE_FILE=${TUN_ROUTING_STATE_FILE} bash ${SCRIPT_PATH} --reconcile-tun-routing-unlocked" \
+    "$(cat "$invocation_file")" "locked TUN routing reconciliation" || return 1
+  run_tun_routing_action remove || return 1
+  assert_equal "flock --exclusive --wait 30 ${TUN_ROUTING_LOCK_FILE} env MIPILOT_CONFIG_DIR=${CONFIG_DIR} MIPILOT_STATE_DIR=${STATE_DIR} MIPILOT_TUN_ROUTING_STATE_FILE=${TUN_ROUTING_STATE_FILE} bash ${SCRIPT_PATH} --remove-tun-routing-unlocked" \
+    "$(cat "$invocation_file")" "locked TUN routing cleanup" || return 1
+  if run_tun_routing_action invalid; then
+    fail "unknown TUN routing action was accepted"
+    return 1
+  fi
+  sudo() {
+    return 75
+  }
+  if run_tun_routing_action reconcile; then
+    fail "TUN routing lock failure was ignored"
+    return 1
+  fi
 }
 
 test_manager_lock_release() {
@@ -625,7 +711,7 @@ EOF
   render_tun_config "$input_file" "$output_file" true || return 1
   assert_file_has_line "$output_file" "  enable: true" "enabled TUN" || return 1
   assert_file_has_line "$output_file" "  auto-route: true" "enabled auto-route" || return 1
-  assert_file_has_line "$output_file" "  auto-redirect: true" "enabled automatic redirect" || return 1
+  assert_file_has_line "$output_file" "  auto-redirect: false" "disabled automatic redirect" || return 1
   assert_file_has_line "$output_file" "  auto-detect-interface: true" "enabled interface detection"
 }
 
@@ -659,6 +745,113 @@ test_cleanup_legacy_tun_bypass() {
   cleanup_legacy_tun_bypass || return 1
   assert_not_exists "$TUN_BYPASS_STATE_FILE" || return 1
   assert_equal '0' "$(wc -l <"$rules_file" | tr -d ' ')" "removed recorded legacy bypass rule"
+}
+
+test_tun_routing_rules_are_connection_based() {
+  local root
+  local ip_rules_file
+  local table_file
+  local generated_rules
+  local remaining
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  STATE_DIR="$root/state"
+  TUN_ROUTING_STATE_FILE="$STATE_DIR/tun-routing.state"
+  ip_rules_file="$root/ip-rules"
+  table_file="$root/nft-table"
+  generated_rules="$root/generated.nft"
+  printf '%s\n' '8990: from all lookup 100' >"$ip_rules_file"
+
+  sudo() {
+    while [[ ${1:-} == -n ]]; do shift; done
+    if [[ ${1:-} == install && ${2:-} == -d ]]; then
+      mkdir -p -- "${@: -1}"
+      return
+    fi
+    run_as_mock_sudo "$@"
+  }
+  atomic_install_file() {
+    local source_file="$2"
+    local destination="$3"
+
+    mkdir -p -- "$(dirname -- "$destination")"
+    cp -- "$source_file" "$destination"
+  }
+  ip() {
+    local family="$1"
+    shift
+    [[ $family == -4 ]] || return 1
+    if [[ ${1:-} == rule && ${2:-} == show ]]; then
+      cat "$ip_rules_file"
+    elif [[ ${1:-} == rule && ${2:-} == add ]]; then
+      printf '%s: from all fwmark %s lookup main\n' "$4" "$6" >>"$ip_rules_file"
+    elif [[ ${1:-} == rule && ${2:-} == del ]]; then
+      awk -F: -v priority="$4" '$1 + 0 != priority' "$ip_rules_file" >"${ip_rules_file}.next"
+      mv -- "${ip_rules_file}.next" "$ip_rules_file"
+    else
+      return 1
+    fi
+  }
+  nft() {
+    if [[ ${1:-} == list && ${2:-} == ruleset ]]; then
+      return 0
+    elif [[ ${1:-} == list && ${2:-} == chain ]]; then
+      [[ -f $table_file ]] && cat "$generated_rules"
+    elif [[ ${1:-} == list && ${2:-} == table ]]; then
+      [[ -f $table_file ]]
+    elif [[ ${1:-} == -f ]]; then
+      cp -- "$2" "$generated_rules"
+      : >"$table_file"
+    elif [[ ${1:-} == delete && ${2:-} == table ]]; then
+      rm -f -- "$table_file"
+    else
+      return 1
+    fi
+  }
+  tun_routing_priority_in_use() {
+    [[ $1 == 8990 ]]
+  }
+  tun_routing_mark_in_use() {
+    return 1
+  }
+
+  setup_tun_routing_rules || return 1
+  assert_file_has_line "$TUN_ROUTING_STATE_FILE" 'priority=8989' "selected free rule priority" || return 1
+  assert_file_has_line "$TUN_ROUTING_STATE_FILE" 'mark=0x40000000' "selected connection mark" || return 1
+  grep -Fq 'ct direction original ct status dnat' "$generated_rules" || return 1
+  grep -Fq 'ct direction reply ct mark & 0x40000000' "$generated_rules" || return 1
+  if grep -Eq 'dport|sport|8080' "$generated_rules"; then
+    fail "TUN routing rules depend on a port"
+    return 1
+  fi
+
+  setup_tun_routing_rules || return 1
+  assert_equal '1' "$(grep -c 'fwmark' "$ip_rules_file")" "idempotent TUN route rule" || return 1
+
+  sed -i 's/0x40000000/0x20000000/g' "$generated_rules"
+  if tun_routing_rules_ready; then
+    fail "mismatched managed nft mark was accepted"
+    return 1
+  fi
+  setup_tun_routing_rules || return 1
+  grep -Fq 'ct direction original ct status dnat ct mark set ct mark | 0x40000000' "$generated_rules" || return 1
+
+  printf 'table inet mipilot_tun { chain prerouting { } }\n' >"$generated_rules"
+  if tun_routing_rules_ready; then
+    fail "empty managed nft chain was accepted"
+    return 1
+  fi
+  setup_tun_routing_rules || return 1
+  grep -Fq 'ct direction original ct status dnat' "$generated_rules" || return 1
+  grep -Fq 'ct direction reply ct mark & 0x40000000' "$generated_rules" || return 1
+
+  remove_tun_routing_rules || return 1
+  assert_not_exists "$TUN_ROUTING_STATE_FILE" || return 1
+  assert_not_exists "$table_file" || return 1
+  remaining="$(cat "$ip_rules_file")"
+  assert_equal '8990: from all lookup 100' "$remaining" "preserved unrelated route rule"
 }
 
 test_reconcile_tun_runtime_state() {
@@ -1167,6 +1360,7 @@ test_render_minimal_config() {
 
   assert_file_has_line "$output_file" "mode: direct" "direct mode" || return 1
   assert_file_has_line "$output_file" "  enable: false" "disabled TUN" || return 1
+  assert_file_has_line "$output_file" "  auto-redirect: false" "server-compatible redirect mode" || return 1
   assert_file_has_line "$output_file" "proxies: []" "empty proxy nodes" || return 1
   assert_file_has_line "$output_file" "proxy-groups: []" "empty proxy groups" || return 1
   assert_file_has_line "$output_file" "  - MATCH,DIRECT" "direct fallback rule" || return 1
@@ -1514,6 +1708,9 @@ test_online_manager_update_and_rollback() {
     fi
     run_as_mock_sudo "$@"
   }
+  systemctl() {
+    return 0
+  }
 
   online_update_manager || return 1
   grep -Fq 'MANAGER_VERSION="1.0.0"' "$MANAGER_INSTALLED_SCRIPT" || fail "manager update did not install candidate"
@@ -1582,6 +1779,9 @@ test_reset_runtime_state() {
 
   sudo() {
     run_as_mock_sudo "$@"
+  }
+  run_tun_routing_action() {
+    return 0
   }
 
   clear_manager_runtime_state || return 1
@@ -1896,6 +2096,26 @@ test_tun_runtime_api_mismatch_fails() {
   fi
 }
 
+test_tun_runtime_missing_return_rules_fails() {
+  load_manager || return 1
+  API='http://127.0.0.1:9090'
+
+  refresh_api_config() {
+    API='http://127.0.0.1:9090'
+  }
+  api_quick() {
+    printf '%s\n' '{"tun":{"enable":true}}'
+  }
+  tun_routing_rules_ready() {
+    return 1
+  }
+
+  if verify_tun_runtime_network >/dev/null 2>&1; then
+    fail "TUN runtime check accepted missing return routing rules"
+    return 1
+  fi
+}
+
 test_tun_public_probe_failure_is_warning() {
   local output
 
@@ -1909,6 +2129,9 @@ test_tun_public_probe_failure_is_warning() {
   }
   api_quick() {
     printf '%s\n' '{"tun":{"enable":true}}'
+  }
+  tun_routing_rules_ready() {
+    return 0
   }
   ip() {
     if [[ ${1:-} == -4 ]]; then
@@ -1939,6 +2162,9 @@ test_tun_ssh_return_route_failure() {
   }
   api_quick() {
     printf '%s\n' '{"tun":{"enable":true}}'
+  }
+  tun_routing_rules_ready() {
+    return 0
   }
   ip() {
     if [[ ${1:-} == route && ${2:-} == get && ${3:-} == 203.0.113.10 ]]; then return 1; fi
@@ -1980,6 +2206,8 @@ run_test "TUN preserves non-TUN state" test_tun_render_preserves_non_tun_state
 run_test "runtime marker precedence" test_runtime_mode_marker_precedence
 run_test "runtime backend dispatch" test_runtime_backend_dispatch
 run_test "manual install default" test_install_runtime_choice_defaults_manual
+run_test "service TUN routing lifecycle" test_service_unit_reconciles_tun_routing
+run_test "TUN routing action lock" test_tun_routing_action_uses_independent_lock
 run_test "manager lock release" test_manager_lock_release
 run_test "lock release preserves caller stderr" test_lock_release_preserves_stderr
 run_test "curl download follows current system route" test_download_uses_curl_without_forced_proxy
@@ -1987,6 +2215,7 @@ run_test "restored TUN state reconciliation" test_reconcile_tun_runtime_state
 run_test "TUN state sync failure restores sidecar" test_tun_state_sync_failure_restores_sidecar
 run_test "native Mihomo TUN routing" test_render_tun_native_routing
 run_test "legacy TUN bypass cleanup" test_cleanup_legacy_tun_bypass
+run_test "connection-based TUN return routing" test_tun_routing_rules_are_connection_based
 run_test "mode switch persistence" test_mode_switch_persists_config
 run_test "selected-node persistence rendering" test_render_store_selected_config
 run_test "custom region group rendering" test_custom_region_group_rendering
@@ -2021,6 +2250,7 @@ run_test "region metadata rollback on config failure" test_region_metadata_resto
 run_test "TUN state failure preserves config" test_tun_state_failure_preserves_config
 run_test "TUN restart failure restores state" test_tun_restart_failure_restores_state
 run_test "TUN API mismatch fails health check" test_tun_runtime_api_mismatch_fails
+run_test "TUN return routing rules are required" test_tun_runtime_missing_return_rules_fails
 run_test "TUN public probe failure warns" test_tun_public_probe_failure_is_warning
 run_test "TUN SSH return route failure" test_tun_ssh_return_route_failure
 

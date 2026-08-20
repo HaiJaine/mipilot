@@ -24,7 +24,7 @@ cd mipilot-v1.0.1
 bash ./mipilot
 ```
 
-完整离线包已经包含Mihomo内核、`country.mmdb` 和 `geosite.dat`, 首次安装这些组件不需要访问GitHub。
+完整离线包解压后就是可直接安装的完整项目目录, 包含管理脚本、测试文件、许可证、未压缩的 `mihomo` 可执行文件、`country.mmdb` 和 `geosite.dat`, 内部不再嵌套其他压缩包。首次安装这些组件不需要访问GitHub。
 
 ### 克隆源码安装
 
@@ -69,20 +69,20 @@ mipilot
 
 ## 首次安装流程
 
-将以下 4 个文件放在同一个目录:
+完整离线包已经把以下文件放在同一个目录:
 
 ```text
 mipilot
 country.mmdb
 geosite.dat
-mihomo-linux-amd64-v1.19.30.gz
+mihomo
 ```
 
 文件用途:
 
 | 文件 | 安装位置 | 来源 |
 | --- | --- | --- |
-| `mihomo-linux-amd64-v1.19.30.gz` | `/usr/local/bin/mihomo` | [MetaCubeX/mihomo Releases](https://github.com/MetaCubeX/mihomo/releases) |
+| `mihomo` | `/usr/local/bin/mihomo` | 完整离线包内置, 来源为 [MetaCubeX/mihomo Releases](https://github.com/MetaCubeX/mihomo/releases) |
 | `country.mmdb` | `/etc/mihomo/Country.mmdb` | [MetaCubeX/meta-rules-dat Releases](https://github.com/MetaCubeX/meta-rules-dat/releases) |
 | `geosite.dat` | `/etc/mihomo/GeoSite.dat` | [MetaCubeX/meta-rules-dat Releases](https://github.com/MetaCubeX/meta-rules-dat/releases) |
 
@@ -96,7 +96,7 @@ bash ./mipilot
 
 1. 检查 Ubuntu 版本、amd64 架构、Bash、systemd 和 sudo.
 2. 检查所需系统命令. 缺少依赖时, 经确认后尝试使用 APT 安装.
-3. 校验本地 gzip、临时内核版本、地理数据和生成配置.
+3. 校验本地 Mihomo 文件、临时内核版本、地理数据和生成配置.
 4. 选择运行方式. 默认是手动模式; 只有明确输入 `y` 才安装并启用 systemd 服务.
 5. 安装 Mihomo、地理数据、安全的初始直连配置、管理脚本和 `mipilot` 命令.
 6. 服务模式会立即启动并可选添加首个订阅; 手动模式安装后保持停止, 进入 `mipilot` 启动后再管理订阅.
@@ -147,7 +147,11 @@ mipilot
 
 ### TUN与公网服务兼容
 
-开启TUN时, MiPilot使用Mihomo原生的 `auto-route: true`、`auto-redirect: true` 和 `auto-detect-interface: true` 管理Linux路由与TCP重定向, 不扫描监听端口, 也不创建按源端口绕过TUN的策略路由。启用后会检查Mihomo运行状态、TUN配置、IPv4路由和当前SSH客户端回程路由, 并执行一次不使用显式代理的公网连通性探测。普通单出口和包含Docker网桥的环境由Mihomo自动识别出口; 检测到多条默认路由时会给出提示, 多个有效公网出口的复杂策略路由仍需结合实际网络配置验证。
+开启TUN时, MiPilot使用Mihomo原生的 `auto-route: true` 和 `auto-detect-interface: true`, 并关闭 `auto-redirect`。MiPilot在独立的 `inet mipilot_tun` nftables表中按conntrack连接方向标记DNAT入站连接, 再通过优先于Mihomo的受管 `ip rule` 让对应回包查询main表。Docker或Podman容器主动访问互联网仍然进入TUN; 外部访问标准bridge端口发布产生的回包保持原物理网络路径。该机制不扫描监听端口, 不依赖Docker是否已安装、容器网段、网桥名称或服务启动顺序, 因此开启TUN后再安装Docker、创建网络或发布新端口不需要重新配置MiPilot。
+
+MiPilot会在 `/var/lib/mipilot/tun-routing.state` 保存自己分配的规则优先级和连接标记, 启停时只操作该状态对应的规则。已占用的候选优先级和连接标记会被跳过; 若同名nftables表没有受管状态或全部候选资源均不可用, TUN启动会失败并保留原配置。服务模式通过Mihomo unit的启动前和停止后动作恢复、清理规则; 手动模式在Mihomo进程启动前同步规则。两种入口使用独立文件锁串行修改TUN路由状态, 运行检查同时验证nftables链内的连接方向和mark规则, 缺失时会重新建立。启用后会检查Mihomo API、TUN回程规则、IPv4路由、当前SSH客户端回程和公网连通性。运行维护中的“网络兼容性检查”或 `sudo mipilot --doctor` 可以只读查看默认路由、相关虚拟接口、受管规则、nftables表和本地DNS监听。
+
+首版自动兼容范围是Ubuntu上的标准Docker/Podman bridge与DNAT端口发布。`macvlan`、`ipvlan`、Kubernetes CNI/IPVS/eBPF、Docker IPv6 direct-routing、多个全局VPN和多公网出口不会被假定为已兼容; MiPilot只提示已发现的隧道和多默认路由, 这些环境仍需按实际链路验证。
 
 升级会清理旧版 `tun-bypass-ports.conf`、`mipilot-tun-bypass.service` 以及状态文件中已记录端口对应的旧规则。旧状态文件已经丢失时不会按端口盲目删除系统策略路由, 需要管理员结合实际规则手动确认。
 
@@ -200,7 +204,7 @@ mipilot
 
 在线更新不可用时:
 
-1. 在可联网的设备上打开 [Mihomo 最新稳定版](https://github.com/MetaCubeX/mihomo/releases/latest), 下载名称严格匹配 `mihomo-linux-amd64-v*.gz` 的资产.
+1. 在可联网的设备上打开 [Mihomo 最新稳定版](https://github.com/MetaCubeX/mihomo/releases/latest), 下载名称严格匹配 `mihomo-linux-amd64-v*.gz` 的资产. 手动更新兼容该压缩文件; 完整离线包中使用的是解压后的 `mihomo` 文件.
 2. 打开 [meta-rules-dat 最新版](https://github.com/MetaCubeX/meta-rules-dat/releases/latest), 下载 `country.mmdb` 和 `geosite.dat`.
 3. 将文件复制到任意目录. 默认可放回 `mipilot` 所在目录.
 4. 在更新菜单选择“使用本地文件更新”, 使用默认当前目录或输入文件所在目录.
@@ -260,7 +264,7 @@ bash -n mipilot
 bash tests/run-tests.sh
 ```
 
-模拟测试不会写入真实系统目录。涉及TUN、Docker公网端口和systemd的行为应在受支持的Ubuntu amd64环境中验证。实机验证前后可以执行只读网络检查:
+模拟测试不会写入真实系统目录。涉及TUN、Docker公网端口、nftables和systemd的行为应在受支持的Ubuntu amd64环境中验证。TUN兼容层需要 `nft` 命令, 首次安装缺失时会通过APT安装 `nftables`。实机验证前后可以执行只读网络检查:
 
 ```bash
 sudo bash tests/run-network-checks.sh off
