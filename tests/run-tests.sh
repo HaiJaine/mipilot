@@ -6,6 +6,7 @@ set -o pipefail
 TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_DIR="$(cd -- "${TEST_DIR}/.." && pwd -P)"
 MANAGER_SCRIPT="${PROJECT_DIR}/mipilot"
+NETWORK_CHECK_SCRIPT="${TEST_DIR}/run-network-checks.sh"
 
 PASSED=0
 FAILED=0
@@ -78,15 +79,19 @@ load_manager() {
   MIPILOT_TESTING=1
   # shellcheck source=/dev/null
   source "$MANAGER_SCRIPT"
+  if [[ -n ${TEST_TEMP_DIR:-} ]]; then
+    MANAGER_CONFIG_DIR="${TEST_TEMP_DIR}/etc/mipilot"
+    MANAGER_CONFIG_FILE="${MANAGER_CONFIG_DIR}/config.json"
+  fi
 }
 
 test_bash_syntax() {
-  bash -n "$MANAGER_SCRIPT"
+  bash -n "$MANAGER_SCRIPT" && bash -n "$NETWORK_CHECK_SCRIPT"
 }
 
 test_manager_release_version() {
   load_manager || return 1
-  assert_equal "1.0.0" "$MANAGER_VERSION" "manager release version"
+  assert_equal "1.0.1" "$MANAGER_VERSION" "manager release version"
 }
 
 test_source_testing_guard() {
@@ -320,6 +325,200 @@ test_detect_install_state() {
   assert_equal "managed" "$state" "managed installation state" || return 1
 }
 
+test_mipilot_config_migration_and_materialization() {
+  local root
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  CONFIG_DIR="$root/etc/mihomo"
+  CONFIG_FILE="$CONFIG_DIR/config.yaml"
+  SUBSCRIPTION_FILE="$CONFIG_DIR/subscription.url"
+  SUBSCRIPTION_LIST_FILE="$CONFIG_DIR/subscriptions.list"
+  REGION_STATE_FILE="$CONFIG_DIR/region-groups.conf"
+  REGION_PARENT_FILE="$CONFIG_DIR/region-parent.conf"
+  TUN_STATE_FILE="$CONFIG_DIR/tun.state"
+  mkdir -p -- "$CONFIG_DIR"
+  cat >"$CONFIG_FILE" <<'EOF'
+mode: global
+tun:
+  enable: true
+EOF
+  printf 'https://one.example/sub\n' >"$SUBSCRIPTION_FILE"
+  printf 'https://one.example/sub\nhttps://two.example/sub\n' >"$SUBSCRIPTION_LIST_FILE"
+  printf 'custom-1;MiPilot-日本;Japan;url-test\n' >"$REGION_STATE_FILE"
+  printf 'Proxy\n' >"$REGION_PARENT_FILE"
+  printf 'true\n' >"$TUN_STATE_FILE"
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+  installed_runtime_mode() {
+    printf 'manual\n'
+  }
+
+  sync_mipilot_config_from_state || return 1
+  jq -e '
+    .schema_version == 1
+    and .runtime.type == "manual"
+    and .mode == "global"
+    and .tun.enabled == true
+    and .subscription.active == "https://one.example/sub"
+    and (.subscription.items | length) == 2
+    and .rule_selection.parent == "Proxy"
+    and .custom_groups[0].name == "MiPilot-日本"
+  ' "$MANAGER_CONFIG_FILE" >/dev/null || fail "migrated MiPilot config is incomplete"
+
+  rm -f -- "$SUBSCRIPTION_FILE" "$SUBSCRIPTION_LIST_FILE" "$REGION_STATE_FILE" "$REGION_PARENT_FILE" "$TUN_STATE_FILE"
+  materialize_mipilot_state || return 1
+  assert_file_has_line "$SUBSCRIPTION_LIST_FILE" 'https://two.example/sub' "materialized subscriptions" || return 1
+  assert_file_has_line "$REGION_STATE_FILE" 'custom-1;MiPilot-日本;Japan;url-test' "materialized custom group" || return 1
+  assert_equal "Proxy" "$(cat "$REGION_PARENT_FILE")" "materialized rule parent" || return 1
+  assert_equal "true" "$(cat "$TUN_STATE_FILE")" "materialized TUN state"
+}
+
+test_config_backup_bundles_mipilot_settings() {
+  local root
+  local backup
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  CONFIG_DIR="$root/etc/mihomo"
+  CONFIG_FILE="$CONFIG_DIR/config.yaml"
+  BACKUP_DIR="$CONFIG_DIR/backups"
+  mkdir -p -- "$CONFIG_DIR" "$MANAGER_CONFIG_DIR"
+  printf 'mode: rule\n' >"$CONFIG_FILE"
+  cat >"$MANAGER_CONFIG_FILE" <<'EOF'
+{
+  "schema_version": 1,
+  "runtime": {"type": "manual"},
+  "mode": "rule",
+  "tun": {"enabled": false},
+  "subscription": {"active": "", "items": []},
+  "rule_selection": {"parent": "", "group": ""},
+  "global_selection": {"node": ""},
+  "selector_selections": {},
+  "custom_groups": []
+}
+EOF
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+
+  backup="$(create_config_backup bundled)" || return 1
+  assert_exists "$backup" || return 1
+  assert_exists "${backup%.yaml}.mipilot.json" || return 1
+  cmp -s -- "$MANAGER_CONFIG_FILE" "${backup%.yaml}.mipilot.json" || fail "MiPilot settings backup differs"
+}
+
+test_tun_render_preserves_non_tun_state() {
+  local root
+  local input_file
+  local output_file
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  input_file="$root/input.yaml"
+  output_file="$root/output.yaml"
+  cat >"$input_file" <<'EOF'
+mode: global
+tun:
+  enable: false
+proxy-groups:
+  - name: MiPilot-日本
+    type: url-test
+    proxies:
+      - JP-01
+rules:
+  - DOMAIN,example.com,MiPilot-日本
+  - MATCH,DIRECT
+EOF
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+
+  render_tun_config "$input_file" "$output_file" true || return 1
+  assert_file_has_line "$output_file" 'mode: global' "preserved global mode" || return 1
+  assert_file_has_line "$output_file" '  - name: MiPilot-日本' "preserved custom group" || return 1
+  assert_file_has_line "$output_file" '  - DOMAIN,example.com,MiPilot-日本' "preserved custom rule"
+}
+
+test_runtime_mode_marker_precedence() {
+  local root
+  local mode
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  INSTALL_MARKER="$root/installed"
+  printf 'runtime=manual\n' >"$INSTALL_MARKER"
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+  service_exists() {
+    return 0
+  }
+
+  mode="$(installed_runtime_mode)" || return 1
+  assert_equal "manual" "$mode" "marker runtime must override service fallback" || return 1
+  printf 'runtime=service\n' >"$INSTALL_MARKER"
+  mode="$(installed_runtime_mode)" || return 1
+  assert_equal "service" "$mode" "service runtime marker" || return 1
+}
+
+test_runtime_backend_dispatch() {
+  local selected=""
+
+  load_manager || return 1
+  installed_runtime_mode() {
+    printf 'manual\n'
+  }
+  manual_start() {
+    selected="manual-start"
+  }
+  manual_stop() {
+    selected="manual-stop"
+  }
+  runtime_start || return 1
+  assert_equal "manual-start" "$selected" "manual start dispatch" || return 1
+  runtime_stop || return 1
+  assert_equal "manual-stop" "$selected" "manual stop dispatch" || return 1
+
+  installed_runtime_mode() {
+    printf 'service\n'
+  }
+  sudo() {
+    while [[ ${1:-} == -n ]]; do shift; done
+    if [[ ${1:-} == systemctl && ${2:-} == start && ${3:-} == mihomo ]]; then
+      selected="service-start"
+      return 0
+    fi
+    return 1
+  }
+  runtime_start || return 1
+  assert_equal "service-start" "$selected" "service start dispatch"
+}
+
+test_install_runtime_choice_defaults_manual() {
+  load_manager || return 1
+  read_line_or_back() {
+    INPUT_LINE=""
+    return 0
+  }
+  choose_install_runtime_mode || return 1
+  assert_equal "manual" "$SELECTED" "default install runtime" || return 1
+
+  read_line_or_back() {
+    INPUT_LINE="yes"
+    return 0
+  }
+  choose_install_runtime_mode || return 1
+  assert_equal "service" "$SELECTED" "explicit service install runtime"
+}
+
 test_manager_lock_release() {
   local root
 
@@ -398,84 +597,7 @@ test_download_uses_curl_without_forced_proxy() {
   fi
 }
 
-test_detect_public_service_ports() {
-  local output
-
-  load_manager || return 1
-  ss() {
-    case " $* " in
-      *" -ltn "*)
-        printf '%s\n' \
-          'LISTEN 0 128 0.0.0.0:22 0.0.0.0:*' \
-          'LISTEN 0 128 127.0.0.1:9090 0.0.0.0:*' \
-          'LISTEN 0 128 [::]:443 [::]:*'
-        ;;
-      *" -lun "*)
-        printf '%s\n' 'UNCONN 0 0 0.0.0.0:5353 0.0.0.0:*'
-        ;;
-    esac
-  }
-  docker() {
-    if [[ ${1:-} == ps && ${2:-} == --format ]]; then
-      printf '%s\n' '0.0.0.0:8080->8080/tcp, [::]:8080->8080/tcp, 127.0.0.1:9000->9000/udp'
-    fi
-    return 0
-  }
-  timeout() {
-    shift
-    "$@"
-  }
-  sudo() {
-    run_as_mock_sudo "$@"
-  }
-
-  output="$(detect_public_service_ports)" || return 1
-  assert_equal $'tcp:22\ntcp:443\ntcp:8080\nudp:5353\nudp:9000' "$output" "detected public service ports"
-}
-
-test_sync_tun_bypass_rules() {
-  local root
-  local rules_file
-
-  root="$(make_temp_dir)" || return 1
-  register_temp_dir_cleanup "$root"
-  load_manager || return 1
-  TUN_BYPASS_STATE_FILE="$root/tun-bypass-ports.conf"
-  rules_file="$root/rules"
-  printf 'tcp:8080\n' >"$TUN_BYPASS_STATE_FILE"
-  : >"$rules_file"
-
-  sudo() {
-    run_as_mock_sudo "$@"
-  }
-  ip() {
-    if [[ ${1:-} == rule && ${2:-} == show ]]; then
-      cat "$rules_file"
-    elif [[ ${1:-} == rule && ${2:-} == add ]]; then
-      printf '%s: from all ipproto %s sport %s lookup main\n' "$4" "$6" "$8" >>"$rules_file"
-    elif [[ ${1:-} == rule && ${2:-} == del ]]; then
-      : >"$rules_file"
-    else
-      return 1
-    fi
-  }
-  tun_config_value() {
-    printf 'true\n'
-  }
-
-  sync_tun_bypass_rules || return 1
-  grep -Fq '8990: from all ipproto tcp sport 8080 lookup main' "$rules_file" || return 1
-  sync_tun_bypass_rules || return 1
-  assert_equal "1" "$(wc -l <"$rules_file" | tr -d ' ')" "idempotent bypass rule count" || return 1
-
-  tun_config_value() {
-    printf 'false\n'
-  }
-  sync_tun_bypass_rules || return 1
-  assert_equal "0" "$(wc -l <"$rules_file" | tr -d ' ')" "removed bypass rule count"
-}
-
-test_render_tun_server_compatibility() {
+test_render_tun_native_routing() {
   local root
   local input_file
   local output_file
@@ -503,8 +625,512 @@ EOF
   render_tun_config "$input_file" "$output_file" true || return 1
   assert_file_has_line "$output_file" "  enable: true" "enabled TUN" || return 1
   assert_file_has_line "$output_file" "  auto-route: true" "enabled auto-route" || return 1
-  assert_file_has_line "$output_file" "  auto-redirect: false" "server-compatible auto-redirect" || return 1
+  assert_file_has_line "$output_file" "  auto-redirect: true" "enabled automatic redirect" || return 1
   assert_file_has_line "$output_file" "  auto-detect-interface: true" "enabled interface detection"
+}
+
+test_cleanup_legacy_tun_bypass() {
+  local root
+  local rules_file
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  TUN_BYPASS_STATE_FILE="$root/tun-bypass-ports.conf"
+  TUN_BYPASS_SERVICE_FILE="$root/mipilot-tun-bypass.service"
+  rules_file="$root/rules"
+  printf 'tcp:8080\n' >"$TUN_BYPASS_STATE_FILE"
+  printf '8990: from all ipproto tcp sport 8080 lookup main\n' >"$rules_file"
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+  ip() {
+    [[ ${1:-} == -6 ]] && shift
+    if [[ ${1:-} == rule && ${2:-} == show ]]; then
+      cat "$rules_file"
+    elif [[ ${1:-} == rule && ${2:-} == del ]]; then
+      : >"$rules_file"
+    else
+      return 1
+    fi
+  }
+
+  cleanup_legacy_tun_bypass || return 1
+  assert_not_exists "$TUN_BYPASS_STATE_FILE" || return 1
+  assert_equal '0' "$(wc -l <"$rules_file" | tr -d ' ')" "removed recorded legacy bypass rule"
+}
+
+test_reconcile_tun_runtime_state() {
+  local root
+  local cleaned=0
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  CONFIG_DIR="$root/etc/mihomo"
+  CONFIG_FILE="$CONFIG_DIR/config.yaml"
+  TUN_STATE_FILE="$CONFIG_DIR/tun.state"
+  mkdir -p -- "$CONFIG_DIR"
+  printf '%s\n' \
+    'tun:' \
+    '  enable: true' \
+    'rules:' \
+    '  - MATCH,DIRECT' >"$CONFIG_FILE"
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+  cleanup_legacy_tun_bypass() {
+    cleaned=1
+  }
+
+  reconcile_tun_runtime_state || return 1
+  assert_equal 'true' "$(cat "$TUN_STATE_FILE")" "reconciled TUN state" || return 1
+  jq -e '.tun.enabled == true' "$MANAGER_CONFIG_FILE" >/dev/null || {
+    fail "reconciled MiPilot TUN setting"
+    return 1
+  }
+  assert_equal '1' "$cleaned" "cleaned legacy TUN bypass"
+}
+
+test_tun_state_sync_failure_restores_sidecar() {
+  local root
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  TUN_STATE_FILE="$root/tun.state"
+  printf 'false\n' >"$TUN_STATE_FILE"
+
+  sudo() {
+    while [[ ${1:-} == -n ]]; do shift; done
+    if [[ ${1:-} == install && ${2:-} == -m ]]; then
+      shift 3
+      cp -- "$1" "$2"
+      return
+    fi
+    run_as_mock_sudo "$@"
+  }
+  update_mipilot_tun() {
+    return 1
+  }
+
+  if save_tun_state true; then
+    fail "TUN state save succeeded after MiPilot config sync failure"
+    return 1
+  fi
+  assert_equal 'false' "$(cat "$TUN_STATE_FILE")" "restored TUN sidecar after MiPilot config sync failure"
+}
+
+test_mode_switch_persists_config() {
+  local root
+  local api_calls
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  CONFIG_DIR="$root/etc/mihomo"
+  CONFIG_FILE="$CONFIG_DIR/config.yaml"
+  # shellcheck disable=SC2034
+  API='http://127.0.0.1:9090'
+  api_calls="$root/api-calls"
+  mkdir -p -- "$CONFIG_DIR"
+  printf '%s\n' \
+    'mixed-port: 7890' \
+    'mode: rule' \
+    'rules:' \
+    '  - MATCH,DIRECT' >"$CONFIG_FILE"
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+  require_api() {
+    return 0
+  }
+  choose_item() {
+    # shellcheck disable=SC2034
+    SELECTED='global'
+    return 0
+  }
+  run_cancellable_named() {
+    return 0
+  }
+  create_config_backup() {
+    printf '%s\n' "$root/config-backup.yaml"
+  }
+  api() {
+    if (( $# == 1 )); then
+      printf '%s\n' '{"mode":"rule"}'
+    else
+      printf '%s\n' "$*" >>"$api_calls"
+    fi
+  }
+
+  switch_mode >/dev/null || return 1
+  assert_file_has_line "$CONFIG_FILE" 'mode: global' "persisted global mode" || return 1
+  assert_line_count "$CONFIG_FILE" 'mode: global' 1 "persisted mode count" || return 1
+  grep -Fq '"mode":"global"' "$api_calls" || fail "runtime mode API update was missing"
+}
+
+test_render_store_selected_config() {
+  local root
+  local input_file
+  local output_file
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  input_file="$root/input.yaml"
+  output_file="$root/output.yaml"
+  printf '%s\n' \
+    'mode: rule' \
+    'profile:' \
+    '  store-selected: false' \
+    '  store-fake-ip: true' \
+    'rules:' \
+    '  - MATCH,DIRECT' >"$input_file"
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+
+  render_store_selected_config "$input_file" "$output_file" || return 1
+  assert_file_has_line "$output_file" '  store-selected: true' "enabled selected-node persistence" || return 1
+  assert_file_has_line "$output_file" '  store-fake-ip: true' "preserved profile setting" || return 1
+  assert_line_count "$output_file" '  store-selected: true' 1 "store-selected count"
+}
+
+test_custom_region_group_rendering() {
+  local root
+  local input_file
+  local output_file
+  local state_file
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  input_file="$root/input.yaml"
+  output_file="$root/output.yaml"
+  state_file="$root/region-groups.conf"
+  printf '%s\n' \
+    'proxy-groups:' \
+    '  - name: "🚀节点选择"' \
+    '    type: select' \
+    '    proxies:' \
+    '      - DIRECT' \
+    'rules:' \
+    '  - MATCH,🚀节点选择' >"$input_file"
+  printf '%s\n' \
+    'custom-1;MiPilot-亚洲优选;日本|Japan|JP|新加坡|Singapore|SG;fallback' \
+    'custom-2;MiPilot-日本手动;日本|Japan|JP;select' \
+    'custom-3;MiPilot-旧版自动;新加坡|Singapore|SG' >"$state_file"
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+
+  apply_region_groups_to_config "$input_file" "$output_file" "$state_file" || return 1
+  assert_file_has_line "$output_file" '  - name: "MiPilot-亚洲优选"' "custom group definition" || return 1
+  assert_file_has_line "$output_file" '      - "MiPilot-亚洲优选"' "custom group parent reference" || return 1
+  assert_file_has_line "$output_file" '    type: fallback' "custom group fallback type" || return 1
+  assert_file_has_line "$output_file" '    type: select' "custom group manual selection type" || return 1
+  assert_file_has_line "$output_file" '    type: url-test' "legacy group automatic selection type" || return 1
+  grep -Fq '日本|Japan|JP|新加坡|Singapore|SG' "$output_file" || fail "custom group combined filter was missing"
+}
+
+test_rule_mode_selects_managed_group() {
+  local root
+  local api_calls
+  local choices_file
+  local api_response
+  local item
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  CONFIG_FILE="$root/config.yaml"
+  REGION_STATE_FILE="$root/region-groups.conf"
+  # shellcheck disable=SC2034
+  API='http://127.0.0.1:9090'
+  api_calls="$root/api-calls"
+  choices_file="$root/choices"
+  printf '%s\n' 'custom-1;MiPilot-亚洲优选;Japan|Singapore' >"$REGION_STATE_FILE"
+  printf '%s\n' \
+    'proxy-groups:' \
+    '  - name: "🚀节点选择"' \
+    '    type: select' \
+    'rules:' \
+    '  - MATCH,🚀节点选择' >"$CONFIG_FILE"
+  api_response='{"proxies":{"🚀节点选择":{"type":"Selector","all":["DIRECT","自动选择","MiPilot-亚洲优选"],"now":"自动选择"},"自动选择":{"type":"URLTest","all":["香港01","日本01"],"now":"香港01"},"MiPilot-亚洲优选":{"type":"URLTest","all":["日本01","新加坡01"],"now":"新加坡01"},"香港01":{"type":"Vmess"},"日本01":{"type":"Vmess"},"新加坡01":{"type":"Vmess"}}}'
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+  api() {
+    if (( $# == 1 )); then
+      printf '%s\n' "$api_response"
+    else
+      printf '%s\n' "$*" >>"$api_calls"
+    fi
+  }
+  choose_item() {
+    printf '%s\n' "$@" >"$choices_file"
+    for item in "$@"; do
+      if [[ $item == *'MiPilot-亚洲优选'* ]]; then
+        # shellcheck disable=SC2034
+        SELECTED="$item"
+        return 0
+      fi
+    done
+    return 1
+  }
+
+  manage_rule_nodes >/dev/null || return 1
+  grep -Fq '自动选择' "$choices_file" || fail "subscription strategy group was not listed"
+  grep -Fq 'MiPilot-亚洲优选' "$choices_file" || fail "custom strategy group was not listed"
+  grep -Fq 'MiPilot-亚洲优选' "$api_calls" || fail "managed group API selection was missing"
+  grep -Fq '/proxies/%F0%9F%9A%80%E8%8A%82%E7%82%B9%E9%80%89%E6%8B%A9' "$api_calls" || fail "managed parent group API target was incorrect"
+}
+
+test_dynamic_region_parent_selection() {
+  local root
+  local response
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  CONFIG_DIR="$root/etc/mihomo"
+  CONFIG_FILE="$CONFIG_DIR/config.yaml"
+  REGION_PARENT_FILE="$CONFIG_DIR/region-parent.conf"
+  mkdir -p -- "$CONFIG_DIR"
+  printf '%s\n' \
+    'proxy-groups:' \
+    '  - name: Proxy' \
+    '    type: select' \
+    'rules:' \
+    '  - MATCH,Proxy' >"$CONFIG_FILE"
+  response='{"proxies":{"Proxy":{"type":"Selector","all":["DIRECT"],"now":"DIRECT"},"GLOBAL":{"type":"Selector","all":["DIRECT"],"now":"DIRECT"}}}'
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+
+  ensure_region_parent "$response" >/dev/null || return 1
+  assert_equal 'Proxy' "$REGION_PARENT" "automatically selected sole non-GLOBAL parent"
+}
+
+test_unreferenced_selector_uses_managed_rule_outlet() {
+  local root
+  local response
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  CONFIG_DIR="$root/etc/mihomo"
+  CONFIG_FILE="$CONFIG_DIR/config.yaml"
+  REGION_PARENT_FILE="$CONFIG_DIR/region-parent.conf"
+  mkdir -p -- "$CONFIG_DIR"
+  printf '%s\n' \
+    'proxy-groups:' \
+    '  - name: 节点选择' \
+    '    type: select' \
+    '  - name: 实际出口' \
+    '    type: url-test' \
+    'rules:' \
+    '  - DOMAIN-SUFFIX,example.com,节点选择' \
+    '  - MATCH,实际出口' >"$CONFIG_FILE"
+  response='{"proxies":{"节点选择":{"type":"Selector","all":["DIRECT"],"now":"DIRECT"},"实际出口":{"type":"URLTest","all":["日本01"],"now":"日本01"},"GLOBAL":{"type":"Selector","all":["日本01"],"now":"日本01"}}}'
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+
+  ensure_region_parent "$response" >/dev/null || return 1
+  assert_equal '节点选择' "$REGION_PARENT" "rule-referenced selector parent" || return 1
+
+  printf '%s\n' \
+    'proxy-groups:' \
+    '  - name: 节点选择' \
+    '    type: select' \
+    '  - name: 实际出口' \
+    '    type: url-test' \
+    'rules:' \
+    '  - MATCH,实际出口' >"$CONFIG_FILE"
+  rm -f -- "$REGION_PARENT_FILE"
+  ensure_region_parent "$response" >/dev/null || return 1
+  assert_equal "$REGION_MANAGED_PARENT" "$REGION_PARENT" "unreferenced selector must not be selected"
+}
+
+test_custom_region_group_without_subscription_groups() {
+  local root
+  local input_file
+  local output_file
+  local state_file
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  input_file="$root/input.yaml"
+  output_file="$root/output.yaml"
+  state_file="$root/region-groups.conf"
+  printf '%s\n' \
+    'proxies:' \
+    '  - name: 日本01' \
+    '    type: vmess' \
+    'rules:' \
+    '  - GEOIP,CN,DIRECT' \
+    '  - MATCH,DIRECT' >"$input_file"
+  printf '%s\n' \
+    'custom-1;MiPilot-日本优选;日本|Japan|JP;url-test' >"$state_file"
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+
+  apply_region_groups_to_config \
+    "$input_file" "$output_file" "$state_file" "$REGION_MANAGED_PARENT" || return 1
+  assert_file_has_line "$output_file" '  - name: "MiPilot-日本优选"' "standalone custom group definition" || return 1
+  assert_file_has_line "$output_file" '  - name: "MiPilot-规则出口"' "managed rule outlet definition" || return 1
+  assert_file_has_line "$output_file" '      - "MiPilot-日本优选"' "managed outlet custom group reference" || return 1
+  assert_file_has_line "$output_file" '  - GEOIP,CN,DIRECT' "preserved direct rule" || return 1
+  assert_file_has_line "$output_file" '  - MATCH,"MiPilot-规则出口"' "managed outlet match rule"
+}
+
+test_region_group_strategy_refresh() {
+  local root
+  local input_file
+  local output_file
+  local state_file
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  input_file="$root/input.yaml"
+  output_file="$root/output.yaml"
+  state_file="$root/region-groups.conf"
+  printf '%s\n' \
+    'proxy-groups:' \
+    '  - name: "MiPilot-日本"' \
+    '    type: url-test' \
+    '    include-all-proxies: true' \
+    '    filter: "old"' \
+    '    exclude-filter: "old"' \
+    '    url: https://old.example' \
+    '    interval: 60' \
+    '    tolerance: 100' \
+    'rules:' \
+    '  - MATCH,DIRECT' >"$input_file"
+  printf '%s\n' 'custom-1;MiPilot-日本;日本|Japan;fallback' >"$state_file"
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+
+  refresh_saved_region_definitions "$input_file" "$output_file" "$state_file" || return 1
+  assert_file_has_line "$output_file" '    type: fallback' "updated managed group type" || return 1
+  assert_file_has_line "$output_file" '    interval: 300' "updated fallback interval" || return 1
+  if grep -Fq 'tolerance:' "$output_file"; then
+    fail "fallback group retained URLTest tolerance"
+    return 1
+  fi
+}
+
+test_remove_region_group_exact_match() {
+  local root
+  local input_file
+  local output_file
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  input_file="$root/input.yaml"
+  output_file="$root/output.yaml"
+  printf '%s\n' \
+    'proxy-groups:' \
+    '  - name: Proxy' \
+    '    type: select' \
+    '    proxies:' \
+    '      - "MiPilot-日本"' \
+    '      - "MiPilot-日本-备用"' \
+    '  - name: "MiPilot-日本"' \
+    '    type: url-test' \
+    '  - name: "MiPilot-日本-备用"' \
+    '    type: url-test' \
+    'rules:' \
+    '  - MATCH,Proxy' >"$input_file"
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+
+  render_without_region_group "$input_file" "$output_file" 'MiPilot-日本' || return 1
+  if grep -Fq 'name: "MiPilot-日本"' "$output_file"; then
+    fail "removed group definition remained"
+    return 1
+  fi
+  assert_file_has_line "$output_file" '      - "MiPilot-日本-备用"' "substring group reference preserved" || return 1
+  assert_file_has_line "$output_file" '  - name: "MiPilot-日本-备用"' "substring group definition preserved"
+}
+
+test_missing_selector_uses_managed_rule_outlet() {
+  local root
+  local response
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  CONFIG_DIR="$root/etc/mihomo"
+  CONFIG_FILE="$CONFIG_DIR/config.yaml"
+  REGION_PARENT_FILE="$CONFIG_DIR/region-parent.conf"
+  mkdir -p -- "$CONFIG_DIR"
+  printf '%s\n' \
+    'proxies:' \
+    '  - name: 日本01' \
+    '    type: vmess' \
+    'rules:' \
+    '  - MATCH,DIRECT' >"$CONFIG_FILE"
+  response='{"proxies":{"日本01":{"type":"Vmess"},"GLOBAL":{"type":"Selector","all":["日本01"],"now":"日本01"}}}'
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+
+  ensure_region_parent "$response" >/dev/null || return 1
+  assert_equal "$REGION_MANAGED_PARENT" "$REGION_PARENT" "selected managed rule outlet"
+}
+
+test_managed_outlet_keeps_subscription_groups() {
+  local root
+  local input_file
+  local output_file
+  local state_file
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  input_file="$root/input.yaml"
+  output_file="$root/output.yaml"
+  state_file="$root/region-groups.conf"
+  printf '%s\n' \
+    'proxy-groups:' \
+    '  - name: "订阅自动选择"' \
+    '    type: url-test' \
+    '    proxies:' \
+    '      - 日本01' \
+    'rules:' \
+    '  - MATCH,订阅自动选择' >"$input_file"
+  printf '%s\n' \
+    'custom-1;MiPilot-日本优选;日本|Japan|JP;url-test' >"$state_file"
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+
+  apply_region_groups_to_config \
+    "$input_file" "$output_file" "$state_file" "$REGION_MANAGED_PARENT" || return 1
+  assert_file_has_line "$output_file" '      - "订阅自动选择"' "managed outlet subscription group reference" || return 1
+  assert_file_has_line "$output_file" '      - "MiPilot-日本优选"' "managed outlet custom group reference"
 }
 
 test_render_minimal_config() {
@@ -634,6 +1260,30 @@ test_shell_integration_idempotent() {
   assert_equal "$first_normalized" "$second_normalized" "repeated shell integration content" || return 1
 }
 
+test_proxy_state_restores_previous_environment() {
+  local root
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  PROXY_STATE_DIR="$root/home/.config/mipilot"
+  PROXY_STATE_FILE="$PROXY_STATE_DIR/proxy-state.sh"
+  unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY no_proxy NO_PROXY
+  export http_proxy='http://company-proxy.example:8080'
+  export NO_PROXY='internal.example'
+  export MIHOMO_PROXY_ENABLED=0
+
+  write_proxy_state 1 || return 1
+  apply_proxy_state
+  assert_equal "$PROXY_URL" "$http_proxy" "MiPilot HTTP proxy" || return 1
+  assert_equal "$PROXY_URL" "$https_proxy" "MiPilot HTTPS proxy" || return 1
+
+  disable_proxy_state || return 1
+  assert_equal 'http://company-proxy.example:8080' "$http_proxy" "restored original HTTP proxy" || return 1
+  assert_equal 'internal.example' "$NO_PROXY" "restored original NO_PROXY" || return 1
+  [[ ! -v https_proxy ]] || fail "previously unset HTTPS proxy was not removed"
+}
+
 test_version_is_newer() {
   load_manager || return 1
 
@@ -758,6 +1408,32 @@ test_local_api_config_rendering() {
   grep -v '^external-controller:' "$input_file" >"$root/without-controller.yaml"
   render_local_api_config "$root/without-controller.yaml" "$output_file" || return 1
   assert_line_count "$output_file" "external-controller: '127.0.0.1:9090'" 1 "appended API controller count" || return 1
+}
+
+test_local_proxy_config_rendering() {
+  local root
+  local input_file
+  local output_file
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  input_file="$root/input.yaml"
+  output_file="$root/output.yaml"
+  printf '%s\n' \
+    'mixed-port: 7890' \
+    'allow-lan: true' \
+    "bind-address: '*'" \
+    'rules:' \
+    '  - MATCH,DIRECT' >"$input_file"
+
+  render_local_proxy_config "$input_file" "$output_file" || return 1
+  assert_file_has_line "$output_file" 'allow-lan: false' "disabled LAN proxy access" || return 1
+  assert_file_has_line "$output_file" "bind-address: '127.0.0.1'" "local proxy bind address" || return 1
+  if grep -Fq "bind-address: '*'" "$output_file"; then
+    fail "public proxy bind address was retained"
+    return 1
+  fi
 }
 
 test_manager_candidate_validation_helpers() {
@@ -888,15 +1564,20 @@ test_reset_runtime_state() {
   SUBSCRIPTION_FILE="$CONFIG_DIR/subscription.url"
   SUBSCRIPTION_LIST_FILE="$CONFIG_DIR/subscriptions.list"
   REGION_STATE_FILE="$CONFIG_DIR/region-groups.conf"
+  REGION_PARENT_FILE="$CONFIG_DIR/region-parent.conf"
   TUN_STATE_FILE="$CONFIG_DIR/tun.state"
   TUN_BYPASS_STATE_FILE="$CONFIG_DIR/tun-bypass-ports.conf"
+  # shellcheck disable=SC2034
+  TUN_BYPASS_SERVICE_FILE="$root/etc/systemd/system/mipilot-tun-bypass.service"
   PROXY_STATE_DIR="$root/home/.config/mipilot"
   PROXY_STATE_FILE="$PROXY_STATE_DIR/proxy-state.sh"
   mkdir -p -- "$CONFIG_DIR" "$PROXY_STATE_DIR"
   printf 'old\n' >"$SUBSCRIPTION_FILE"
   printf 'old\n' >"$SUBSCRIPTION_LIST_FILE"
   printf 'old\n' >"$REGION_STATE_FILE"
+  printf 'Proxy\n' >"$REGION_PARENT_FILE"
   printf 'true\n' >"$TUN_STATE_FILE"
+  printf 'tcp:8080\n' >"$TUN_BYPASS_STATE_FILE"
   printf 'export MIHOMO_PROXY_ENABLED=1\n' >"$PROXY_STATE_FILE"
 
   sudo() {
@@ -906,6 +1587,8 @@ test_reset_runtime_state() {
   clear_manager_runtime_state || return 1
   assert_not_exists "$SUBSCRIPTION_FILE" || return 1
   assert_not_exists "$REGION_STATE_FILE" || return 1
+  assert_not_exists "$REGION_PARENT_FILE" || return 1
+  assert_not_exists "$TUN_BYPASS_STATE_FILE" || return 1
   assert_equal "" "$(cat "$SUBSCRIPTION_LIST_FILE")" "empty subscription list after reset" || return 1
   assert_equal "false" "$(cat "$TUN_STATE_FILE")" "disabled TUN state after reset" || return 1
   grep -Fq 'MIHOMO_PROXY_ENABLED=0' "$PROXY_STATE_FILE" || fail "terminal proxy state was not disabled"
@@ -947,6 +1630,328 @@ test_uninstall_stops_before_delete() {
   assert_equal "0" "$delete_attempted" "no deletion after failed service stop" || return 1
 }
 
+test_rule_policy_parsing_edges() {
+  local root
+  local config_file
+  local actual
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  config_file="$root/config.yaml"
+  printf '%s\n' \
+    'proxy-groups:' \
+    '  - name: Proxy' \
+    '    type: select' \
+    '  - name: Backup' \
+    '    type: select' \
+    '  - name: Unused' \
+    '    type: select' \
+    'rules:' \
+    '  - "DOMAIN-SUFFIX,example.com,Proxy"' \
+    "  - 'IP-CIDR,1.1.1.0/24,Backup,no-resolve'" \
+    '  - MATCH,DIRECT' >"$config_file"
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+
+  actual="$(list_rule_selector_names "$config_file" | sort)"
+  assert_equal $'Backup\nProxy' "$actual" "quoted and no-resolve rule policies"
+}
+
+test_multiple_rule_selectors_require_choice() {
+  local root
+  local response
+  local choice_requested=0
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  CONFIG_DIR="$root/etc/mihomo"
+  CONFIG_FILE="$CONFIG_DIR/config.yaml"
+  REGION_PARENT_FILE="$CONFIG_DIR/region-parent.conf"
+  mkdir -p -- "$CONFIG_DIR"
+  printf '%s\n' \
+    'proxy-groups:' \
+    '  - name: Alpha' \
+    '    type: select' \
+    '  - name: Beta' \
+    '    type: select' \
+    'rules:' \
+    '  - DOMAIN-SUFFIX,alpha.example,Alpha' \
+    '  - MATCH,Beta' >"$CONFIG_FILE"
+  response='{"proxies":{"Alpha":{"type":"Selector","all":["DIRECT"],"now":"DIRECT"},"Beta":{"type":"Selector","all":["DIRECT"],"now":"DIRECT"}}}'
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+  choose_item() {
+    choice_requested=1
+    # shellcheck disable=SC2034
+    SELECTED='Beta'
+  }
+
+  ensure_region_parent "$response" >/dev/null || return 1
+  assert_equal '1' "$choice_requested" "ambiguous rule entry choice prompt" || return 1
+  assert_equal 'Beta' "$REGION_PARENT" "explicitly selected rule entry"
+}
+
+test_stale_saved_parent_is_ignored() {
+  local root
+  local response
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  CONFIG_DIR="$root/etc/mihomo"
+  CONFIG_FILE="$CONFIG_DIR/config.yaml"
+  REGION_PARENT_FILE="$CONFIG_DIR/region-parent.conf"
+  mkdir -p -- "$CONFIG_DIR"
+  printf '%s\n' 'OldParent' >"$REGION_PARENT_FILE"
+  printf '%s\n' \
+    'proxy-groups:' \
+    '  - name: OldParent' \
+    '    type: select' \
+    '  - name: Proxy' \
+    '    type: select' \
+    'rules:' \
+    '  - MATCH,Proxy' >"$CONFIG_FILE"
+  response='{"proxies":{"OldParent":{"type":"Selector","all":["DIRECT"],"now":"DIRECT"},"Proxy":{"type":"Selector","all":["DIRECT"],"now":"DIRECT"}}}'
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+
+  ensure_region_parent "$response" >/dev/null || return 1
+  assert_equal 'Proxy' "$REGION_PARENT" "stale unreferenced saved parent"
+}
+
+test_inline_rules_rejected_for_managed_outlet() {
+  local root
+  local input_file
+  local output_file
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  input_file="$root/input.yaml"
+  output_file="$root/output.yaml"
+  printf '%s\n' \
+    'proxy-groups: []' \
+    'rules: ["MATCH,DIRECT"]' >"$input_file"
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+
+  if render_managed_rule_outlet "$input_file" "$output_file" >/dev/null 2>&1; then
+    fail "inline rules unexpectedly accepted"
+    return 1
+  fi
+}
+
+test_region_metadata_restored_when_config_commit_fails() {
+  local root
+  local candidate_state
+  local backup_file
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  CONFIG_DIR="$root/etc/mihomo"
+  CONFIG_FILE="$CONFIG_DIR/config.yaml"
+  REGION_STATE_FILE="$CONFIG_DIR/region-groups.conf"
+  REGION_PARENT_FILE="$CONFIG_DIR/region-parent.conf"
+  MIHOMO_BIN="$root/mihomo"
+  REGION_PARENT='NewParent'
+  mkdir -p -- "$CONFIG_DIR"
+  printf '%s\n' 'mode: rule' >"$CONFIG_FILE"
+  printf '%s\n' 'old;MiPilot-旧;Old;url-test' >"$REGION_STATE_FILE"
+  printf '%s\n' 'OldParent' >"$REGION_PARENT_FILE"
+  candidate_state="$root/candidate-state"
+  backup_file="$root/config-backup"
+  printf '%s\n' 'new;MiPilot-新;New;fallback' >"$candidate_state"
+  cp -- "$CONFIG_FILE" "$backup_file"
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+  apply_region_groups_to_config() {
+    cp -- "$1" "$2"
+  }
+  run_cancellable_named() {
+    return 0
+  }
+  create_config_backup() {
+    printf '%s\n' "$backup_file"
+  }
+  atomic_install_file() {
+    local source_file="$2"
+    local destination="$3"
+    if [[ $destination == "$CONFIG_FILE" ]]; then return 1; fi
+    mkdir -p -- "$(dirname -- "$destination")"
+    cp -- "$source_file" "$destination"
+  }
+
+  if apply_region_group_state "$candidate_state" test "unexpected" >/dev/null 2>&1; then
+    fail "region state apply succeeded after config commit failure"
+    return 1
+  fi
+  assert_equal 'old;MiPilot-旧;Old;url-test' "$(cat "$REGION_STATE_FILE")" "restored region state" || return 1
+  assert_equal 'OldParent' "$(cat "$REGION_PARENT_FILE")" "restored region parent"
+}
+
+test_tun_state_failure_preserves_config() {
+  local root
+  local original_hash
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  CONFIG_DIR="$root/etc/mihomo"
+  CONFIG_FILE="$CONFIG_DIR/config.yaml"
+  TUN_STATE_FILE="$CONFIG_DIR/tun.state"
+  MIHOMO_BIN="$root/mihomo"
+  mkdir -p -- "$CONFIG_DIR"
+  printf '%s\n' 'tun:' '  enable: false' >"$CONFIG_FILE"
+  original_hash="$(sha256sum "$CONFIG_FILE" | awk '{print $1}')"
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+  run_cancellable_named() {
+    return 0
+  }
+  create_config_backup() {
+    printf '%s\n' "$root/backup"
+  }
+  save_tun_state() {
+    return 1
+  }
+
+  if apply_tun_setting true "开启" >/dev/null 2>&1; then
+    fail "TUN apply succeeded after state write failure"
+    return 1
+  fi
+  assert_equal "$original_hash" "$(sha256sum "$CONFIG_FILE" | awk '{print $1}')" "config unchanged after TUN state failure"
+}
+
+test_tun_restart_failure_restores_state() {
+  local root
+  local backup_file
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  CONFIG_DIR="$root/etc/mihomo"
+  CONFIG_FILE="$CONFIG_DIR/config.yaml"
+  TUN_STATE_FILE="$CONFIG_DIR/tun.state"
+  MIHOMO_BIN="$root/mihomo"
+  mkdir -p -- "$CONFIG_DIR"
+  printf '%s\n' 'tun:' '  enable: false' >"$CONFIG_FILE"
+  printf '%s\n' 'false' >"$TUN_STATE_FILE"
+  backup_file="$root/config-backup"
+  cp -- "$CONFIG_FILE" "$backup_file"
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+  run_cancellable_named() {
+    return 0
+  }
+  create_config_backup() {
+    printf '%s\n' "$backup_file"
+  }
+  run_blocking() {
+    return 1
+  }
+  rollback_config() {
+    cp -- "$backup_file" "$CONFIG_FILE"
+  }
+
+  if apply_tun_setting true "开启" >/dev/null 2>&1; then
+    fail "TUN apply succeeded after restart failure"
+    return 1
+  fi
+  assert_equal 'false' "$(cat "$TUN_STATE_FILE")" "restored TUN state after restart failure" || return 1
+  assert_file_has_line "$CONFIG_FILE" '  enable: false' "restored TUN config"
+}
+
+test_tun_runtime_api_mismatch_fails() {
+  load_manager || return 1
+  # shellcheck disable=SC2034
+  API='http://127.0.0.1:9090'
+
+  refresh_api_config() {
+    API='http://127.0.0.1:9090'
+  }
+  api_quick() {
+    printf '%s\n' '{"tun":{"enable":false}}'
+  }
+
+  if verify_tun_runtime_network >/dev/null 2>&1; then
+    fail "TUN runtime check accepted disabled API state"
+    return 1
+  fi
+}
+
+test_tun_public_probe_failure_is_warning() {
+  local output
+
+  load_manager || return 1
+  # shellcheck disable=SC2034
+  API='http://127.0.0.1:9090'
+  SSH_CONNECTION=''
+
+  refresh_api_config() {
+    API='http://127.0.0.1:9090'
+  }
+  api_quick() {
+    printf '%s\n' '{"tun":{"enable":true}}'
+  }
+  ip() {
+    if [[ ${1:-} == -4 ]]; then
+      printf '%s\n' 'default via 192.0.2.1 dev eth0' 'default via 198.51.100.1 dev eth1'
+    else
+      return 0
+    fi
+  }
+  curl() {
+    return 1
+  }
+
+  output="$(verify_tun_runtime_network)" || return 1
+  [[ $output == *'检测到 2 条 IPv4 默认路由'* ]] || return 1
+  [[ $output == *'公网连通性探测失败'* ]] || return 1
+}
+
+test_tun_ssh_return_route_failure() {
+  load_manager || return 1
+  # shellcheck disable=SC2034
+  API='http://127.0.0.1:9090'
+  # shellcheck disable=SC2034
+  SSH_CONNECTION='203.0.113.10 50000 192.0.2.10 22'
+
+  refresh_api_config() {
+    # shellcheck disable=SC2034
+    API='http://127.0.0.1:9090'
+  }
+  api_quick() {
+    printf '%s\n' '{"tun":{"enable":true}}'
+  }
+  ip() {
+    if [[ ${1:-} == route && ${2:-} == get && ${3:-} == 203.0.113.10 ]]; then return 1; fi
+    if [[ ${1:-} == -4 ]]; then printf '%s\n' 'default via 192.0.2.1 dev eth0'; fi
+    return 0
+  }
+
+  if verify_tun_runtime_network >/dev/null 2>&1; then
+    fail "TUN runtime check accepted missing SSH return route"
+    return 1
+  fi
+}
+
 run_test() {
   local name="$1"
   local function_name="$2"
@@ -969,25 +1974,55 @@ run_test "local asset discovery" test_find_local_assets
 run_test "configuration backup pruning" test_prune_config_backups
 run_test "rollback expiration" test_cleanup_expired_rollbacks
 run_test "installation state detection" test_detect_install_state
+run_test "MiPilot config migration and materialization" test_mipilot_config_migration_and_materialization
+run_test "configuration backup includes MiPilot settings" test_config_backup_bundles_mipilot_settings
+run_test "TUN preserves non-TUN state" test_tun_render_preserves_non_tun_state
+run_test "runtime marker precedence" test_runtime_mode_marker_precedence
+run_test "runtime backend dispatch" test_runtime_backend_dispatch
+run_test "manual install default" test_install_runtime_choice_defaults_manual
 run_test "manager lock release" test_manager_lock_release
 run_test "lock release preserves caller stderr" test_lock_release_preserves_stderr
 run_test "curl download follows current system route" test_download_uses_curl_without_forced_proxy
-run_test "public service port detection" test_detect_public_service_ports
-run_test "TUN bypass rule synchronization" test_sync_tun_bypass_rules
-run_test "server-compatible TUN rendering" test_render_tun_server_compatibility
+run_test "restored TUN state reconciliation" test_reconcile_tun_runtime_state
+run_test "TUN state sync failure restores sidecar" test_tun_state_sync_failure_restores_sidecar
+run_test "native Mihomo TUN routing" test_render_tun_native_routing
+run_test "legacy TUN bypass cleanup" test_cleanup_legacy_tun_bypass
+run_test "mode switch persistence" test_mode_switch_persists_config
+run_test "selected-node persistence rendering" test_render_store_selected_config
+run_test "custom region group rendering" test_custom_region_group_rendering
+run_test "rule mode managed-group selection" test_rule_mode_selects_managed_group
+run_test "dynamic region parent selection" test_dynamic_region_parent_selection
+run_test "unreferenced selector falls back to managed outlet" test_unreferenced_selector_uses_managed_rule_outlet
+run_test "custom region group without subscription groups" test_custom_region_group_without_subscription_groups
+run_test "managed region strategy refresh" test_region_group_strategy_refresh
+run_test "exact managed region deletion" test_remove_region_group_exact_match
+run_test "managed rule outlet without selector" test_missing_selector_uses_managed_rule_outlet
+run_test "managed rule outlet keeps subscription groups" test_managed_outlet_keeps_subscription_groups
 run_test "minimal direct configuration" test_render_minimal_config
 run_test "SHA256 sidecar verification" test_verify_sha256_sidecar
 run_test "idempotent shell integration" test_shell_integration_idempotent
+run_test "proxy environment restoration" test_proxy_state_restores_previous_environment
 run_test "manager version comparison" test_version_is_newer
 run_test "progress runner non-TTY behavior" test_progress_runner_non_tty
 run_test "API secret argument protection" test_api_secret_not_in_arguments
 run_test "secure subscription curl config" test_secure_subscription_curl_config
 run_test "local API config rendering" test_local_api_config_rendering
+run_test "local proxy config rendering" test_local_proxy_config_rendering
 run_test "manager candidate validation helpers" test_manager_candidate_validation_helpers
 run_test "online manager update and rollback" test_online_manager_update_and_rollback
 run_test "subscription activation marker rollback" test_subscription_activation_marker_rollback
 run_test "reset runtime state" test_reset_runtime_state
 run_test "uninstall stop-before-delete guard" test_uninstall_stops_before_delete
+run_test "rule policy parsing edge cases" test_rule_policy_parsing_edges
+run_test "multiple rule selectors require explicit choice" test_multiple_rule_selectors_require_choice
+run_test "stale saved rule parent ignored" test_stale_saved_parent_is_ignored
+run_test "inline rules rejected for managed outlet" test_inline_rules_rejected_for_managed_outlet
+run_test "region metadata rollback on config failure" test_region_metadata_restored_when_config_commit_fails
+run_test "TUN state failure preserves config" test_tun_state_failure_preserves_config
+run_test "TUN restart failure restores state" test_tun_restart_failure_restores_state
+run_test "TUN API mismatch fails health check" test_tun_runtime_api_mismatch_fails
+run_test "TUN public probe failure warns" test_tun_public_probe_failure_is_warning
+run_test "TUN SSH return route failure" test_tun_ssh_return_route_failure
 
 printf '\nResult: %s passed, %s failed\n' "$PASSED" "$FAILED"
 ((FAILED == 0))

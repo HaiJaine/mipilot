@@ -1,6 +1,6 @@
 # MiPilot
 
-当前版本: `1.0.0`, MiPilot首个正式版本。
+当前版本: `1.0.1`, 配置持久化、TUN和规则分组修复版本。
 
 MiPilot 取意于“Mihomo + Pilot”, 是面向 Ubuntu 的 Mihomo 一键安装与维护工具。首次执行时可完全使用本地的 Mihomo 内核和地理数据完成安装; 安装完成后通过 `mipilot` 管理订阅、节点、TUN、终端代理、服务、更新、备份和卸载。
 
@@ -8,10 +8,10 @@ MiPilot 取意于“Mihomo + Pilot”, 是面向 Ubuntu 的 Mihomo 一键安装�
 
 ### 使用完整离线包
 
-从 [MiPilot v1.0.0 Release](https://github.com/HaiJaine/mipilot/releases/tag/v1.0.0) 下载:
+从 [MiPilot v1.0.1 Release](https://github.com/HaiJaine/mipilot/releases/tag/v1.0.1) 下载:
 
 ```text
-mipilot-v1.0.0-linux-amd64-offline.tar.gz
+mipilot-v1.0.1-linux-amd64-offline.tar.gz
 SHA256SUMS
 ```
 
@@ -19,8 +19,8 @@ SHA256SUMS
 
 ```bash
 sha256sum -c SHA256SUMS --ignore-missing
-tar -xzf mipilot-v1.0.0-linux-amd64-offline.tar.gz
-cd mipilot-v1.0.0
+tar -xzf mipilot-v1.0.1-linux-amd64-offline.tar.gz
+cd mipilot-v1.0.1
 bash ./mipilot
 ```
 
@@ -38,17 +38,17 @@ cd mipilot
 ```text
 country.mmdb
 geosite.dat
-mihomo-linux-amd64-v1.19.28.gz
+mihomo-linux-amd64-v1.19.30.gz
 ```
 
 确认 3 个文件与脚本位于同一目录:
 
 ```bash
-ls -lh mipilot country.mmdb geosite.dat mihomo-linux-amd64-v1.19.28.gz
+ls -lh mipilot country.mmdb geosite.dat mihomo-linux-amd64-v1.19.30.gz
 bash ./mipilot
 ```
 
-Git仓库不会提交这3个第三方大文件。它们可以从 [Mihomo v1.19.28](https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.28) 和 [meta-rules-dat Releases](https://github.com/MetaCubeX/meta-rules-dat/releases) 获取; GitHub无法访问时也可以在其他设备下载后传入服务器。
+Git仓库不会提交这3个第三方大文件。它们可以从 [Mihomo v1.19.30](https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.30) 和 [meta-rules-dat Releases](https://github.com/MetaCubeX/meta-rules-dat/releases) 获取; GitHub无法访问时也可以在其他设备下载后传入服务器。
 
 安装完成后执行:
 
@@ -75,14 +75,14 @@ mipilot
 mipilot
 country.mmdb
 geosite.dat
-mihomo-linux-amd64-v1.19.28.gz
+mihomo-linux-amd64-v1.19.30.gz
 ```
 
 文件用途:
 
 | 文件 | 安装位置 | 来源 |
 | --- | --- | --- |
-| `mihomo-linux-amd64-v1.19.28.gz` | `/usr/local/bin/mihomo` | [MetaCubeX/mihomo Releases](https://github.com/MetaCubeX/mihomo/releases) |
+| `mihomo-linux-amd64-v1.19.30.gz` | `/usr/local/bin/mihomo` | [MetaCubeX/mihomo Releases](https://github.com/MetaCubeX/mihomo/releases) |
 | `country.mmdb` | `/etc/mihomo/Country.mmdb` | [MetaCubeX/meta-rules-dat Releases](https://github.com/MetaCubeX/meta-rules-dat/releases) |
 | `geosite.dat` | `/etc/mihomo/GeoSite.dat` | [MetaCubeX/meta-rules-dat Releases](https://github.com/MetaCubeX/meta-rules-dat/releases) |
 
@@ -97,9 +97,9 @@ bash ./mipilot
 1. 检查 Ubuntu 版本、amd64 架构、Bash、systemd 和 sudo.
 2. 检查所需系统命令. 缺少依赖时, 经确认后尝试使用 APT 安装.
 3. 校验本地 gzip、临时内核版本、地理数据和生成配置.
-4. 安装 Mihomo、地理数据、安全的初始直连配置和 systemd 服务.
-5. 安装管理脚本与 `mipilot`, 并写入受管的 Bash 集成区块.
-6. 可选添加首个订阅. 跳过或订阅下载失败时, Mihomo 仍以直连配置完成安装.
+4. 选择运行方式. 默认是手动模式; 只有明确输入 `y` 才安装并启用 systemd 服务.
+5. 安装 Mihomo、地理数据、安全的初始直连配置、管理脚本和 `mipilot` 命令.
+6. 服务模式会立即启动并可选添加首个订阅; 手动模式安装后保持停止, 进入 `mipilot` 启动后再管理订阅.
 
 完成后在当前终端执行:
 
@@ -109,6 +109,10 @@ mipilot
 ```
 
 初始配置关闭 TUN, 控制 API 仅监听本机, 且不包含代理节点。
+
+手动模式不会创建 `mihomo.service`, 也不会开机自启。用户仍通过 `mipilot` 启动和停止 Mihomo; 管理器会使用 `sudo` 启动进程, 因此开启 TUN 时仍具备所需网络权限。手动模式日志保存在 `/var/lib/mipilot/mihomo.log`, PID 文件保存在 `/run/mipilot/mihomo.pid`。可在“运行维护”中随时切换手动模式和 systemd 服务模式。
+
+MiPilot 将用户设置统一保存在 `/etc/mipilot/config.json`, 权限为 `600`。该文件是订阅、运行模式、TUN、地区分组和节点选择的持久状态源; `/etc/mihomo/config.yaml` 是合并订阅与这些设置后生成的 Mihomo 运行配置。已有安装首次启动新版管理器时, 会自动从旧状态文件迁移并保留旧文件作为派生兼容数据。
 
 离线资产可以避免首次安装访问 GitHub, 但不能替代系统依赖。如果系统缺少依赖且 APT 也不可用, 安装会在写入系统文件前停止并显示缺失清单。请先从可信来源准备依赖和 3 个离线资产; 首次安装不附带上游签名或可信摘要时, 完整性检测不能替代来源真实性校验。
 
@@ -137,13 +141,15 @@ mipilot
 
 主菜单提供运行状态、订阅管理、节点管理、规则/全局/直连模式、终端代理、TUN 和服务维护等功能。通过 `.bashrc` 中的受管 `mipilot` 函数进入菜单时, 终端代理开关可以立即作用于当前 Shell。
 
+地区分组管理与节点管理相互独立。地区分组管理可以自动生成常用地区组, 也可以将日本、新加坡等多个地区组合成一个自定义 `MiPilot-` 分组。创建后可以查看实际匹配节点、修改自动测速/故障回退/负载均衡/手动选择策略或删除分组; 旧版已保存分组继续按自动测速处理。规则模式只把订阅规则实际引用的手动策略组视为原生规则入口, 节点管理会显示该入口下的订阅分组和 `MiPilot-` 自定义分组; 全局模式只显示并切换具体代理节点。订阅没有被规则引用的手动策略组时, MiPilot会创建自己的兜底规则出口并接管最终 `MATCH` 规则, 自定义地区分组不再依赖订阅的 Selector。这个兜底出口不会改写更早命中的订阅规则。订阅更新后会按新节点重新生成地区分组; 新订阅恢复明确的原生规则入口时会优先回挂原生入口, 无法唯一确认入口时迁移到MiPilot兜底规则出口。
+
 下载、测速、配置验证、TUN切换、服务操作和更新等耗时任务会显示动态进度与等待时间。可安全取消的阶段支持Esc; 配置替换、服务重启、路由修改和回滚阶段会明确显示“不可中断”。
 
 ### TUN与公网服务兼容
 
-开启TUN时, MiPilot使用 `auto-route: true` 和服务器兼容性更好的 `auto-redirect: false`, 并自动扫描Docker公开端口以及监听在所有地址上的TCP/UDP服务端口, 为这些端口的返回流量添加优先于Mihomo TUN的主路由规则。例如Docker公开 `8080` 后会生成 `ipproto tcp sport 8080 lookup main`, 防止外部请求从公网网卡进入、返回包却被TUN接管。普通外连使用随机源端口, 仍按Mihomo规则经过TUN。
+开启TUN时, MiPilot使用Mihomo原生的 `auto-route: true`、`auto-redirect: true` 和 `auto-detect-interface: true` 管理Linux路由与TCP重定向, 不扫描监听端口, 也不创建按源端口绕过TUN的策略路由。启用后会检查Mihomo运行状态、TUN配置、IPv4路由和当前SSH客户端回程路由, 并执行一次不使用显式代理的公网连通性探测。普通单出口和包含Docker网桥的环境由Mihomo自动识别出口; 检测到多条默认路由时会给出提示, 多个有效公网出口的复杂策略路由仍需结合实际网络配置验证。
 
-端口列表保存于 `/etc/mihomo/tun-bypass-ports.conf`, 系统启动时由 `mipilot-tun-bypass.service` 恢复。每次开启TUN或进入MiPilot菜单时会重新扫描, 关闭TUN和卸载时会删除对应策略规则。
+升级会清理旧版 `tun-bypass-ports.conf`、`mipilot-tun-bypass.service` 以及状态文件中已记录端口对应的旧规则。旧状态文件已经丢失时不会按端口盲目删除系统策略路由, 需要管理员结合实际规则手动确认。
 
 ### 订阅与节点
 
@@ -155,20 +161,21 @@ mipilot
 
 ### 配置备份
 
-所有配置备份统一位于 `/etc/mihomo/backups`, 合计只保留最新 3 份, 权限为 `600`。备份管理可以查看时间和原因, 并恢复指定版本。旧式 `config.yaml.bak.*` 文件在接管时会迁移并按同一上限清理。
+所有配置备份统一位于 `/etc/mihomo/backups`, 合计只保留最新 3 组, 权限为 `600`。每组同时包含 Mihomo 运行配置和对应的 MiPilot 持久配置, 恢复时会作为一个整体处理。旧式 `config.yaml.bak.*` 文件在接管时会迁移并按同一上限清理; 旧备份没有配套MiPilot配置时, 仍可按兼容模式仅恢复运行配置。
 
-### 服务维护
+### 运行维护
 
 ```text
-1) 验证配置并重启服务
-2) 启动/停止服务
-3) 查看服务日志
+1) 验证配置并重启 Mihomo
+2) 启动/停止 Mihomo
+3) 查看最近日志
 4) 查看内核与数据版本
 5) 更新与版本回退
 6) 配置备份与恢复
 7) 生成脱敏诊断报告
 8) 修复或重新安装
-9) 卸载
+9) 切换手动/系统服务模式
+10) 卸载
 0) 返回
 ```
 
@@ -189,7 +196,7 @@ mipilot
 0) 返回
 ```
 
-在线更新只跟踪 Mihomo 稳定版。下载统一使用普通 `curl`, 不主动判断或指定代理; 实际网络路径由当前TUN、代理环境变量或系统路由决定。下载和校验全部完成后才会停止服务并替换组件, 新版本验证或启动失败时会自动恢复旧组件。
+在线更新只跟踪 Mihomo 稳定版。下载统一使用普通 `curl`, 不主动判断或指定代理; 实际网络路径由当前TUN、代理环境变量或系统路由决定。下载和校验全部完成后才会停止服务并替换组件, 新版本验证或启动失败时会自动恢复旧组件。订阅更新会重新合并MiPilot中保存的运行模式、TUN和自定义地区分组, 并恢复新订阅中仍然存在的策略组及节点选择。
 
 在线更新不可用时:
 
@@ -208,7 +215,7 @@ MiPilot管理器只在用户从菜单手动选择时检查更新, 不在启动�
 
 从“服务维护”菜单选择“卸载”后有两种模式:
 
-- 卸载程序并保留 `/etc/mihomo` 配置, 方便以后恢复.
+- 卸载程序并保留 `/etc/mihomo` 和 `/etc/mipilot` 配置, 方便以后恢复.
 - 彻底卸载, 删除 Mihomo 内核、受管服务、配置、订阅、备份、回退区、管理器、Shell 集成和用户代理状态.
 
 彻底卸载必须输入 `UNINSTALL` 确认。卸载不会删除当前项目目录及其中的离线包, 也不会卸载 `curl`、`jq` 等系统共享依赖。
@@ -219,11 +226,13 @@ MiPilot管理器只在用户从菜单手动选择时检查更新, 不在启动�
 | --- | --- |
 | Mihomo 内核 | `/usr/local/bin/mihomo` |
 | 配置与地理数据 | `/etc/mihomo` |
+| MiPilot 持久配置 | `/etc/mipilot/config.json` |
 | 配置备份 | `/etc/mihomo/backups` |
 | 管理器 | `/usr/local/lib/mipilot/mipilot` |
 | 管理命令 | `/usr/local/bin/mipilot` |
-| systemd 服务 | `/etc/systemd/system/mihomo.service` |
-| TUN公网服务保护 | `/etc/systemd/system/mipilot-tun-bypass.service` |
+| systemd 服务(选择服务模式时) | `/etc/systemd/system/mihomo.service` |
+| 手动模式日志 | `/var/lib/mipilot/mihomo.log` |
+| 手动模式 PID | `/run/mipilot/mihomo.pid` |
 | 更新回退区与安装状态 | `/var/lib/mipilot` |
 | 当前用户的终端代理状态 | `~/.config/mipilot` |
 
@@ -239,6 +248,7 @@ mipilot/
 ├── README.md
 ├── LICENSE
 ├── THIRD_PARTY_NOTICES.md
+├── .gitattributes
 ├── .gitignore
 └── tests/
 ```
@@ -250,7 +260,15 @@ bash -n mipilot
 bash tests/run-tests.sh
 ```
 
-模拟测试不会写入真实系统目录。涉及TUN、Docker公网端口和systemd的行为应在受支持的Ubuntu amd64环境中验证。
+模拟测试不会写入真实系统目录。涉及TUN、Docker公网端口和systemd的行为应在受支持的Ubuntu amd64环境中验证。实机验证前后可以执行只读网络检查:
+
+```bash
+sudo bash tests/run-network-checks.sh off
+# 通过mipilot开启TUN后
+sudo bash tests/run-network-checks.sh on
+```
+
+单网卡、多网卡、SSH、Docker、IPv6、防火墙和断网恢复场景见 `tests/NETWORK_TEST_MATRIX.md`。
 
 ## 许可证
 

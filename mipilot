@@ -16,17 +16,21 @@ if (( EUID == 0 )) && ! command -v sudo >/dev/null 2>&1; then
   }
 fi
 
-MANAGER_VERSION="1.0.0"
+MANAGER_VERSION="1.0.1"
 SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname -- "$SCRIPT_PATH")"
 USER_HOME="${HOME:-/root}"
 CONFIG_DIR="${MIPILOT_CONFIG_DIR:-/etc/mihomo}"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
+MANAGER_CONFIG_DIR="${MIPILOT_MANAGER_CONFIG_DIR:-/etc/mipilot}"
+MANAGER_CONFIG_FILE="${MIPILOT_MANAGER_CONFIG_FILE:-${MANAGER_CONFIG_DIR}/config.json}"
 SUBSCRIPTION_FILE="${CONFIG_DIR}/subscription.url"
 SUBSCRIPTION_LIST_FILE="${CONFIG_DIR}/subscriptions.list"
 TUN_STATE_FILE="${CONFIG_DIR}/tun.state"
 TUN_BYPASS_STATE_FILE="${CONFIG_DIR}/tun-bypass-ports.conf"
 REGION_STATE_FILE="${CONFIG_DIR}/region-groups.conf"
+REGION_PARENT_FILE="${CONFIG_DIR}/region-parent.conf"
+REGION_MANAGED_PARENT="MiPilot-规则出口"
 BACKUP_DIR="${CONFIG_DIR}/backups"
 BACKUP_LIMIT=3
 MANAGER_LIB_DIR="${MIPILOT_LIB_DIR:-/usr/local/lib/mipilot}"
@@ -40,6 +44,8 @@ TUN_BYPASS_SERVICE_FILE="${MIPILOT_TUN_BYPASS_SERVICE_FILE:-/etc/systemd/system/
 STATE_DIR="${MIPILOT_STATE_DIR:-/var/lib/mipilot}"
 ROLLBACK_DIR="${STATE_DIR}/rollback"
 INSTALL_MARKER="${STATE_DIR}/installed"
+MANUAL_LOG_FILE="${MIPILOT_MANUAL_LOG_FILE:-${STATE_DIR}/mihomo.log}"
+MANUAL_PID_FILE="${MIPILOT_MANUAL_PID_FILE:-/run/mipilot/mihomo.pid}"
 LOCK_FILE="${MIPILOT_LOCK_FILE:-/run/lock/mipilot.lock}"
 ROLLBACK_MAX_AGE=$((72 * 60 * 60))
 MANAGER_RELEASE_BASE="https://github.com/HaiJaine/mipilot/releases/latest/download"
@@ -63,9 +69,11 @@ MENU_CHOICE=""
 INPUT_LINE=""
 ACTIVE_NODE=""
 ACTIVE_CHAIN=""
+SELECTED_REGION_RECORD=""
 MENU_MODE_STATUS=""
 MENU_NODE_STATUS=""
 MENU_RUNTIME_MODE=""
+REGION_PARENT=""
 SUBSCRIPTION_URLS=()
 MANAGER_SHOULD_EXIT=0
 DOWNLOAD_ROUTE_NOTICE_SHOWN=0
@@ -94,7 +102,7 @@ ensure_sudo_access() {
   elif command -v sudo >/dev/null 2>&1; then
     sudo -v
   else
-    echo "当前用户不是root且系统缺少sudo, 无法管理系统服务."
+    echo "当前用户不是root且系统缺少sudo, 无法管理 Mihomo."
     return 1
   fi
 }
@@ -381,12 +389,33 @@ mipilot() {
 write_proxy_state() {
   local enabled="$1"
   local temporary
+  local variable
+  local saved_set_name
+  local saved_value_name
+  local saved_set
+  local saved_value
 
   mkdir -p "$PROXY_STATE_DIR"
   temporary="$(mktemp "${PROXY_STATE_FILE}.XXXXXX")" || return
 
   if [[ $enabled == 1 ]]; then
     {
+      for variable in http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY no_proxy NO_PROXY; do
+        saved_set_name="MIPILOT_SAVED_${variable}_SET"
+        saved_value_name="MIPILOT_SAVED_${variable}_VALUE"
+        if [[ ${MIHOMO_PROXY_ENABLED:-0} == 1 && -n ${!saved_set_name+x} ]]; then
+          saved_set="${!saved_set_name}"
+          saved_value="${!saved_value_name:-}"
+        elif [[ -v $variable ]]; then
+          saved_set=1
+          saved_value="${!variable}"
+        else
+          saved_set=0
+          saved_value=""
+        fi
+        printf 'export %s=%q\n' "$saved_set_name" "$saved_set"
+        printf 'export %s=%q\n' "$saved_value_name" "$saved_value"
+      done
       printf "export http_proxy='%s'\n" "$PROXY_URL"
       printf "export https_proxy='%s'\n" "$PROXY_URL"
       printf "export all_proxy='%s'\n" "$SOCKS_PROXY_URL"
@@ -399,15 +428,43 @@ write_proxy_state() {
     } >"$temporary"
   else
     {
-      printf 'unset http_proxy https_proxy all_proxy\n'
-      printf 'unset HTTP_PROXY HTTPS_PROXY ALL_PROXY\n'
-      printf 'unset no_proxy NO_PROXY\n'
       printf 'export MIHOMO_PROXY_ENABLED=0\n'
+      printf 'unset MIPILOT_SAVED_http_proxy_SET MIPILOT_SAVED_http_proxy_VALUE\n'
+      printf 'unset MIPILOT_SAVED_https_proxy_SET MIPILOT_SAVED_https_proxy_VALUE\n'
+      printf 'unset MIPILOT_SAVED_all_proxy_SET MIPILOT_SAVED_all_proxy_VALUE\n'
+      printf 'unset MIPILOT_SAVED_HTTP_PROXY_SET MIPILOT_SAVED_HTTP_PROXY_VALUE\n'
+      printf 'unset MIPILOT_SAVED_HTTPS_PROXY_SET MIPILOT_SAVED_HTTPS_PROXY_VALUE\n'
+      printf 'unset MIPILOT_SAVED_ALL_PROXY_SET MIPILOT_SAVED_ALL_PROXY_VALUE\n'
+      printf 'unset MIPILOT_SAVED_no_proxy_SET MIPILOT_SAVED_no_proxy_VALUE\n'
+      printf 'unset MIPILOT_SAVED_NO_PROXY_SET MIPILOT_SAVED_NO_PROXY_VALUE\n'
     } >"$temporary"
   fi
 
   chmod 600 "$temporary"
   mv -f -- "$temporary" "$PROXY_STATE_FILE"
+}
+
+restore_saved_proxy_environment() {
+  local variable
+  local saved_set_name
+  local saved_value_name
+
+  for variable in http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY no_proxy NO_PROXY; do
+    saved_set_name="MIPILOT_SAVED_${variable}_SET"
+    saved_value_name="MIPILOT_SAVED_${variable}_VALUE"
+    if [[ ${!saved_set_name:-0} == 1 ]]; then
+      printf -v "$variable" '%s' "${!saved_value_name:-}"
+      export "${variable?}"
+    else
+      unset "$variable"
+    fi
+  done
+}
+
+disable_proxy_state() {
+  restore_saved_proxy_environment
+  write_proxy_state 0 || return 1
+  apply_proxy_state
 }
 
 apply_proxy_state() {
@@ -497,8 +554,8 @@ show_proxy_environment() {
 enable_system_proxy() {
   local status
 
-  if ! systemctl is-active --quiet mihomo; then
-    echo "Mihomo 服务未运行, 请先验证配置并启动服务."
+  if ! runtime_is_active; then
+    echo "Mihomo 未运行, 请先验证配置并启动."
     return 1
   fi
 
@@ -527,8 +584,7 @@ enable_system_proxy() {
 }
 
 disable_system_proxy() {
-  write_proxy_state 0 || return
-  apply_proxy_state
+  disable_proxy_state || return
   echo "代理已关闭, 后续终端默认直连."
 
   if (( SCRIPT_SOURCED == 0 )); then
@@ -549,6 +605,7 @@ prune_config_backups() {
   )
   for ((index = keep; index < ${#backups[@]}; index++)); do
     sudo rm -f -- "${backups[$index]}"
+    sudo rm -f -- "${backups[$index]%.yaml}.mipilot.json"
   done
 }
 
@@ -563,6 +620,10 @@ create_config_backup() {
   backup="${BACKUP_DIR}/config-${timestamp}-${reason}.yaml"
   sudo install -d -m 700 "$BACKUP_DIR" || return 1
   sudo install -m 600 "$CONFIG_FILE" "$backup" || return 1
+  if ! mipilot_config_is_valid; then
+    sync_mipilot_config_from_state || return 1
+  fi
+  sudo install -m 600 "$MANAGER_CONFIG_FILE" "${backup%.yaml}.mipilot.json" || return 1
   prune_config_backups "$BACKUP_LIMIT" || return 1
   printf '%s\n' "$backup"
 }
@@ -581,6 +642,308 @@ atomic_install_file() {
     sudo -n rm -f -- "$temporary" 2>/dev/null || true
     return 1
   }
+}
+
+mipilot_config_is_valid() {
+  sudo test -f "$MANAGER_CONFIG_FILE" && \
+    sudo jq -e '
+      .schema_version == 1
+      and (.runtime.type == "manual" or .runtime.type == "service")
+      and (.mode == "rule" or .mode == "global" or .mode == "direct")
+      and (.tun.enabled | type == "boolean")
+      and (.subscription.items | type == "array")
+      and (.custom_groups | type == "array")
+    ' "$MANAGER_CONFIG_FILE" >/dev/null 2>&1
+}
+
+sync_mipilot_config_from_state() {
+  local temporary
+  local old_file="/dev/null"
+  local active_file="/dev/null"
+  local list_file="/dev/null"
+  local groups_file="/dev/null"
+  local parent_file="/dev/null"
+  local runtime_mode
+  local running_mode
+  local tun_enabled
+
+  sudo install -d -m 700 "$MANAGER_CONFIG_DIR" || return 1
+  sudo test -f "$MANAGER_CONFIG_FILE" && old_file="$MANAGER_CONFIG_FILE"
+  sudo test -f "$SUBSCRIPTION_FILE" && active_file="$SUBSCRIPTION_FILE"
+  sudo test -f "$SUBSCRIPTION_LIST_FILE" && list_file="$SUBSCRIPTION_LIST_FILE"
+  sudo test -f "$REGION_STATE_FILE" && groups_file="$REGION_STATE_FILE"
+  sudo test -f "$REGION_PARENT_FILE" && parent_file="$REGION_PARENT_FILE"
+  runtime_mode="$(installed_runtime_mode)"
+  running_mode="$(config_value mode 2>/dev/null || true)"
+  [[ $running_mode == rule || $running_mode == global || $running_mode == direct ]] || running_mode="rule"
+  if sudo test -s "$TUN_STATE_FILE"; then
+    tun_enabled="$(sudo head -n 1 "$TUN_STATE_FILE")"
+  else
+    tun_enabled="$(tun_config_value)"
+  fi
+  [[ $tun_enabled == true || $tun_enabled == false ]] || tun_enabled="false"
+
+  temporary="$(mktemp /tmp/mipilot-config.XXXXXX.json)" || return 1
+  # shellcheck disable=SC2024
+  if ! sudo jq -n \
+      --arg runtime "$runtime_mode" \
+      --arg mode "$running_mode" \
+      --argjson tun "$tun_enabled" \
+      --rawfile old "$old_file" \
+      --rawfile active "$active_file" \
+      --rawfile subscriptions "$list_file" \
+      --rawfile groups "$groups_file" \
+      --rawfile parent "$parent_file" '
+        ($old | try fromjson catch {}) as $previous
+        | {
+            schema_version: 1,
+            runtime: {type: $runtime},
+            mode: $mode,
+            tun: {enabled: $tun},
+            subscription: {
+              active: ($active | split("\n") | map(select(length > 0)) | first // ""),
+              items: ($subscriptions | split("\n") | map(select(length > 0)) | unique)
+            },
+            rule_selection: {
+              parent: ($parent | split("\n") | map(select(length > 0)) | first // ""),
+              group: ($previous.rule_selection.group // "")
+            },
+            global_selection: {node: ($previous.global_selection.node // "")},
+            selector_selections: ($previous.selector_selections // {}),
+            custom_groups: (
+              $groups
+              | split("\n")
+              | map(select(length > 0) | split(";") | {
+                  id: (.[0] // ""),
+                  name: (.[1] // ""),
+                  match: (.[2] // ""),
+                  strategy: (.[3] // "url-test")
+                })
+            )
+          }
+      ' >"$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  atomic_install_file 600 "$temporary" "$MANAGER_CONFIG_FILE"
+  local status=$?
+  rm -f -- "$temporary"
+  return "$status"
+}
+
+materialize_mipilot_state() {
+  local temporary
+
+  mipilot_config_is_valid || return 1
+  sudo install -d -m 700 "$CONFIG_DIR" || return 1
+  temporary="$(mktemp /tmp/mipilot-derived.XXXXXX)" || return 1
+
+  # shellcheck disable=SC2024
+  sudo jq -r '.subscription.items[]' "$MANAGER_CONFIG_FILE" >"$temporary" || return 1
+  atomic_install_file 600 "$temporary" "$SUBSCRIPTION_LIST_FILE" || return 1
+  # shellcheck disable=SC2024
+  sudo jq -r '.subscription.active // empty' "$MANAGER_CONFIG_FILE" >"$temporary" || return 1
+  if [[ -s $temporary ]]; then
+    atomic_install_file 600 "$temporary" "$SUBSCRIPTION_FILE" || return 1
+  else
+    sudo rm -f -- "$SUBSCRIPTION_FILE" || return 1
+  fi
+  # shellcheck disable=SC2024
+  sudo jq -r '
+    .custom_groups[]
+    | [.id, .name, .match, (.strategy // "url-test")]
+    | join(";")
+  ' "$MANAGER_CONFIG_FILE" >"$temporary" || return 1
+  if [[ -s $temporary ]]; then
+    atomic_install_file 600 "$temporary" "$REGION_STATE_FILE" || return 1
+  else
+    sudo rm -f -- "$REGION_STATE_FILE" || return 1
+  fi
+  # shellcheck disable=SC2024
+  sudo jq -r '.rule_selection.parent // empty' "$MANAGER_CONFIG_FILE" >"$temporary" || return 1
+  if [[ -s $temporary ]]; then
+    atomic_install_file 600 "$temporary" "$REGION_PARENT_FILE" || return 1
+  else
+    sudo rm -f -- "$REGION_PARENT_FILE" || return 1
+  fi
+  # shellcheck disable=SC2024
+  sudo jq -r '.tun.enabled' "$MANAGER_CONFIG_FILE" >"$temporary" || return 1
+  atomic_install_file 600 "$temporary" "$TUN_STATE_FILE" || return 1
+  rm -f -- "$temporary"
+}
+
+initialize_mipilot_config() {
+  if sudo test -f "$MANAGER_CONFIG_FILE"; then
+    if ! mipilot_config_is_valid; then
+      echo "MiPilot 配置无效, 为避免覆盖现有状态已停止: ${MANAGER_CONFIG_FILE}"
+      return 1
+    fi
+    materialize_mipilot_state || return 1
+  else
+    sync_mipilot_config_from_state || return 1
+  fi
+  reconcile_runtime_config_from_mipilot
+}
+
+reconcile_runtime_config_from_mipilot() {
+  local mode
+  local tun_enabled
+  local mode_temporary
+  local tun_temporary
+  local region_temporary=""
+  local region_parent
+  local current_hash
+  local candidate_hash
+  local backup
+
+  sudo test -f "$CONFIG_FILE" || return 0
+  mode="$(sudo jq -r '.mode' "$MANAGER_CONFIG_FILE")"
+  tun_enabled="$(sudo jq -r '.tun.enabled' "$MANAGER_CONFIG_FILE")"
+  mode_temporary="$(mktemp /tmp/mipilot-reconcile-mode.XXXXXX.yaml)" || return 1
+  tun_temporary="$(mktemp /tmp/mipilot-reconcile-tun.XXXXXX.yaml)" || {
+    rm -f -- "$mode_temporary"
+    return 1
+  }
+  if ! render_mode_config "$CONFIG_FILE" "$mode_temporary" "$mode" || \
+     ! render_tun_config "$mode_temporary" "$tun_temporary" "$tun_enabled"; then
+    rm -f -- "$mode_temporary" "$tun_temporary"
+    echo "无法把 MiPilot 持久配置合并到 Mihomo 配置."
+    return 1
+  fi
+  if sudo test -s "$REGION_STATE_FILE"; then
+    region_parent="$(sudo jq -r '.rule_selection.parent // empty' "$MANAGER_CONFIG_FILE")"
+    [[ -n $region_parent ]] || region_parent="$(managed_region_parent)"
+    region_temporary="$(mktemp /tmp/mipilot-reconcile-region.XXXXXX.yaml)" || {
+      rm -f -- "$mode_temporary" "$tun_temporary"
+      return 1
+    }
+    if ! apply_region_groups_to_config "$tun_temporary" "$region_temporary" "$REGION_STATE_FILE" "$region_parent"; then
+      rm -f -- "$mode_temporary" "$tun_temporary" "$region_temporary"
+      echo "无法把持久化地区分组合并到 Mihomo 配置."
+      return 1
+    fi
+    mv -f -- "$region_temporary" "$tun_temporary"
+  fi
+  current_hash="$(sudo sha256sum "$CONFIG_FILE" | awk '{print $1}')"
+  candidate_hash="$(sha256sum "$tun_temporary" | awk '{print $1}')"
+  if [[ $current_hash == "$candidate_hash" ]]; then
+    rm -f -- "$mode_temporary" "$tun_temporary"
+    return 0
+  fi
+  sudo "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$tun_temporary" || {
+    rm -f -- "$mode_temporary" "$tun_temporary"
+    echo "MiPilot 持久配置无法通过 Mihomo 验证, 现有运行配置未改变."
+    return 1
+  }
+  backup="$(create_config_backup reconcile)" || {
+    rm -f -- "$mode_temporary" "$tun_temporary"
+    return 1
+  }
+  atomic_install_file 600 "$tun_temporary" "$CONFIG_FILE" || {
+    rm -f -- "$mode_temporary" "$tun_temporary"
+    return 1
+  }
+  rm -f -- "$mode_temporary" "$tun_temporary"
+  if runtime_is_active; then
+    if ! restart_mihomo_with_progress || ! wait_mihomo_with_progress 2; then
+      rollback_config "$backup" || true
+      echo "应用 MiPilot 持久配置失败, 已尝试恢复原配置."
+      return 1
+    fi
+    refresh_api_config
+    restore_mipilot_selections || true
+  fi
+}
+
+update_mipilot_mode() {
+  local mode="$1"
+  local temporary
+
+  mipilot_config_is_valid || sync_mipilot_config_from_state || return 1
+  temporary="$(mktemp /tmp/mipilot-config-mode.XXXXXX.json)" || return 1
+  # shellcheck disable=SC2024
+  sudo jq --arg mode "$mode" '.mode = $mode' "$MANAGER_CONFIG_FILE" >"$temporary" || return 1
+  atomic_install_file 600 "$temporary" "$MANAGER_CONFIG_FILE"
+  local status=$?
+  rm -f -- "$temporary"
+  return "$status"
+}
+
+update_mipilot_runtime() {
+  local runtime_mode="$1"
+  local temporary
+
+  [[ $runtime_mode == manual || $runtime_mode == service ]] || return 1
+  mipilot_config_is_valid || sync_mipilot_config_from_state || return 1
+  temporary="$(mktemp /tmp/mipilot-config-runtime.XXXXXX.json)" || return 1
+  # shellcheck disable=SC2024
+  sudo jq --arg runtime "$runtime_mode" '.runtime.type = $runtime' "$MANAGER_CONFIG_FILE" >"$temporary" || return 1
+  atomic_install_file 600 "$temporary" "$MANAGER_CONFIG_FILE"
+  local status=$?
+  rm -f -- "$temporary"
+  return "$status"
+}
+
+update_mipilot_tun() {
+  local enabled="$1"
+  local temporary
+
+  [[ $enabled == true || $enabled == false ]] || return 1
+  if ! mipilot_config_is_valid; then
+    sync_mipilot_config_from_state
+    return $?
+  fi
+  temporary="$(mktemp /tmp/mipilot-config-tun.XXXXXX.json)" || return 1
+  # shellcheck disable=SC2024
+  if ! sudo jq --argjson enabled "$enabled" '.tun.enabled = $enabled' "$MANAGER_CONFIG_FILE" >"$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  atomic_install_file 600 "$temporary" "$MANAGER_CONFIG_FILE"
+  local status=$?
+  rm -f -- "$temporary"
+  return "$status"
+}
+
+update_mipilot_selection() {
+  local kind="$1"
+  local group="$2"
+  local value="$3"
+  local temporary
+
+  mipilot_config_is_valid || sync_mipilot_config_from_state || return 1
+  temporary="$(mktemp /tmp/mipilot-config-selection.XXXXXX.json)" || return 1
+  case "$kind" in
+    rule)
+      # shellcheck disable=SC2024
+      sudo jq --arg value "$value" '.rule_selection.group = $value' "$MANAGER_CONFIG_FILE" >"$temporary"
+      ;;
+    global)
+      # shellcheck disable=SC2024
+      sudo jq --arg value "$value" '.global_selection.node = $value' "$MANAGER_CONFIG_FILE" >"$temporary"
+      ;;
+    selector)
+      # shellcheck disable=SC2024
+      sudo jq --arg group "$group" --arg value "$value" '.selector_selections[$group] = $value' "$MANAGER_CONFIG_FILE" >"$temporary"
+      ;;
+    *) rm -f -- "$temporary"; return 1 ;;
+  esac || { rm -f -- "$temporary"; return 1; }
+  atomic_install_file 600 "$temporary" "$MANAGER_CONFIG_FILE"
+  local status=$?
+  rm -f -- "$temporary"
+  return "$status"
+}
+
+restore_optional_managed_file() {
+  local snapshot="$1"
+  local was_present="$2"
+  local destination="$3"
+
+  if (( was_present == 1 )); then
+    atomic_install_file 600 "$snapshot" "$destination"
+  else
+    sudo -n rm -f -- "$destination"
+  fi
 }
 
 migrate_legacy_backups() {
@@ -664,7 +1027,7 @@ render_tun_config() {
       if (tun_enabled == "true") {
         if (!stack_seen) print "  stack: mixed"
         if (!auto_route_seen) print "  auto-route: true"
-        if (!auto_redirect_seen) print "  auto-redirect: false"
+        if (!auto_redirect_seen) print "  auto-redirect: true"
         if (!auto_detect_seen) print "  auto-detect-interface: true"
         if (!dns_hijack_seen) {
           print "  dns-hijack:"
@@ -717,7 +1080,7 @@ render_tun_config() {
         if ($0 ~ /^[[:space:]]+auto-redirect:[[:space:]]*/) {
           auto_redirect_seen = 1
           if (tun_enabled == "true") {
-            print replace_boolean($0, "auto-redirect", "false")
+            print replace_boolean($0, "auto-redirect", "true")
             next
           }
         }
@@ -746,7 +1109,7 @@ render_tun_config() {
         print "  enable: " tun_enabled
         print "  stack: mixed"
         print "  auto-route: true"
-        print "  auto-redirect: false"
+        print "  auto-redirect: true"
         print "  auto-detect-interface: true"
         print "  dns-hijack:"
         print "    - any:53"
@@ -759,78 +1122,88 @@ render_tun_config() {
 save_tun_state() {
   local enabled="$1"
   local temporary
+  local previous_state
+  local had_state=0
 
   temporary="$(mktemp /tmp/mihomo-tun-state.XXXXXX)" || return 1
+  previous_state="$(mktemp /tmp/mihomo-tun-state-previous.XXXXXX)" || {
+    rm -f -- "$temporary"
+    return 1
+  }
+  if sudo test -f "$TUN_STATE_FILE"; then
+    had_state=1
+    sudo install -m 600 "$TUN_STATE_FILE" "$previous_state" || {
+      rm -f -- "$temporary"
+      sudo rm -f -- "$previous_state"
+      return 1
+    }
+  fi
   printf '%s\n' "$enabled" >"$temporary"
   atomic_install_file 600 "$temporary" "$TUN_STATE_FILE"
   local status=$?
   rm -f -- "$temporary"
+  if (( status == 0 )); then
+    if ! update_mipilot_tun "$enabled"; then
+      restore_optional_managed_file "$previous_state" "$had_state" "$TUN_STATE_FILE" || true
+      sudo rm -f -- "$previous_state"
+      return 1
+    fi
+  fi
+  sudo rm -f -- "$previous_state"
   return "$status"
 }
 
-detect_public_service_ports() {
-  {
-    if command -v ss >/dev/null 2>&1; then
-      ss -H -ltn 2>/dev/null | awk '
-        {
-          address = $4
-          if (address ~ /^0[.]0[.]0[.]0:/ || address ~ /^\*:/ || address ~ /^\[::\]:/) {
-            sub(/^.*:/, "", address)
-            if (address ~ /^[0-9]+$/) print "tcp:" address
-          }
-        }
-      '
-      ss -H -lun 2>/dev/null | awk '
-        {
-          address = $4
-          if (address ~ /^0[.]0[.]0[.]0:/ || address ~ /^\*:/ || address ~ /^\[::\]:/) {
-            sub(/^.*:/, "", address)
-            if (address ~ /^[0-9]+$/) print "udp:" address
-          }
-        }
-      '
-    fi
+tun_bypass_rule_lines() {
+  local family="$1"
 
-    if command -v docker >/dev/null 2>&1 && timeout 4 sudo -n docker ps >/dev/null 2>&1; then
-      timeout 4 sudo -n docker ps --format '{{.Ports}}' 2>/dev/null \
-        | grep -oE '[0-9]+->[0-9]+/(tcp|udp)' \
-        | sed -E 's/^([0-9]+)->[0-9]+\/(tcp|udp)$/\2:\1/' \
-        || true
-    fi
-  } | awk -F: '
-    ($1 == "tcp" || $1 == "udp") && $2 ~ /^[0-9]+$/ && $2 >= 1 && $2 <= 65535 {
-      print $1 ":" $2
+  if [[ $family == ipv6 ]]; then
+    ip -6 rule show 2>/dev/null
+  else
+    ip rule show 2>/dev/null
+  fi
+}
+
+list_actual_tun_bypass_ports() {
+  local family="$1"
+
+  tun_bypass_rule_lines "$family" | awk -v priority="${TUN_BYPASS_RULE_PRIORITY}:" '
+    $1 == priority {
+      protocol = ""
+      port = ""
+      table = ""
+      for (field_index = 1; field_index <= NF; field_index++) {
+        if ($field_index == "ipproto") protocol = $(field_index + 1)
+        if ($field_index == "sport") port = $(field_index + 1)
+        if ($field_index == "lookup") table = $(field_index + 1)
+      }
+      if ((protocol == "tcp" || protocol == "udp") && port ~ /^[0-9]+$/ && table == "main") {
+        print protocol ":" port
+      }
     }
   ' | sort -u
 }
 
 tun_bypass_rule_exists() {
-  local protocol="$1"
-  local port="$2"
+  local family="$1"
+  local protocol="$2"
+  local port="$3"
 
-  ip rule show 2>/dev/null \
-    | grep -Fq "${TUN_BYPASS_RULE_PRIORITY}:" \
-    && ip rule show 2>/dev/null \
-      | grep -F "${TUN_BYPASS_RULE_PRIORITY}:" \
-      | grep -Fq "ipproto ${protocol} sport ${port} lookup main"
-}
-
-add_tun_bypass_rule() {
-  local protocol="$1"
-  local port="$2"
-
-  tun_bypass_rule_exists "$protocol" "$port" && return 0
-  sudo -n ip rule add pref "$TUN_BYPASS_RULE_PRIORITY" \
-    ipproto "$protocol" sport "$port" lookup main
+  list_actual_tun_bypass_ports "$family" | grep -Fxq "${protocol}:${port}"
 }
 
 delete_tun_bypass_rule() {
-  local protocol="$1"
-  local port="$2"
+  local family="$1"
+  local protocol="$2"
+  local port="$3"
 
-  while tun_bypass_rule_exists "$protocol" "$port"; do
-    sudo -n ip rule del pref "$TUN_BYPASS_RULE_PRIORITY" \
-      ipproto "$protocol" sport "$port" lookup main || return 1
+  while tun_bypass_rule_exists "$family" "$protocol" "$port"; do
+    if [[ $family == ipv6 ]]; then
+      sudo -n ip -6 rule del pref "$TUN_BYPASS_RULE_PRIORITY" \
+        ipproto "$protocol" sport "$port" lookup main || return 1
+    else
+      sudo -n ip rule del pref "$TUN_BYPASS_RULE_PRIORITY" \
+        ipproto "$protocol" sport "$port" lookup main || return 1
+    fi
   done
 }
 
@@ -843,66 +1216,75 @@ list_tun_bypass_ports() {
   ' "$TUN_BYPASS_STATE_FILE" | sort -u
 }
 
-refresh_tun_bypass_ports() {
-  local temporary
-  local protocol
-  local port
-
-  temporary="$(mktemp /tmp/mipilot-tun-bypass.XXXXXX)" || return 1
-  detect_public_service_ports >"$temporary" || {
-    rm -f -- "$temporary"
-    return 1
-  }
-
-  while IFS=: read -r protocol port; do
-    [[ -n $protocol && -n $port ]] || continue
-    if ! grep -Fxq "${protocol}:${port}" "$temporary"; then
-      delete_tun_bypass_rule "$protocol" "$port" || true
-    fi
-  done < <(list_tun_bypass_ports)
-
-  atomic_install_file 600 "$temporary" "$TUN_BYPASS_STATE_FILE"
-  local status=$?
-  rm -f -- "$temporary"
-  return "$status"
-}
-
-sync_tun_bypass_rules() {
-  local enabled
-  local protocol
-  local port
-  local failed=0
-
-  enabled="$(tun_config_value)"
-  while IFS=: read -r protocol port; do
-    [[ -n $protocol && -n $port ]] || continue
-    if [[ $enabled == true ]]; then
-      add_tun_bypass_rule "$protocol" "$port" || failed=1
-    else
-      delete_tun_bypass_rule "$protocol" "$port" || failed=1
-    fi
-  done < <(list_tun_bypass_ports)
-  return "$failed"
-}
-
 remove_all_tun_bypass_rules() {
+  local family
   local protocol
   local port
   local failed=0
 
-  while IFS=: read -r protocol port; do
-    [[ -n $protocol && -n $port ]] || continue
-    delete_tun_bypass_rule "$protocol" "$port" || failed=1
-  done < <(list_tun_bypass_ports)
+  for family in ipv4 ipv6; do
+    tun_bypass_rule_lines "$family" >/dev/null || continue
+    while IFS=: read -r protocol port; do
+      [[ -n $protocol && -n $port ]] || continue
+      delete_tun_bypass_rule "$family" "$protocol" "$port" || failed=1
+    done < <(list_tun_bypass_ports)
+  done
   return "$failed"
 }
 
-show_tun_bypass_ports() {
-  local ports
+cleanup_legacy_tun_bypass() {
+  local failed=0
+  local has_service=0
+  local has_state=0
 
-  ports="$(list_tun_bypass_ports | paste -sd ',' - | sed 's/,/, /g')"
-  if [[ -n $ports ]]; then
-    echo "已保护公网服务返回端口: ${ports}"
+  sudo -n test -f "$TUN_BYPASS_SERVICE_FILE" && has_service=1
+  sudo -n test -f "$TUN_BYPASS_STATE_FILE" && has_state=1
+  (( has_service == 1 || has_state == 1 )) || return 0
+
+  if (( has_state == 1 )); then
+    remove_all_tun_bypass_rules || failed=1
+  fi
+  if (( has_service == 1 )); then
+    sudo -n systemctl disable --now "$(basename -- "$TUN_BYPASS_SERVICE_FILE")" >/dev/null 2>&1 || true
+  fi
+  sudo -n rm -f -- "$TUN_BYPASS_SERVICE_FILE" "$TUN_BYPASS_STATE_FILE" || failed=1
+  if (( has_service == 1 )); then
+    sudo -n systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  return "$failed"
+}
+
+verify_tun_runtime_network() {
+  local config_response
+  local ssh_client=""
+  local default_route_count
+
+  refresh_api_config
+  [[ -n $API ]] || return 1
+  config_response="$(api_quick "${API}/configs")" || return 1
+  jq -e '.tun.enable == true' <<<"$config_response" >/dev/null || return 1
+  ip route get 1.1.1.1 >/dev/null 2>&1 || return 1
+
+  default_route_count="$(ip -4 route show default 2>/dev/null | awk 'NF { count++ } END { print count + 0 }')"
+  if (( default_route_count > 1 )); then
+    echo "提示: 检测到 ${default_route_count} 条 IPv4 默认路由, 当前由 Mihomo 自动识别出口."
+    echo "多公网出口环境仍需确认实际流量和回程接口符合预期."
+  fi
+
+  if [[ -n ${SSH_CONNECTION:-} ]]; then
+    ssh_client="${SSH_CONNECTION%% *}"
+    if [[ -n $ssh_client ]] && ! ip route get "$ssh_client" >/dev/null 2>&1; then
+      echo "无法解析当前 SSH 客户端 ${ssh_client} 的回程路由."
+      return 1
+    fi
+  fi
+
+  if curl -4 -fsS --noproxy '*' --connect-timeout 5 --max-time 10 \
+       -o /dev/null https://cp.cloudflare.com/generate_204; then
+    echo "TUN 出站联网检查通过."
+  else
+    echo "警告: TUN 和系统路由已建立, 但公网连通性探测失败."
+    echo "这可能由节点、DNS、防火墙或探测地址不可达造成, 请立即验证实际访问和 SSH 回程."
   fi
 }
 
@@ -912,6 +1294,8 @@ apply_tun_setting() {
   local temporary
   local backup
   local status
+  local previous_state
+  local had_state=0
 
   ensure_sudo_access || return 1
   temporary="$(mktemp /tmp/mihomo-tun-config.XXXXXX.yaml)" || return
@@ -943,49 +1327,75 @@ apply_tun_setting() {
     rm -f -- "$temporary"
     return 1
   }
+  previous_state="$(mktemp /tmp/mihomo-tun-state-previous.XXXXXX)" || {
+    rm -f -- "$temporary"
+    return 1
+  }
+  if sudo test -f "$TUN_STATE_FILE"; then
+    had_state=1
+    sudo install -m 600 "$TUN_STATE_FILE" "$previous_state" || {
+      rm -f -- "$temporary"
+      sudo rm -f -- "$previous_state"
+      return 1
+    }
+  fi
+  if ! save_tun_state "$enabled"; then
+    rm -f -- "$temporary"
+    sudo rm -f -- "$previous_state"
+    echo "无法保存 TUN 状态, 现有配置未改变."
+    return 1
+  fi
   atomic_install_file 600 "$temporary" "$CONFIG_FILE" || {
+    restore_optional_managed_file "$previous_state" "$had_state" "$TUN_STATE_FILE" || true
+    sync_mipilot_config_from_state || true
+    sudo rm -f -- "$previous_state"
     rm -f -- "$temporary"
     return 1
   }
   rm -f -- "$temporary"
 
-  echo "[4/5] 重启 Mihomo 服务"
-  if ! run_blocking "正在重启 Mihomo 服务" 35 sudo -n systemctl restart mihomo; then
+  echo "[4/5] 重启 Mihomo"
+  if ! restart_mihomo_with_progress; then
     if rollback_config "$backup"; then
+      restore_optional_managed_file "$previous_state" "$had_state" "$TUN_STATE_FILE" || true
+      sync_mipilot_config_from_state || true
       echo "Mihomo 启动失败, TUN 状态已回滚."
     else
       echo "Mihomo 启动失败且自动回滚未完成, 请立即检查 ${backup}."
     fi
+    sudo rm -f -- "$previous_state"
     return 1
   fi
 
   echo "[5/5] 等待 Mihomo 服务稳定"
   if ! run_blocking "正在等待 Mihomo 服务稳定" 15 wait_for_mihomo_stable 2; then
     if rollback_config "$backup"; then
+      restore_optional_managed_file "$previous_state" "$had_state" "$TUN_STATE_FILE" || true
+      sync_mipilot_config_from_state || true
       echo "Mihomo 未能稳定运行, TUN 状态已回滚."
     else
       echo "Mihomo 未稳定运行且自动回滚未完成, 请立即检查 ${backup}."
     fi
+    sudo rm -f -- "$previous_state"
     return 1
   fi
-
-  if ! save_tun_state "$enabled"; then
-    echo "TUN 已${label}, 但持久化状态保存失败; 下次更新订阅后可能丢失该状态."
-    return 1
-  fi
-
-  if [[ $enabled == true ]]; then
-    if ! run_blocking "正在扫描并保存公网服务端口" 15 refresh_tun_bypass_ports; then
-      echo "警告: 无法扫描公网服务端口, 请检查 iproute2 和 Docker 权限."
+  if [[ $enabled == true ]] && ! verify_tun_runtime_network; then
+    if rollback_config "$backup"; then
+      restore_optional_managed_file "$previous_state" "$had_state" "$TUN_STATE_FILE" || true
+      sync_mipilot_config_from_state || true
+      echo "TUN 路由或当前 SSH 回程检查失败, 已自动回滚."
+    else
+      echo "TUN 网络检查失败且自动回滚未完成, 请立即检查 ${backup}."
     fi
+    sudo rm -f -- "$previous_state"
+    return 1
   fi
-  if ! run_blocking "正在同步公网服务返回路由" 15 sync_tun_bypass_rules; then
-    echo "警告: 公网服务返回流量保护规则同步失败."
-  fi
+  sudo rm -f -- "$previous_state"
+
+  cleanup_legacy_tun_bypass || echo "警告: 旧版TUN端口旁路规则未完全清理."
 
   refresh_api_config
   echo "TUN 模式已${label}."
-  [[ $enabled == true ]] && show_tun_bypass_ports
   echo "备份文件: ${backup}"
 }
 
@@ -1050,7 +1460,8 @@ disable_tun_mode() {
 }
 
 terminal_proxy_is_enabled() {
-  [[ ${MIHOMO_PROXY_ENABLED:-0} == 1 || -n ${http_proxy:-} || -n ${https_proxy:-} || -n ${all_proxy:-} || -n ${HTTP_PROXY:-} || -n ${HTTPS_PROXY:-} || -n ${ALL_PROXY:-} ]]
+  [[ ${MIHOMO_PROXY_ENABLED:-0} == 1 ||
+     ( ${http_proxy:-} == "$PROXY_URL" && ${https_proxy:-} == "$PROXY_URL" ) ]]
 }
 
 terminal_proxy_action_label() {
@@ -1212,6 +1623,162 @@ mode_status_label() {
   esac
 }
 
+reconcile_tun_runtime_state() {
+  local enabled
+
+  enabled="$(tun_config_value)"
+  [[ $enabled == true || $enabled == false ]] || {
+    echo "无法识别恢复配置中的 TUN 状态."
+    return 1
+  }
+  save_tun_state "$enabled" || return 1
+  cleanup_legacy_tun_bypass
+}
+
+render_mode_config() {
+  local input_file="$1"
+  local output_file="$2"
+  local mode="$3"
+
+  [[ $mode == rule || $mode == global || $mode == direct ]] || return 1
+
+  # The input needs sudo; the caller-owned output path intentionally does not.
+  # shellcheck disable=SC2024
+  sudo awk -v selected_mode="$mode" '
+    /^mode:[[:space:]]*/ {
+      if (!mode_seen) {
+        print "mode: " selected_mode
+        mode_seen = 1
+      }
+      next
+    }
+    { print }
+    END {
+      if (!mode_seen) {
+        print ""
+        print "mode: " selected_mode
+      }
+    }
+  ' "$input_file" >"$output_file"
+}
+
+profile_store_selected_value() {
+  sudo awk '
+    /^profile:[[:space:]]*(#.*)?$/ {
+      in_profile = 1
+      next
+    }
+    in_profile && /^[^[:space:]#][^:]*:/ {
+      exit
+    }
+    in_profile && /^[[:space:]]+store-selected:[[:space:]]*/ {
+      value = $0
+      sub(/^[[:space:]]+store-selected:[[:space:]]*/, "", value)
+      sub(/[[:space:]]*#.*/, "", value)
+      gsub(/[[:space:]]/, "", value)
+      print tolower(value)
+      found = 1
+      exit
+    }
+    END {
+      if (!found) print "false"
+    }
+  ' "$CONFIG_FILE"
+}
+
+render_store_selected_config() {
+  local input_file="$1"
+  local output_file="$2"
+
+  # The input needs sudo; the caller-owned output path intentionally does not.
+  # shellcheck disable=SC2024
+  sudo awk '
+    function finish_profile() {
+      if (!store_selected_seen) print "  store-selected: true"
+    }
+
+    {
+      if (in_profile && $0 ~ /^[^[:space:]#][^:]*:/) {
+        finish_profile()
+        in_profile = 0
+      }
+
+      if ($0 ~ /^profile:[[:space:]]*(#.*)?$/) {
+        profile_found = 1
+        in_profile = 1
+        store_selected_seen = 0
+        print
+        next
+      }
+
+      if ($0 ~ /^profile:[[:space:]]*[^[:space:]#]/) {
+        print "不支持行内写法的 profile 配置, 请先改为多行 YAML." > "/dev/stderr"
+        fatal = 1
+        exit 42
+      }
+
+      if (in_profile && $0 ~ /^[[:space:]]+store-selected:[[:space:]]*/) {
+        print "  store-selected: true"
+        store_selected_seen = 1
+        next
+      }
+
+      print
+    }
+
+    END {
+      if (fatal) exit 42
+      if (in_profile) finish_profile()
+      if (!profile_found) {
+        print ""
+        print "profile:"
+        print "  store-selected: true"
+      }
+    }
+  ' "$input_file" >"$output_file"
+}
+
+ensure_store_selected() {
+  local temporary
+  local backup
+  local status
+
+  if [[ $(profile_store_selected_value) == true ]]; then
+    return 0
+  fi
+
+  temporary="$(mktemp /tmp/mihomo-profile-config.XXXXXX.yaml)" || return 1
+  if ! render_store_selected_config "$CONFIG_FILE" "$temporary"; then
+    rm -f -- "$temporary"
+    echo "无法生成节点选择持久化配置."
+    return 1
+  fi
+  run_cancellable_named "正在验证节点选择持久化配置" 45 \
+    sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$temporary"
+  status=$?
+  if (( status != 0 )); then
+    rm -f -- "$temporary"
+    (( status == 130 )) && return 130
+    echo "节点选择持久化配置验证失败."
+    return 1
+  fi
+  backup="$(create_config_backup store-selected)" || {
+    rm -f -- "$temporary"
+    return 1
+  }
+  atomic_install_file 600 "$temporary" "$CONFIG_FILE" || {
+    rm -f -- "$temporary"
+    return 1
+  }
+  rm -f -- "$temporary"
+  if ! restart_mihomo_with_progress || ! wait_mihomo_with_progress 3; then
+    rollback_config "$backup" || true
+    echo "启用节点选择持久化失败, 已尝试恢复原配置."
+    return 1
+  fi
+  refresh_api_config
+}
+
 refresh_menu_runtime_summary() {
   local response
   local mode
@@ -1221,8 +1788,8 @@ refresh_menu_runtime_summary() {
   MENU_NODE_STATUS=""
   MENU_RUNTIME_MODE=""
 
-  if ! systemctl is-active --quiet mihomo; then
-    MENU_MODE_STATUS="服务未运行"
+  if ! runtime_is_active; then
+    MENU_MODE_STATUS="Mihomo 未运行"
     return
   fi
   if [[ -z $API ]]; then
@@ -1283,7 +1850,7 @@ require_api() {
   if (( status == 130 )); then return 130; fi
   if (( status != 0 )); then
     echo "无法连接 Mihomo API: ${API}"
-    echo "请检查服务状态、external-controller 和 secret."
+    echo "请检查 Mihomo 运行状态、external-controller 和 secret."
     return 1
   fi
 }
@@ -1294,6 +1861,7 @@ resolve_main_proxy_response() {
   local current
   local next
   local depth
+  local rule_parent="${REGION_PARENT:-$(managed_region_parent 2>/dev/null)}"
   local -A seen=()
 
   ACTIVE_NODE=""
@@ -1307,6 +1875,8 @@ resolve_main_proxy_response() {
 
   if [[ $running_mode == global ]] && jq -e '.proxies.GLOBAL != null' <<<"$response" >/dev/null; then
     current="GLOBAL"
+  elif [[ -n $rule_parent ]] && jq -e --arg parent "$rule_parent" '.proxies[$parent] != null' <<<"$response" >/dev/null; then
+    current="$rule_parent"
   elif jq -e '.proxies["🚀节点选择"] != null' <<<"$response" >/dev/null; then
     current="🚀节点选择"
   elif jq -e '.proxies.GLOBAL != null' <<<"$response" >/dev/null; then
@@ -1405,8 +1975,12 @@ show_overview() {
   echo "Mihomo 版本:"
   sudo "$MIHOMO_BIN" -v | sed -n '1p'
   echo
-  echo "服务状态: $(systemctl is-active mihomo 2>/dev/null || true)"
-  echo "开机启动: $(systemctl is-enabled mihomo 2>/dev/null || true)"
+  echo "运行状态: $(runtime_status_label)"
+  if [[ $(installed_runtime_mode) == service ]]; then
+    echo "开机启动: $(systemctl is-enabled mihomo 2>/dev/null || true)"
+  else
+    echo "开机启动: 不适用(手动模式)"
+  fi
   echo "TUN 模式: $(tun_status_label)"
   echo "订阅链接: $(subscription_status_label)"
   echo
@@ -1503,6 +2077,116 @@ config_has_group() {
   ' "$config_file"
 }
 
+list_config_group_names() {
+  local config_file="$1"
+
+  sudo awk '
+    function parse_group_name(text, value, quote) {
+      value = text
+      sub(/^[[:space:]]*-[[:space:]]*[{]?[[:space:]]*name[[:space:]]*:[[:space:]]*/, "", value)
+      quote = substr(value, 1, 1)
+      if (quote == "\"") {
+        sub(/^"/, "", value)
+        sub(/".*/, "", value)
+      } else if (quote == "\047") {
+        sub(/^\047/, "", value)
+        sub(/\047.*/, "", value)
+      } else {
+        sub(/[[:space:]]*[,}#].*$/, "", value)
+        sub(/[[:space:]]+$/, "", value)
+      }
+      return value
+    }
+
+    /^proxy-groups:[[:space:]]*$/ { in_groups = 1; next }
+    in_groups && /^[^[:space:]#][^:]*:/ { exit }
+    in_groups && /^[[:space:]]*-[[:space:]]*([{][[:space:]]*)?name[[:space:]]*:/ {
+      name = parse_group_name($0)
+      if (name != "") print name
+    }
+  ' "$config_file"
+}
+
+list_config_selector_names() {
+  local config_file="$1"
+
+  sudo awk '
+    function parse_group_name(text, value, quote) {
+      value = text
+      sub(/^[[:space:]]*-[[:space:]]*[{]?[[:space:]]*name[[:space:]]*:[[:space:]]*/, "", value)
+      quote = substr(value, 1, 1)
+      if (quote == "\"") {
+        sub(/^"/, "", value)
+        sub(/".*/, "", value)
+      } else if (quote == "\047") {
+        sub(/^\047/, "", value)
+        sub(/\047.*/, "", value)
+      } else {
+        sub(/[[:space:]]*[,}#].*$/, "", value)
+        sub(/[[:space:]]+$/, "", value)
+      }
+      return value
+    }
+
+    function finish_group() {
+      if (group_name != "" && group_type == "select") print group_name
+      group_name = ""
+      group_type = ""
+    }
+
+    /^proxy-groups:[[:space:]]*$/ { in_groups = 1; next }
+    in_groups && /^[^[:space:]#][^:]*:/ { finish_group(); exit }
+    in_groups && /^[[:space:]]*-[[:space:]]*([{][[:space:]]*)?name[[:space:]]*:/ {
+      finish_group()
+      group_name = parse_group_name($0)
+      if ($0 ~ /type[[:space:]]*:[[:space:]]*select([[:space:],}]|$)/) group_type = "select"
+      next
+    }
+    in_groups && group_name != "" && /^[[:space:]]+type[[:space:]]*:[[:space:]]*/ {
+      value = $0
+      sub(/^[[:space:]]+type[[:space:]]*:[[:space:]]*/, "", value)
+      sub(/[[:space:]#].*$/, "", value)
+      group_type = tolower(value)
+    }
+    END { if (in_groups) finish_group() }
+  ' "$config_file"
+}
+
+list_config_rule_policy_names() {
+  local config_file="$1"
+
+  sudo awk '
+    function trim(value) {
+      sub(/^[[:space:]"\047]+/, "", value)
+      sub(/[[:space:]"\047]+$/, "", value)
+      return value
+    }
+
+    /^rules:[[:space:]]*(#.*)?$/ { in_rules = 1; next }
+    in_rules && /^[^[:space:]#][^:]*:/ { exit }
+    in_rules && /^[[:space:]]*-[[:space:]]*/ {
+      line = $0
+      sub(/^[[:space:]]*-[[:space:]]*/, "", line)
+      sub(/[[:space:]]+#.*$/, "", line)
+      line = trim(line)
+      count = split(line, fields, ",")
+      if (count < 2) next
+      policy_index = count
+      if (tolower(trim(fields[count])) == "no-resolve") policy_index--
+      policy = trim(fields[policy_index])
+      if (policy != "" && policy != "DIRECT" && policy != "REJECT" && policy != "PASS") print policy
+    }
+  ' "$config_file"
+}
+
+list_rule_selector_names() {
+  local config_file="$1"
+
+  comm -12 \
+    <(list_config_selector_names "$config_file" | sort -u) \
+    <(list_config_rule_policy_names "$config_file" | sort -u)
+}
+
 parent_group_has_child() {
   local config_file="$1"
   local parent_name="$2"
@@ -1526,14 +2210,47 @@ parent_group_has_child() {
       return value
     }
 
+    function trim(value) {
+      sub(/^[[:space:]"\047]+/, "", value)
+      sub(/[[:space:]"\047]+$/, "", value)
+      return value
+    }
+
+    function inline_has_child(line, body, count, fields, field_index) {
+      body = line
+      sub(/^.*proxies[[:space:]]*:[[:space:]]*\[/, "", body)
+      sub(/\].*$/, "", body)
+      count = split(body, fields, ",")
+      for (field_index = 1; field_index <= count; field_index++) {
+        if (trim(fields[field_index]) == child) return 1
+      }
+      return 0
+    }
+
     /^proxy-groups:[[:space:]]*$/ { in_groups = 1; next }
     in_groups && /^[^[:space:]#][^:]*:/ { exit }
     in_groups && /^[[:space:]]*-[[:space:]]*([{][[:space:]]*)?name[[:space:]]*:/ {
       in_parent = parse_group_name($0) == parent
+      in_proxies = 0
+      if (in_parent && $0 ~ /proxies[[:space:]]*:[[:space:]]*\[/ && inline_has_child($0)) found = 1
     }
-    in_parent && index($0, child) {
-      found = 1
-      exit
+    in_parent && /^[[:space:]]+proxies[[:space:]]*:/ {
+      in_proxies = 1
+      match($0, /^[[:space:]]*/)
+      proxies_indent = RLENGTH
+      if ($0 ~ /\[/ && inline_has_child($0)) found = 1
+      next
+    }
+    in_parent && in_proxies {
+      match($0, /^[[:space:]]*/)
+      if ($0 !~ /^[[:space:]]*($|#)/ && RLENGTH <= proxies_indent) {
+        in_proxies = 0
+      } else if ($0 ~ /^[[:space:]]*-[[:space:]]*/) {
+        value = $0
+        sub(/^[[:space:]]*-[[:space:]]*/, "", value)
+        sub(/[[:space:]]+#.*$/, "", value)
+        if (trim(value) == child) found = 1
+      }
     }
     END { exit(found ? 0 : 1) }
   ' "$config_file"
@@ -1544,43 +2261,91 @@ prepare_region_overlay() {
   local state_file="$2"
   local refs_file="$3"
   local definitions_file="$4"
+  local parent="${5:-$(managed_region_parent)}"
   local code
   local name
   local pattern
+  local group_mode
   local exclude_pattern
+  local parent_missing=0
+  local gateway_refs
 
   : >"$refs_file"
   : >"$definitions_file"
   exclude_pattern="$(region_exclude_pattern)"
 
-  if ! config_has_group "$config_file" "🚀节点选择"; then
-    echo "配置中找不到 🚀节点选择, 无法挂载自动地区组."
-    return 1
+  if ! config_has_group "$config_file" "$parent"; then
+    if [[ $parent == "$REGION_MANAGED_PARENT" ]]; then
+      parent_missing=1
+    else
+      echo "配置中找不到已保存的主策略组 ${parent}, 无法挂载地区组."
+      return 1
+    fi
   fi
 
-  while IFS=';' read -r code name pattern; do
+  while IFS=';' read -r code name pattern group_mode; do
     [[ -z $code || -z $name || -z $pattern ]] && continue
+    group_mode="${group_mode:-url-test}"
+    case "$group_mode" in
+      url-test|fallback|load-balance|select) ;;
+      *) group_mode="url-test" ;;
+    esac
 
     if ! config_has_group "$config_file" "$name"; then
       {
         printf '%s\n' "- name: \"${name}\""
-        printf '%s\n' '  type: url-test'
+        printf '%s\n' "  type: ${group_mode}"
         printf '%s\n' '  include-all-proxies: true'
         printf '%s\n' "  filter: \"(?i)(${pattern})\""
         printf '%s\n' "  exclude-filter: \"(?i)(${exclude_pattern})\""
-        printf '%s\n' '  url: https://cp.cloudflare.com'
-        printf '%s\n' '  interval: 300'
-        printf '%s\n' '  tolerance: 50'
-        printf '%s\n' '  lazy: true'
+        case "$group_mode" in
+          url-test)
+            printf '%s\n' '  url: https://cp.cloudflare.com'
+            printf '%s\n' '  interval: 300'
+            printf '%s\n' '  tolerance: 50'
+            printf '%s\n' '  lazy: true'
+            printf '%s\n' '  expected-status: 200/204'
+            ;;
+          fallback)
+            printf '%s\n' '  url: https://cp.cloudflare.com'
+            printf '%s\n' '  interval: 300'
+            printf '%s\n' '  lazy: true'
+            printf '%s\n' '  expected-status: 200/204'
+            ;;
+          load-balance)
+            printf '%s\n' '  strategy: consistent-hashing'
+            printf '%s\n' '  url: https://cp.cloudflare.com'
+            printf '%s\n' '  interval: 300'
+            printf '%s\n' '  lazy: true'
+            printf '%s\n' '  expected-status: 200/204'
+            ;;
+        esac
         printf '%s\n' '  empty-fallback: REJECT'
-        printf '%s\n' '  expected-status: 200/204'
       } >>"$definitions_file"
     fi
 
-    if ! parent_group_has_child "$config_file" "🚀节点选择" "$name"; then
+    if ! parent_group_has_child "$config_file" "$parent" "$name"; then
       printf '%s\n' "$name" >>"$refs_file"
     fi
   done < <(sudo cat "$state_file")
+
+  if (( parent_missing == 1 )); then
+    gateway_refs="$(mktemp /tmp/mihomo-region-gateway-refs.XXXXXX)" || return 1
+    {
+      list_config_group_names "$config_file"
+      cat "$refs_file"
+    } | awk -v outlet="$REGION_MANAGED_PARENT" '$0 != outlet && !seen[$0]++' >"$gateway_refs"
+    {
+      printf '%s\n' "- name: \"${REGION_MANAGED_PARENT}\""
+      printf '%s\n' '  type: select'
+      printf '%s\n' '  proxies:'
+      while IFS= read -r name; do
+        [[ -n $name ]] && printf '%s\n' "    - \"${name}\""
+      done <"$gateway_refs"
+    } >>"$definitions_file"
+    rm -f -- "$gateway_refs"
+    : >"$refs_file"
+  fi
 }
 
 refresh_saved_region_definitions() {
@@ -1614,11 +2379,24 @@ refresh_saved_region_definitions() {
 
       function finish_managed_group() {
         if (!managed) return
+        if (!type_written) print field_indent "type: " modes[current_group]
         if (!filter_written) {
           print field_indent "filter: \"(?i)(" patterns[current_group] ")\""
         }
         if (!exclude_written) {
           print field_indent "exclude-filter: \"(?i)(" exclude_pattern ")\""
+        }
+        if (modes[current_group] != "select") {
+          if (!url_written) print field_indent "url: https://cp.cloudflare.com"
+          if (!interval_written) print field_indent "interval: 300"
+          if (!lazy_written) print field_indent "lazy: true"
+          if (!expected_status_written) print field_indent "expected-status: 200/204"
+        }
+        if (modes[current_group] == "url-test" && !tolerance_written) {
+          print field_indent "tolerance: 50"
+        }
+        if (modes[current_group] == "load-balance" && !strategy_written) {
+          print field_indent "strategy: consistent-hashing"
         }
         managed = 0
       }
@@ -1628,6 +2406,11 @@ refresh_saved_region_definitions() {
           field_count = split(record, fields, ";")
           if (field_count >= 3 && fields[2] != "" && fields[3] != "") {
             patterns[fields[2]] = fields[3]
+            modes[fields[2]] = fields[4]
+            if (modes[fields[2]] != "url-test" && modes[fields[2]] != "fallback" &&
+                modes[fields[2]] != "load-balance" && modes[fields[2]] != "select") {
+              modes[fields[2]] = "url-test"
+            }
           }
         }
         close(state_file)
@@ -1651,12 +2434,25 @@ refresh_saved_region_definitions() {
           finish_managed_group()
           current_group = parse_group_name(line)
           managed = current_group in patterns
+          type_written = 0
           filter_written = 0
           exclude_written = 0
+          url_written = 0
+          interval_written = 0
+          tolerance_written = 0
+          lazy_written = 0
+          expected_status_written = 0
+          strategy_written = 0
           match(line, /^[[:space:]]*/)
           field_indent = substr(line, RSTART, RLENGTH) "  "
           if (managed && line ~ /[}][[:space:]]*$/) unsupported = 1
           print line
+          next
+        }
+
+        if (managed && line ~ /^[[:space:]]+type[[:space:]]*:/) {
+          print field_indent "type: " modes[current_group]
+          type_written = 1
           next
         }
 
@@ -1669,6 +2465,49 @@ refresh_saved_region_definitions() {
         if (managed && line ~ /^[[:space:]]+exclude-filter[[:space:]]*:/) {
           print field_indent "exclude-filter: \"(?i)(" exclude_pattern ")\""
           exclude_written = 1
+          next
+        }
+
+        if (managed && line ~ /^[[:space:]]+url[[:space:]]*:/) {
+          if (modes[current_group] != "select") {
+            print field_indent "url: https://cp.cloudflare.com"
+            url_written = 1
+          }
+          next
+        }
+        if (managed && line ~ /^[[:space:]]+interval[[:space:]]*:/) {
+          if (modes[current_group] != "select") {
+            print field_indent "interval: 300"
+            interval_written = 1
+          }
+          next
+        }
+        if (managed && line ~ /^[[:space:]]+tolerance[[:space:]]*:/) {
+          if (modes[current_group] == "url-test") {
+            print field_indent "tolerance: 50"
+            tolerance_written = 1
+          }
+          next
+        }
+        if (managed && line ~ /^[[:space:]]+lazy[[:space:]]*:/) {
+          if (modes[current_group] != "select") {
+            print field_indent "lazy: true"
+            lazy_written = 1
+          }
+          next
+        }
+        if (managed && line ~ /^[[:space:]]+expected-status[[:space:]]*:/) {
+          if (modes[current_group] != "select") {
+            print field_indent "expected-status: 200/204"
+            expected_status_written = 1
+          }
+          next
+        }
+        if (managed && line ~ /^[[:space:]]+strategy[[:space:]]*:/) {
+          if (modes[current_group] == "load-balance") {
+            print field_indent "strategy: consistent-hashing"
+            strategy_written = 1
+          }
           next
         }
 
@@ -1768,13 +2607,14 @@ render_region_overlay() {
   local output_file="$2"
   local refs_file="$3"
   local definitions_file="$4"
+  local parent="${5:-$(managed_region_parent)}"
 
   # The input needs sudo; the caller-owned output path intentionally does not.
   # shellcheck disable=SC2024
   sudo awk \
     -v refs_file="$refs_file" \
     -v definitions_file="$definitions_file" \
-    -v parent_name="🚀节点选择" '
+    -v parent_name="$parent" '
       function parse_group_name(text, value, quote) {
         value = text
         sub(/^[[:space:]]*-[[:space:]]*[{]?[[:space:]]*name[[:space:]]*:[[:space:]]*/, "", value)
@@ -1834,6 +2674,10 @@ render_region_overlay() {
       {
         line = $0
 
+        if (line ~ /^proxy-groups:[[:space:]]*[^[:space:]#]/) {
+          inline_groups = 1
+        }
+
         if (in_groups && line ~ /^[^[:space:]#][^:]*:/) {
           append_definitions()
           in_groups = 0
@@ -1880,24 +2724,91 @@ render_region_overlay() {
         if (fatal) exit 42
         if (in_groups) append_definitions()
         if (!groups_found) {
-          print "找不到块状 proxy-groups 配置, 未修改文件." > "/dev/stderr"
-          exit 42
+          if (inline_groups) {
+            print "不支持行内 proxy-groups 配置, 未修改文件." > "/dev/stderr"
+            exit 42
+          }
+          print ""
+          print "proxy-groups:"
+          group_indent = "  "
+          append_definitions()
+          groups_found = 1
         }
         if (!refs_inserted) {
-          print "找不到 🚀节点选择 的 proxies 列表, 未修改文件." > "/dev/stderr"
+          print "找不到主策略组 " parent_name " 的 proxies 列表, 未修改文件." > "/dev/stderr"
           exit 42
         }
       }
-    ' "$input_file" >"$output_file"
+  ' "$input_file" >"$output_file"
+}
+
+render_managed_rule_outlet() {
+  local input_file="$1"
+  local output_file="$2"
+
+  # The input needs sudo; the caller-owned output path intentionally does not.
+  # shellcheck disable=SC2024
+  sudo awk -v outlet="$REGION_MANAGED_PARENT" '
+    function append_match() {
+      if (!match_written) {
+        print "  - MATCH,\"" outlet "\""
+        match_written = 1
+      }
+    }
+
+    {
+      line = $0
+
+      if (in_rules && line ~ /^[^[:space:]#][^:]*:/) {
+        append_match()
+        in_rules = 0
+      }
+
+      if (line ~ /^rules:[[:space:]]*(#.*)?$/) {
+        rules_found = 1
+        in_rules = 1
+        print line
+        next
+      }
+
+      if (line ~ /^rules:[[:space:]]*[^[:space:]#]/) {
+        inline_rules = 1
+      }
+
+      if (in_rules && line ~ /^[[:space:]]*-[[:space:]]*["\047]?MATCH[[:space:]]*,/) {
+        match(line, /^[[:space:]]*/)
+        print substr(line, RSTART, RLENGTH) "- MATCH,\"" outlet "\""
+        match_written = 1
+        next
+      }
+
+      print line
+    }
+
+    END {
+      if (inline_rules) {
+        print "不支持行内 rules 配置, 未修改文件." > "/dev/stderr"
+        exit 42
+      }
+      if (in_rules) append_match()
+      if (!rules_found) {
+        print ""
+        print "rules:"
+        append_match()
+      }
+    }
+  ' "$input_file" >"$output_file"
 }
 
 apply_region_groups_to_config() {
   local input_file="$1"
   local output_file="$2"
   local state_file="$3"
+  local parent="${4:-${REGION_PARENT:-$(managed_region_parent)}}"
   local refs_file
   local definitions_file
   local refreshed_file
+  local overlay_file
   local status
 
   refs_file="$(mktemp /tmp/mihomo-region-refs.XXXXXX)" || return
@@ -1909,19 +2820,32 @@ apply_region_groups_to_config() {
     rm -f -- "$refs_file" "$definitions_file"
     return 1
   }
+  overlay_file="$(mktemp /tmp/mihomo-region-overlay.XXXXXX.yaml)" || {
+    rm -f -- "$refs_file" "$definitions_file" "$refreshed_file"
+    return 1
+  }
 
   refresh_saved_region_definitions "$input_file" "$refreshed_file" "$state_file"
   status=$?
   if (( status == 0 )); then
-    prepare_region_overlay "$refreshed_file" "$state_file" "$refs_file" "$definitions_file"
+    prepare_region_overlay "$refreshed_file" "$state_file" "$refs_file" "$definitions_file" "$parent"
     status=$?
   fi
   if (( status == 0 )); then
-    render_region_overlay "$refreshed_file" "$output_file" "$refs_file" "$definitions_file"
+    render_region_overlay "$refreshed_file" "$overlay_file" "$refs_file" "$definitions_file" "$parent"
     status=$?
   fi
+  if (( status == 0 )); then
+    if [[ $parent == "$REGION_MANAGED_PARENT" ]]; then
+      render_managed_rule_outlet "$overlay_file" "$output_file"
+      status=$?
+    else
+      mv -f -- "$overlay_file" "$output_file"
+      status=$?
+    fi
+  fi
 
-  rm -f -- "$refs_file" "$definitions_file" "$refreshed_file"
+  rm -f -- "$refs_file" "$definitions_file" "$refreshed_file" "$overlay_file"
   return "$status"
 }
 
@@ -1932,8 +2856,6 @@ auto_add_region_groups() {
   local existing_state
   local candidate_state
   local dedup_state
-  local temporary_config
-  local backup
   local code
   local name
   local pattern
@@ -1961,12 +2883,6 @@ auto_add_region_groups() {
     rm -f -- "$nodes_file" "$groups_file" "$existing_state" "$candidate_state"
     return 1
   }
-  temporary_config="$(mktemp /tmp/mihomo-region-config.XXXXXX.yaml)" || {
-    rm -f -- "$nodes_file" "$groups_file" "$existing_state" "$candidate_state" "$dedup_state"
-    return 1
-  }
-  backup=""
-
   jq -r '
     .proxies
     | to_entries[]
@@ -1986,12 +2902,17 @@ auto_add_region_groups() {
       )
     | .key
   ' <<<"$response" >"$nodes_file"
-  jq -r '.proxies | to_entries[] | select(.value.all != null) | .key' <<<"$response" >"$groups_file"
+  jq -r '
+    .proxies
+    | to_entries[]
+    | select(.value.all != null and (.value.all | length) > 0)
+    | .key
+  ' <<<"$response" >"$groups_file"
 
   if sudo test -s "$REGION_STATE_FILE"; then
     # shellcheck disable=SC2024
     sudo cat "$REGION_STATE_FILE" >"$existing_state" || {
-      rm -f -- "$nodes_file" "$groups_file" "$existing_state" "$candidate_state" "$dedup_state" "$temporary_config"
+      rm -f -- "$nodes_file" "$groups_file" "$existing_state" "$candidate_state" "$dedup_state"
       return 1
     }
   fi
@@ -1999,12 +2920,13 @@ auto_add_region_groups() {
   echo "正在扫描订阅中的实际节点..."
   echo
   echo "扫描结果:"
-  while IFS=';' read -r code name pattern; do
+  awk -F';' '$1 ~ /^custom-/ && NF >= 3' "$existing_state" >"$candidate_state"
+  while IFS=';' read -r code name pattern group_mode; do
     [[ -z $code || -z $name || -z $pattern ]] && continue
 
     old_line="$(awk -F';' -v target="$code" '$1 == target { print; exit }' "$existing_state")"
     if [[ -n $old_line ]]; then
-      printf '%s;%s;%s\n' "$code" "$name" "$pattern" >>"$candidate_state"
+      printf '%s\n' "$old_line" >>"$candidate_state"
       continue
     fi
 
@@ -2020,7 +2942,7 @@ auto_add_region_groups() {
     printf '  新增 %s: %s 个节点\n' "$name" "$count"
     needs_apply=1
     added_count=$((added_count + 1))
-    printf '%s;%s;%s\n' "$code" "$name" "$pattern" >>"$candidate_state"
+    printf '%s;%s;%s;url-test\n' "$code" "$name" "$pattern" >>"$candidate_state"
   done < <(region_specs)
 
   awk -F';' 'NF >= 3 && !seen[$1]++' "$candidate_state" >"$dedup_state"
@@ -2032,13 +2954,13 @@ auto_add_region_groups() {
 
   if (( needs_apply == 0 )); then
     echo "  地区组已完整, 筛选规则无需更新."
-    rm -f -- "$nodes_file" "$groups_file" "$existing_state" "$candidate_state" "$dedup_state" "$temporary_config"
+    rm -f -- "$nodes_file" "$groups_file" "$existing_state" "$candidate_state" "$dedup_state"
     return 0
   fi
 
   echo
   if (( added_count > 0 )); then
-    echo "新增地区组将使用 URLTest 自动测速, 并加入 🚀节点选择."
+    echo "新增地区组将使用 URLTest 自动测速, 并加入 ${REGION_PARENT:-$(managed_region_parent)}."
   fi
   if (( rules_need_refresh > 0 )); then
     echo "已有自动地区组将更新匹配规则并排除流量、到期等提示节点."
@@ -2046,118 +2968,697 @@ auto_add_region_groups() {
   read_line_or_back "确认生成并应用? (y/N, Esc返回): "
   status=$?
   if (( status == 130 )); then
-    rm -f -- "$nodes_file" "$groups_file" "$existing_state" "$candidate_state" "$dedup_state" "$temporary_config"
+    rm -f -- "$nodes_file" "$groups_file" "$existing_state" "$candidate_state" "$dedup_state"
     return 130
   fi
   if (( status != 0 )); then
-    rm -f -- "$nodes_file" "$groups_file" "$existing_state" "$candidate_state" "$dedup_state" "$temporary_config"
+    rm -f -- "$nodes_file" "$groups_file" "$existing_state" "$candidate_state" "$dedup_state"
     return 1
   fi
   case "${INPUT_LINE,,}" in
     y|yes) ;;
     *)
       echo "已取消, 配置未改变."
-      rm -f -- "$nodes_file" "$groups_file" "$existing_state" "$candidate_state" "$dedup_state" "$temporary_config"
+      rm -f -- "$nodes_file" "$groups_file" "$existing_state" "$candidate_state" "$dedup_state"
       return 130
       ;;
   esac
 
-  echo "正在生成地区策略组配置..."
-  if ! apply_region_groups_to_config "$CONFIG_FILE" "$temporary_config" "$dedup_state"; then
+  apply_region_group_state "$dedup_state" region "地区策略组及筛选规则已更新."
+  status=$?
+  rm -f -- "$nodes_file" "$groups_file" "$existing_state" "$candidate_state" "$dedup_state"
+  return "$status"
+}
+
+managed_region_parent() {
+  if sudo test -s "$REGION_PARENT_FILE"; then
+    sudo head -n 1 "$REGION_PARENT_FILE"
+  else
+    printf '🚀节点选择\n'
+  fi
+}
+
+save_region_parent() {
+  local parent="$1"
+  local temporary
+
+  [[ -n $parent && $parent != *$'\n'* && $parent != *$'\r'* ]] || return 1
+  temporary="$(mktemp /tmp/mihomo-region-parent.XXXXXX)" || return 1
+  printf '%s\n' "$parent" >"$temporary"
+  atomic_install_file 600 "$temporary" "$REGION_PARENT_FILE"
+  local status=$?
+  rm -f -- "$temporary"
+  if (( status == 0 )); then
+    sync_mipilot_config_from_state || return 1
+  fi
+  return "$status"
+}
+
+preferred_rule_parent_for_config() {
+  local config_file="$1"
+  local saved_parent="${2:-}"
+  local preferred
+  local candidate
+  local candidates=()
+
+  mapfile -t candidates < <(list_rule_selector_names "$config_file")
+  for candidate in "${candidates[@]}"; do
+    if [[ -n $saved_parent && $saved_parent != "$REGION_MANAGED_PARENT" && $candidate == "$saved_parent" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  for preferred in "🚀节点选择" "节点选择" "代理选择" "Proxy" "手动选择"; do
+    for candidate in "${candidates[@]}"; do
+      if [[ $candidate == "$preferred" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    done
+  done
+  if (( ${#candidates[@]} == 1 )); then
+    printf '%s\n' "${candidates[0]}"
+  else
+    printf '%s\n' "$REGION_MANAGED_PARENT"
+  fi
+}
+
+ensure_region_parent() {
+  local response="$1"
+  local config_file="${2:-$CONFIG_FILE}"
+  local saved_parent
+  local preferred
+  local candidate
+  local candidates=()
+
+  REGION_PARENT=""
+  saved_parent="$(managed_region_parent)"
+  mapfile -t candidates < <(list_rule_selector_names "$config_file")
+  if [[ $saved_parent == "$REGION_MANAGED_PARENT" ]] &&
+     jq -e --arg parent "$saved_parent" '.proxies[$parent].type == "Selector"' <<<"$response" >/dev/null; then
+    REGION_PARENT="$saved_parent"
+    return 0
+  fi
+  for candidate in "${candidates[@]}"; do
+    if [[ $candidate == "$saved_parent" ]] &&
+       jq -e --arg parent "$candidate" '.proxies[$parent].type == "Selector"' <<<"$response" >/dev/null; then
+      REGION_PARENT="$saved_parent"
+      return 0
+    fi
+  done
+  if (( ${#candidates[@]} == 0 )); then
+    REGION_PARENT="$REGION_MANAGED_PARENT"
+    echo "当前规则没有引用可切换的手动策略组, 将创建 MiPilot 自有规则出口."
+    return 0
+  fi
+  for preferred in "🚀节点选择" "节点选择" "代理选择" "Proxy" "手动选择"; do
+    for candidate in "${candidates[@]}"; do
+      if [[ $candidate == "$preferred" ]]; then
+        REGION_PARENT="$candidate"
+        break 2
+      fi
+    done
+  done
+  if [[ -z $REGION_PARENT && ${#candidates[@]} == 1 ]]; then
+    REGION_PARENT="${candidates[0]}"
+  fi
+  if [[ -z $REGION_PARENT ]]; then
+    choose_item "选择 MiPilot 地区分组要挂载的主策略组:" "${candidates[@]}" || return
+    REGION_PARENT="$SELECTED"
+  fi
+  echo "MiPilot 地区分组将挂载到: ${REGION_PARENT}"
+}
+
+apply_region_group_state() {
+  local candidate_state="$1"
+  local reason="$2"
+  local success_message="$3"
+  local base_config="${4:-$CONFIG_FILE}"
+  local temporary_config
+  local backup
+  local status
+  local parent="${REGION_PARENT:-$(managed_region_parent)}"
+  local previous_state
+  local previous_parent
+  local had_state=0
+  local had_parent=0
+
+  temporary_config="$(mktemp /tmp/mihomo-region-config.XXXXXX.yaml)" || return 1
+  if ! apply_region_groups_to_config "$base_config" "$temporary_config" "$candidate_state" "$parent"; then
+    rm -f -- "$temporary_config"
     echo "无法安全合并地区策略组, 现有配置未改变."
-    rm -f -- "$nodes_file" "$groups_file" "$existing_state" "$candidate_state" "$dedup_state" "$temporary_config"
     return 1
   fi
-
   run_cancellable_named "正在验证地区策略组配置" 45 \
     sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$temporary_config"
   status=$?
-  if (( status == 130 )); then
-    rm -f -- "$nodes_file" "$groups_file" "$existing_state" "$candidate_state" "$dedup_state" "$temporary_config"
-    return 130
-  fi
   if (( status != 0 )); then
+    rm -f -- "$temporary_config"
+    (( status == 130 )) && return 130
     echo "地区策略组配置验证失败, 现有配置未改变."
-    rm -f -- "$nodes_file" "$groups_file" "$existing_state" "$candidate_state" "$dedup_state" "$temporary_config"
     return 1
   fi
-
-  echo "配置验证成功, 正在备份、替换并重启服务; 此阶段不可中断."
-  backup="$(create_config_backup region)" || {
-    rm -f -- "$nodes_file" "$groups_file" "$existing_state" "$candidate_state" "$dedup_state" "$temporary_config"
+  backup="$(create_config_backup "$reason")" || {
+    rm -f -- "$temporary_config"
     return 1
   }
+  previous_state="$(mktemp /tmp/mihomo-region-state-previous.XXXXXX)" || {
+    rm -f -- "$temporary_config"
+    return 1
+  }
+  previous_parent="$(mktemp /tmp/mihomo-region-parent-previous.XXXXXX)" || {
+    rm -f -- "$temporary_config" "$previous_state"
+    return 1
+  }
+  if sudo test -f "$REGION_STATE_FILE"; then
+    had_state=1
+    sudo install -m 600 "$REGION_STATE_FILE" "$previous_state" || {
+      rm -f -- "$temporary_config"
+      sudo rm -f -- "$previous_state" "$previous_parent"
+      return 1
+    }
+  fi
+  if sudo test -f "$REGION_PARENT_FILE"; then
+    had_parent=1
+    sudo install -m 600 "$REGION_PARENT_FILE" "$previous_parent" || {
+      rm -f -- "$temporary_config"
+      sudo rm -f -- "$previous_state" "$previous_parent"
+      return 1
+    }
+  fi
+  if ! atomic_install_file 600 "$candidate_state" "$REGION_STATE_FILE" || ! save_region_parent "$parent"; then
+    restore_optional_managed_file "$previous_state" "$had_state" "$REGION_STATE_FILE" || true
+    restore_optional_managed_file "$previous_parent" "$had_parent" "$REGION_PARENT_FILE" || true
+    sync_mipilot_config_from_state || true
+    sudo rm -f -- "$previous_state" "$previous_parent"
+    rm -f -- "$temporary_config"
+    echo "无法保存地区组状态, 现有配置未改变."
+    return 1
+  fi
   atomic_install_file 600 "$temporary_config" "$CONFIG_FILE" || {
-    rm -f -- "$nodes_file" "$groups_file" "$existing_state" "$candidate_state" "$dedup_state" "$temporary_config"
+    restore_optional_managed_file "$previous_state" "$had_state" "$REGION_STATE_FILE" || true
+    restore_optional_managed_file "$previous_parent" "$had_parent" "$REGION_PARENT_FILE" || true
+    sync_mipilot_config_from_state || true
+    sudo rm -f -- "$previous_state" "$previous_parent"
+    rm -f -- "$temporary_config"
     return 1
   }
-
-  if ! restart_mihomo_with_progress; then
+  rm -f -- "$temporary_config"
+  if ! restart_mihomo_with_progress || ! wait_mihomo_with_progress 2; then
     if rollback_config "$backup"; then
-      echo "新配置启动失败, 已自动回滚."
+      restore_optional_managed_file "$previous_state" "$had_state" "$REGION_STATE_FILE" || true
+      restore_optional_managed_file "$previous_parent" "$had_parent" "$REGION_PARENT_FILE" || true
+      sync_mipilot_config_from_state || true
     else
-      echo "新配置启动失败且自动回滚未完成, 请立即检查 ${backup}."
+      echo "严重错误: 地区策略组配置回滚未完成, 已保留与当前配置对应的新状态."
     fi
-    rm -f -- "$nodes_file" "$groups_file" "$existing_state" "$candidate_state" "$dedup_state" "$temporary_config"
+    sudo rm -f -- "$previous_state" "$previous_parent"
+    echo "地区策略组应用失败, 已尝试恢复原配置."
     return 1
   fi
-
-  if ! wait_mihomo_with_progress 2; then
-    if rollback_config "$backup"; then
-      echo "新配置未能稳定运行, 已自动回滚."
-    else
-      echo "新配置未稳定运行且自动回滚未完成, 请立即检查 ${backup}."
-    fi
-    rm -f -- "$nodes_file" "$groups_file" "$existing_state" "$candidate_state" "$dedup_state" "$temporary_config"
-    return 1
-  fi
-
-  if ! atomic_install_file 600 "$dedup_state" "$REGION_STATE_FILE"; then
-    echo "地区组已经生效, 但持久化状态保存失败; 更新订阅后可能丢失."
-    rm -f -- "$nodes_file" "$groups_file" "$existing_state" "$candidate_state" "$dedup_state" "$temporary_config"
-    return 1
-  fi
-
-  rm -f -- "$nodes_file" "$groups_file" "$existing_state" "$candidate_state" "$dedup_state" "$temporary_config"
+  sudo rm -f -- "$previous_state" "$previous_parent"
   refresh_api_config
-  echo "地区策略组及筛选规则已更新."
+  echo "$success_message"
   echo "备份文件: ${backup}"
+}
+
+select_managed_region_record() {
+  local prompt="$1"
+  local record
+  local names=()
+
+  SELECTED_REGION_RECORD=""
+  sudo test -s "$REGION_STATE_FILE" || {
+    echo "尚未创建 MiPilot 地区分组."
+    return 1
+  }
+  while IFS= read -r record; do
+    IFS=';' read -r _ name _ _ <<<"$record"
+    [[ -n $name ]] && names+=("$name")
+  done < <(sudo cat "$REGION_STATE_FILE")
+  (( ${#names[@]} > 0 )) || return 1
+  choose_item "$prompt" "${names[@]}" || return
+  SELECTED_REGION_RECORD="$(sudo awk -F';' -v target="$SELECTED" '$2 == target { print; exit }' "$REGION_STATE_FILE")"
+  [[ -n $SELECTED_REGION_RECORD ]]
+}
+
+view_managed_region_group_nodes() {
+  local response="$1"
+  local name
+  local group_type
+
+  select_managed_region_record "选择要查看的 MiPilot 分组:" || return
+  IFS=';' read -r _ name _ _ <<<"$SELECTED_REGION_RECORD"
+  if ! jq -e --arg name "$name" '.proxies[$name].all != null' <<<"$response" >/dev/null; then
+    echo "当前运行配置中找不到分组 ${name}, 请重新应用地区分组."
+    return 1
+  fi
+  group_type="$(jq -r --arg name "$name" '.proxies[$name].type // "未知"' <<<"$response")"
+  echo "分组: ${name}"
+  echo "运行类型: ${group_type}"
+  echo "当前节点: $(jq -r --arg name "$name" '.proxies[$name].now // "自动"' <<<"$response")"
+  echo "匹配节点:"
+  jq -r --arg name "$name" '.proxies[$name].all[]? | "  - " + .' <<<"$response"
+}
+
+warn_empty_managed_region_groups() {
+  local response
+  local name
+  local empty_count=0
+
+  sudo test -s "$REGION_STATE_FILE" || return 0
+  response="$(api_quick "${API}/proxies")" || return 0
+  while IFS=';' read -r _ name _ _; do
+    [[ -n $name ]] || continue
+    if ! jq -e --arg name "$name" '.proxies[$name].all != null and (.proxies[$name].all | length) > 0' <<<"$response" >/dev/null; then
+      echo "警告: 自定义分组 ${name} 在新订阅中没有匹配节点, 该组当前会回退到 REJECT."
+      empty_count=$((empty_count + 1))
+    fi
+  done < <(sudo cat "$REGION_STATE_FILE")
+  (( empty_count == 0 ))
+}
+
+change_managed_region_group_mode() {
+  local name
+  local group_mode
+  local candidate_state
+  local status
+
+  select_managed_region_record "选择要修改策略的 MiPilot 分组:" || return
+  IFS=';' read -r _ name _ _ <<<"$SELECTED_REGION_RECORD"
+  choose_item "选择新的分组方式:" \
+    "自动测速 - 定期检测并选择延迟合适的节点" \
+    "故障回退 - 优先节点不可用时自动切换" \
+    "负载均衡 - 将不同连接分配到多个节点" \
+    "手动选择 - 由用户固定选择组内节点" || return
+  case "$SELECTED" in
+    自动测速*) group_mode="url-test" ;;
+    故障回退*) group_mode="fallback" ;;
+    负载均衡*) group_mode="load-balance" ;;
+    手动选择*) group_mode="select" ;;
+    *) return 1 ;;
+  esac
+  candidate_state="$(mktemp /tmp/mihomo-region-mode-state.XXXXXX)" || return 1
+  # The input needs sudo; the caller-owned output path intentionally does not.
+  # shellcheck disable=SC2024
+  sudo awk -F';' -v OFS=';' -v target="$name" -v mode="$group_mode" '
+    $2 == target { $4 = mode }
+    NF >= 3 { print }
+  ' "$REGION_STATE_FILE" >"$candidate_state" || {
+    rm -f -- "$candidate_state"
+    return 1
+  }
+  apply_region_group_state "$candidate_state" region-mode "分组策略已更新: ${name}"
+  status=$?
+  rm -f -- "$candidate_state"
+  return "$status"
+}
+
+render_without_region_group() {
+  local input_file="$1"
+  local output_file="$2"
+  local removed_group="$3"
+
+  # The input needs sudo; the caller-owned output path intentionally does not.
+  # shellcheck disable=SC2024
+  sudo awk -v removed="$removed_group" '
+    function parse_group_name(text, value, quote) {
+      value = text
+      sub(/^[[:space:]]*-[[:space:]]*[{]?[[:space:]]*name[[:space:]]*:[[:space:]]*/, "", value)
+      quote = substr(value, 1, 1)
+      if (quote == "\"") { sub(/^"/, "", value); sub(/".*/, "", value) }
+      else if (quote == "\047") { sub(/^\047/, "", value); sub(/\047.*/, "", value) }
+      else { sub(/[[:space:]]*[,}#].*$/, "", value); sub(/[[:space:]]+$/, "", value) }
+      return value
+    }
+    function trim(value) {
+      sub(/^[[:space:]"\047]+/, "", value)
+      sub(/[[:space:]"\047]+$/, "", value)
+      return value
+    }
+    function remove_inline(line, prefix, body, suffix, count, fields, field_index, output, separator, raw) {
+      prefix = substr(line, 1, index(line, "["))
+      suffix = substr(line, index(line, "]"))
+      body = substr(line, index(line, "[") + 1)
+      sub(/\].*$/, "", body)
+      count = split(body, fields, ",")
+      output = prefix
+      separator = ""
+      for (field_index = 1; field_index <= count; field_index++) {
+        if (trim(fields[field_index]) == removed) continue
+        if (trim(fields[field_index]) == "") continue
+        raw = fields[field_index]
+        sub(/^[[:space:]]+/, "", raw)
+        sub(/[[:space:]]+$/, "", raw)
+        output = output separator raw
+        separator = ", "
+      }
+      return output suffix
+    }
+
+    /^proxy-groups:[[:space:]]*$/ { in_groups = 1; print; next }
+    in_groups && /^[^[:space:]#][^:]*:/ { in_groups = 0; skip_group = 0; in_proxies = 0 }
+    in_groups && /^[[:space:]]*-[[:space:]]*([{][[:space:]]*)?name[[:space:]]*:/ {
+      skip_group = parse_group_name($0) == removed
+      in_proxies = 0
+      if (!skip_group) {
+        if ($0 ~ /proxies[[:space:]]*:[[:space:]]*\[/) print remove_inline($0)
+        else print
+      }
+      next
+    }
+    in_groups && skip_group { next }
+    in_groups && /^[[:space:]]+proxies[[:space:]]*:/ {
+      in_proxies = 1
+      match($0, /^[[:space:]]*/)
+      proxies_indent = RLENGTH
+      if ($0 ~ /\[/) print remove_inline($0)
+      else print
+      next
+    }
+    in_groups && in_proxies {
+      match($0, /^[[:space:]]*/)
+      if ($0 !~ /^[[:space:]]*($|#)/ && RLENGTH <= proxies_indent) in_proxies = 0
+      else if ($0 ~ /^[[:space:]]*-[[:space:]]*/) {
+        value = $0
+        sub(/^[[:space:]]*-[[:space:]]*/, "", value)
+        sub(/[[:space:]]+#.*$/, "", value)
+        if (trim(value) == removed) next
+      }
+    }
+    { print }
+  ' "$input_file" >"$output_file"
+}
+
+delete_managed_region_group() {
+  local name
+  local candidate_state
+  local base_config
+  local status
+
+  select_managed_region_record "选择要删除的 MiPilot 分组:" || return
+  IFS=';' read -r _ name _ _ <<<"$SELECTED_REGION_RECORD"
+  read_line_or_back "确认删除 ${name}? (y/N, Esc返回): "
+  status=$?
+  if (( status != 0 )); then return "$status"; fi
+  case "${INPUT_LINE,,}" in y|yes) ;; *) return 130 ;; esac
+
+  candidate_state="$(mktemp /tmp/mihomo-region-delete-state.XXXXXX)" || return 1
+  base_config="$(mktemp /tmp/mihomo-region-delete-config.XXXXXX.yaml)" || {
+    rm -f -- "$candidate_state"
+    return 1
+  }
+  # The input needs sudo; the caller-owned output path intentionally does not.
+  # shellcheck disable=SC2024
+  sudo awk -F';' -v target="$name" '$2 != target && NF >= 3' "$REGION_STATE_FILE" >"$candidate_state" || {
+    rm -f -- "$candidate_state" "$base_config"
+    return 1
+  }
+  render_without_region_group "$CONFIG_FILE" "$base_config" "$name" || {
+    rm -f -- "$candidate_state" "$base_config"
+    return 1
+  }
+  apply_region_group_state "$candidate_state" region-delete "分组已删除: ${name}" "$base_config"
+  status=$?
+  rm -f -- "$candidate_state" "$base_config"
+  return "$status"
+}
+
+show_managed_region_groups() {
+  local code
+  local name
+  local pattern
+  local group_mode
+  local mode_label
+  local index=1
+
+  if ! sudo test -s "$REGION_STATE_FILE"; then
+    echo "尚未创建 MiPilot 地区分组."
+    return 0
+  fi
+  echo "MiPilot 受管地区分组:"
+  while IFS=';' read -r code name pattern group_mode; do
+    [[ -n $code && -n $name && -n $pattern ]] || continue
+    case "${group_mode:-url-test}" in
+      url-test) mode_label="自动测速" ;;
+      fallback) mode_label="故障回退" ;;
+      load-balance) mode_label="负载均衡" ;;
+      select) mode_label="手动选择" ;;
+      *) mode_label="自动测速" ;;
+    esac
+    printf ' %2d) %s [%s]\n' "$index" "$name" "$mode_label"
+    index=$((index + 1))
+  done < <(sudo cat "$REGION_STATE_FILE")
+}
+
+create_custom_region_group() {
+  local response="$1"
+  local group_name
+  local selections
+  local entry
+  local number
+  local selected_code
+  local selected_pattern
+  local combined_pattern=""
+  local candidate_state
+  local nodes_file
+  local count
+  local status
+  local code
+  local name
+  local pattern
+  local group_mode
+  local mode_label
+  local index=1
+  local region_codes=()
+  local region_patterns=()
+  local parent
+
+  parent="${REGION_PARENT:-$(managed_region_parent)}"
+  if [[ $parent != "$REGION_MANAGED_PARENT" ]] && ! config_has_group "$CONFIG_FILE" "$parent"; then
+    echo "配置中找不到主策略组 ${parent}, 无法挂载自定义分组."
+    return 1
+  fi
+  echo "可组合的地区:"
+  while IFS=';' read -r code name pattern; do
+    [[ -n $code && -n $name && -n $pattern ]] || continue
+    printf ' %2d) %s\n' "$index" "$name"
+    region_codes+=("$code")
+    region_patterns+=("$pattern")
+    index=$((index + 1))
+  done < <(region_specs)
+  read_line_or_back "输入地区编号, 多个用逗号分隔(例如 3,4; Esc返回): "
+  status=$?
+  if (( status != 0 )); then return "$status"; fi
+  selections="$INPUT_LINE"
+  [[ -n $selections ]] || return 130
+
+  declare -A selected_regions=()
+  IFS=',' read -ra entries <<<"$selections"
+  for entry in "${entries[@]}"; do
+    number="${entry//[[:space:]]/}"
+    if [[ ! $number =~ ^[0-9]+$ ]] || (( number < 1 || number > ${#region_codes[@]} )); then
+      echo "地区编号无效: ${entry}"
+      return 1
+    fi
+    selected_code="${region_codes[$((number - 1))]}"
+    [[ -n ${selected_regions[$selected_code]+present} ]] && continue
+    selected_regions["$selected_code"]=1
+    selected_pattern="${region_patterns[$((number - 1))]}"
+    if [[ -n $combined_pattern ]]; then combined_pattern+="|"; fi
+    combined_pattern+="$selected_pattern"
+  done
+  [[ -n $combined_pattern ]] || return 1
+
+  read_line_or_back "自定义分组名称(将自动添加 MiPilot- 前缀): "
+  status=$?
+  if (( status != 0 )); then return "$status"; fi
+  group_name="$INPUT_LINE"
+  [[ -n $group_name ]] || return 130
+  if [[ $group_name == *';'* || $group_name == *','* || $group_name == *'"'* || $group_name == *'\\'* || $group_name == *$'\n'* || $group_name == *$'\r'* ]]; then
+    echo "分组名称不能包含分号、逗号、双引号、反斜杠或换行."
+    return 1
+  fi
+  [[ $group_name == MiPilot-* ]] || group_name="MiPilot-${group_name}"
+  if sudo awk -F';' -v target="$group_name" '$2 == target { found = 1 } END { exit(found ? 0 : 1) }' "$REGION_STATE_FILE" 2>/dev/null; then
+    echo "分组已经存在: ${group_name}"
+    return 1
+  fi
+  if config_has_group "$CONFIG_FILE" "$group_name"; then
+    echo "当前订阅已经存在同名策略组: ${group_name}"
+    echo "请使用其他名称, 避免把订阅分组误认为 MiPilot 自定义分组."
+    return 1
+  fi
+
+  choose_item "选择分组方式:" \
+    "自动测速 - 定期检测并选择延迟合适的节点" \
+    "故障回退 - 优先节点不可用时自动切换" \
+    "负载均衡 - 将不同连接分配到多个节点" \
+    "手动选择 - 由用户固定选择组内节点" || return
+  case "$SELECTED" in
+    自动测速*) group_mode="url-test"; mode_label="自动测速" ;;
+    故障回退*) group_mode="fallback"; mode_label="故障回退" ;;
+    负载均衡*) group_mode="load-balance"; mode_label="负载均衡" ;;
+    手动选择*) group_mode="select"; mode_label="手动选择" ;;
+    *)
+      echo "无法识别分组方式."
+      return 1
+      ;;
+  esac
+
+  nodes_file="$(mktemp /tmp/mihomo-custom-group-nodes.XXXXXX)" || return 1
+  jq -r '
+    .proxies
+    | to_entries[]
+    | select(.value.all == null)
+    | select(.key != "DIRECT" and .key != "REJECT" and .key != "PASS")
+    | select(.key | test("剩余流量|流量剩余|到期时间|过期时间|套餐到期|重置时间|流量重置|Traffic|Expire|Expiration|Bandwidth|Reset"; "i") | not)
+    | .key
+  ' <<<"$response" >"$nodes_file"
+  count="$(grep -Eic -- "$combined_pattern" "$nodes_file" || true)"
+  rm -f -- "$nodes_file"
+  if (( count == 0 )); then
+    echo "当前订阅没有匹配到所选地区的实际节点, 未创建分组."
+    return 1
+  fi
+
+  echo "分组: ${group_name}"
+  echo "匹配节点数: ${count}"
+  echo "分组方式: ${mode_label}"
+  read_line_or_back "确认创建分组? (y/N, Esc返回): "
+  status=$?
+  if (( status != 0 )); then return "$status"; fi
+  case "${INPUT_LINE,,}" in y|yes) ;; *) return 130 ;; esac
+
+  candidate_state="$(mktemp /tmp/mihomo-custom-group-state.XXXXXX)" || return 1
+  if sudo test -f "$REGION_STATE_FILE"; then
+    # shellcheck disable=SC2024
+    sudo cat "$REGION_STATE_FILE" >"$candidate_state" || {
+      rm -f -- "$candidate_state"
+      return 1
+    }
+  fi
+  printf 'custom-%s;%s;%s;%s\n' "$(date +%s%N)" "$group_name" "$combined_pattern" "$group_mode" >>"$candidate_state"
+  apply_region_group_state "$candidate_state" custom-group "自定义分组已创建: ${group_name}"
+  status=$?
+  rm -f -- "$candidate_state"
+  return "$status"
+}
+
+manage_region_groups() {
+  local choice
+  local response
+  local status
+
+  while true; do
+    clear
+    echo "================ 地区分组管理 ================"
+    show_managed_region_groups
+    cat <<'EOF'
+
+ 1) 自动扫描并补充常用地区组
+ 2) 创建自定义组合地区组
+ 3) 查看分组匹配节点
+ 4) 修改分组策略
+ 5) 删除分组
+ 0) 返回主菜单
+================================================
+EOF
+    read_choice_or_back "请选择(Esc/0返回): " || return 130
+    choice="$MENU_CHOICE"
+    status=0
+    echo
+    case "$choice" in
+      1|2|3|4|5)
+        require_api || { status=$?; }
+        if [[ ${status:-0} == 0 ]]; then
+          response="$(api "${API}/proxies")"
+          status=$?
+        fi
+        if (( status == 0 )); then
+          ensure_region_parent "$response"
+          status=$?
+        fi
+        if (( status == 0 )); then
+          case "$choice" in
+            1) auto_add_region_groups "$response" ;;
+            2) create_custom_region_group "$response" ;;
+            3) view_managed_region_group_nodes "$response" ;;
+            4) change_managed_region_group_mode ;;
+            5) delete_managed_region_group ;;
+          esac
+          status=$?
+        fi
+        ;;
+      0) return 130 ;;
+      *) echo "无效选项."; status=1 ;;
+    esac
+    if (( status != 130 )); then pause; fi
+  done
 }
 
 manage_rule_nodes() {
   local response
-  local record
+  local parent
+  local parent_url
+  local current
   local group
+  local group_type
+  local type_label
+  local active_node
+  local node_count
   local selected_label
   local index
+  local data
+  local status
   local groups=()
   local display_groups=()
 
   response="$(api "${API}/proxies")" || return
+  ensure_region_parent "$response" || return
+  parent="$REGION_PARENT"
+  if ! jq -e --arg parent "$parent" '.proxies[$parent].type == "Selector"' <<<"$response" >/dev/null; then
+    echo "当前订阅没有可挂载 MiPilot 分组的 ${parent} 策略组."
+    return 1
+  fi
+  current="$(jq -r --arg parent "$parent" '.proxies[$parent].now // ""' <<<"$response")"
+  if [[ $parent == "$REGION_MANAGED_PARENT" ]]; then
+    echo "当前使用 MiPilot 兜底规则出口; 选择只影响 MATCH 及其他明确指向该出口的规则."
+  fi
   mapfile -t groups < <(
-    jq -r '
-      .proxies
-      | to_entries
-      | map(select(.value.type == "Selector" and .key != "GLOBAL"))
-      | sort_by(.key)
-      | .[]
-      | .key
+    jq -r --arg parent "$parent" '
+      . as $root
+      | $root.proxies[$parent].all[]
+      | select(. != $parent and . != "GLOBAL")
+      | . as $name
+      | select($root.proxies[$name].all != null)
     ' <<<"$response"
   )
-
+  for group in "${groups[@]}"; do
+    group_type="$(jq -r --arg group "$group" '.proxies[$group].type // "未知"' <<<"$response")"
+    active_node="$(jq -r --arg group "$group" '.proxies[$group].now // "自动"' <<<"$response")"
+    node_count="$(jq -r --arg group "$group" '.proxies[$group].all | length' <<<"$response")"
+    case "$group_type" in
+      Selector) type_label="手动策略" ;;
+      URLTest) type_label="自动测速" ;;
+      Fallback) type_label="故障回退" ;;
+      LoadBalance) type_label="负载均衡" ;;
+      *) type_label="$group_type" ;;
+    esac
+    if [[ $group == "$current" ]]; then
+      display_groups+=("* ${group} [${type_label}, ${node_count}项, 当前: ${active_node}]")
+    else
+      display_groups+=("  ${group} [${type_label}, ${node_count}项, 当前: ${active_node}]")
+    fi
+  done
   if (( ${#groups[@]} == 0 )); then
-    echo "当前配置中没有可手动切换的 rule 策略组."
+    echo "当前规则入口下没有可选择的策略组."
+    echo "可以从 [地区分组管理] 创建 MiPilot 自定义分组."
     return 1
   fi
 
-  for group in "${groups[@]}"; do
-    record="$(jq -r --arg group "$group" '.proxies[$group].now // "未选择"' <<<"$response")"
-    display_groups+=("${group} [当前: ${record}]")
-  done
-  groups+=("__AUTO_REGION_GROUPS__")
-  display_groups+=("【管理功能】自动扫描并补充地区策略组")
-
-  choose_item "选择要管理的策略组:" "${display_groups[@]}" || return
+  echo "* 表示规则模式当前使用的策略组."
+  choose_item "选择规则模式使用的策略组:" "${display_groups[@]}" || return
   selected_label="$SELECTED"
   group=""
   for index in "${!display_groups[@]}"; do
@@ -2167,17 +3668,39 @@ manage_rule_nodes() {
     fi
   done
 
-  if [[ -z $group ]]; then
+  [[ -n $group ]] || {
     echo "无法识别策略组选择结果."
     return 1
+  }
+  parent_url="$(urlencode "$parent")"
+  data="$(jq -nc --arg name "$group" '{name: $name}')"
+  api -X PUT -H 'Content-Type: application/json' --data "$data" \
+    "${API}/proxies/${parent_url}" >/dev/null
+  status=$?
+  if (( status == 130 )); then return 130; fi
+  if (( status != 0 )); then
+    echo "规则模式策略组切换失败."
+    return 1
   fi
-
-  if [[ $group == "__AUTO_REGION_GROUPS__" ]]; then
-    auto_add_region_groups "$response"
-    return $?
+  if ! update_mipilot_selection rule "$parent" "$group"; then
+    data="$(jq -nc --arg name "$current" '{name: $name}')"
+    api -X PUT -H 'Content-Type: application/json' --data "$data" \
+      "${API}/proxies/${parent_url}" >/dev/null 2>&1 || true
+    echo "MiPilot 配置保存失败, 已尝试恢复原规则策略组."
+    return 1
   fi
-
-  manage_selector_group "$group" "$response"
+  group_type="$(jq -r --arg group "$group" '.proxies[$group].type // ""' <<<"$response")"
+  echo "规则模式已切换到: ${group}"
+  case "$group_type" in
+    URLTest) echo "该组会自动测速并选择合适节点." ;;
+    Fallback) echo "该组会在节点不可用时自动回退." ;;
+    LoadBalance) echo "该组会按订阅配置进行负载均衡." ;;
+    Selector)
+      echo "该组使用手动选择, 请继续选择组内节点."
+      response="$(api "${API}/proxies")" || return
+      manage_selector_group "$group" "$response"
+      ;;
+  esac
 }
 
 manage_selector_group() {
@@ -2374,6 +3897,13 @@ manage_selector_group() {
     echo "节点切换失败, 原选择未确认改变."
     return 1
   fi
+  if ! update_mipilot_selection selector "$group" "$node"; then
+    data="$(jq -nc --arg name "$current" '{name: $name}')"
+    api -X PUT -H 'Content-Type: application/json' --data "$data" \
+      "${API}/proxies/${group_url}" >/dev/null 2>&1 || true
+    echo "MiPilot 配置保存失败, 已尝试恢复原节点选择."
+    return 1
+  fi
 
   echo "已将 ${group} 切换到: ${node}"
 }
@@ -2385,6 +3915,7 @@ manage_global_nodes() {
   local status
   local node_count
   local current
+  local previous_global
   local node
   local delay
   local marker
@@ -2409,6 +3940,11 @@ manage_global_nodes() {
             and (.value.type // "") != "Compatible"
             and (.value.type // "") != "DNS"
           )
+        | select(
+            .key
+            | test("剩余流量|流量剩余|到期时间|过期时间|套餐到期|重置时间|流量重置|Traffic|Expire|Expiration|Bandwidth|Reset"; "i")
+            | not
+          )
         | .key
       ]
       | unique
@@ -2430,6 +3966,7 @@ manage_global_nodes() {
   else
     current="$(jq -r '.proxies.GLOBAL.now // ""' <<<"$response")"
   fi
+  previous_global="$(jq -r '.proxies.GLOBAL.now // ""' <<<"$response")"
 
   echo "找到 ${node_count} 个实际代理节点."
   echo "正在测试全部节点延迟, 最长等待 8 秒, 按 Esc 取消..."
@@ -2510,6 +4047,13 @@ manage_global_nodes() {
     echo "全局节点切换失败, 原选择未确认改变."
     return 1
   fi
+  if ! update_mipilot_selection global GLOBAL "$node"; then
+    data="$(jq -nc --arg name "$previous_global" '{name: $name}')"
+    api -X PUT -H 'Content-Type: application/json' --data "$data" \
+      "${API}/proxies/GLOBAL" >/dev/null 2>&1 || true
+    echo "MiPilot 配置保存失败, 已尝试恢复原全局节点."
+    return 1
+  fi
 
   echo "GLOBAL 已切换到: ${node}"
 }
@@ -2519,6 +4063,7 @@ manage_nodes_by_mode() {
   local mode
   local status
 
+  ensure_store_selected || return
   require_api || return
   config_response="$(api "${API}/configs")"
   status=$?
@@ -2531,7 +4076,7 @@ manage_nodes_by_mode() {
 
   case "$mode" in
     rule)
-      echo "当前为规则分流模式. 请先选择策略组, 随后按测速结果选择节点."
+      echo "当前为规则分流模式. 请选择订阅自带或 MiPilot 自定义策略组."
       manage_rule_nodes
       ;;
     global)
@@ -2592,12 +4137,41 @@ show_runtime_status() {
 switch_mode() {
   local modes=(rule global direct)
   local mode
+  local previous_mode
   local data
+  local rollback_data
+  local temporary
+  local backup
   local status
 
   require_api || return
   choose_item "选择运行模式(rule=规则, global=全局, direct=直连):" "${modes[@]}" || return
   mode="$SELECTED"
+  previous_mode="$(api "${API}/configs" | jq -r '.mode // empty')" || return
+  [[ $previous_mode == rule || $previous_mode == global || $previous_mode == direct ]] || {
+    echo "无法识别当前运行模式: ${previous_mode:-空}"
+    return 1
+  }
+
+  temporary="$(mktemp /tmp/mihomo-mode-config.XXXXXX.yaml)" || return 1
+  if ! render_mode_config "$CONFIG_FILE" "$temporary" "$mode"; then
+    rm -f -- "$temporary"
+    echo "无法生成运行模式配置, 当前模式未改变."
+    return 1
+  fi
+  run_cancellable_named "正在验证运行模式配置" 45 \
+    sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$temporary"
+  status=$?
+  if (( status != 0 )); then
+    rm -f -- "$temporary"
+    (( status == 130 )) && return 130
+    echo "运行模式配置验证失败, 当前模式未改变."
+    return 1
+  fi
+  backup="$(create_config_backup mode)" || {
+    rm -f -- "$temporary"
+    return 1
+  }
   data="$(jq -nc --arg mode "$mode" '{mode: $mode}')"
 
   api \
@@ -2606,14 +4180,39 @@ switch_mode() {
     --data "$data" \
     "${API}/configs" >/dev/null
   status=$?
-  if (( status == 130 )); then return 130; fi
   if (( status != 0 )); then
+    rm -f -- "$temporary"
+    rollback_data="$(jq -nc --arg mode "$previous_mode" '{mode: $mode}')"
+    api -X PATCH -H 'Content-Type: application/json' \
+      --data "$rollback_data" "${API}/configs" >/dev/null 2>&1 || true
+    if (( status == 130 )); then return 130; fi
     echo "运行模式切换失败."
     return 1
   fi
 
+  if ! atomic_install_file 600 "$temporary" "$CONFIG_FILE"; then
+    rm -f -- "$temporary"
+    rollback_data="$(jq -nc --arg mode "$previous_mode" '{mode: $mode}')"
+    if ! api -X PATCH -H 'Content-Type: application/json' \
+         --data "$rollback_data" "${API}/configs" >/dev/null; then
+      echo "严重错误: 配置保存失败且运行模式未能恢复为 ${previous_mode}."
+    fi
+    echo "运行模式配置保存失败, 已尝试恢复原运行模式."
+    return 1
+  fi
+  rm -f -- "$temporary"
+  if ! update_mipilot_mode "$mode"; then
+    if rollback_config "$backup"; then
+      echo "MiPilot 配置保存失败, 已恢复原运行模式."
+    else
+      echo "严重错误: MiPilot 配置保存失败且运行配置回滚失败."
+    fi
+    return 1
+  fi
+
   echo "运行模式已切换为: ${mode}"
-  echo "该修改属于运行时状态, 重启后以 config.yaml 为准."
+  echo "运行模式已写入 config.yaml, 服务重启后仍会保持."
+  echo "备份文件: ${backup}"
 }
 
 rollback_config() {
@@ -2667,6 +4266,33 @@ render_local_api_config() {
   ' "$input_file" >"$output_file"
 }
 
+render_local_proxy_config() {
+  local input_file="$1"
+  local output_file="$2"
+
+  awk '
+    /^allow-lan:[[:space:]]*/ {
+      if (!allow_lan_seen) {
+        print "allow-lan: false"
+        allow_lan_seen = 1
+      }
+      next
+    }
+    /^bind-address:[[:space:]]*/ {
+      if (!bind_address_seen) {
+        print "bind-address: '\''127.0.0.1'\''"
+        bind_address_seen = 1
+      }
+      next
+    }
+    { print }
+    END {
+      if (!allow_lan_seen) print "allow-lan: false"
+      if (!bind_address_seen) print "bind-address: '\''127.0.0.1'\''"
+    }
+  ' "$input_file" >"$output_file"
+}
+
 download_and_apply_subscription() {
   local url="$1"
   local temporary
@@ -2674,7 +4300,15 @@ download_and_apply_subscription() {
   local tun_temporary
   local tun_override
   local region_temporary
+  local mode_temporary
+  local mode_override
+  local profile_temporary
+  local proxy_temporary
   local api_temporary
+  local region_parent
+  local region_parent_migrated=0
+  local previous_parent
+  local had_parent=0
   local backup
   local status
 
@@ -2729,18 +4363,63 @@ download_and_apply_subscription() {
   fi
 
   if sudo test -s "$REGION_STATE_FILE"; then
+    region_parent="$(preferred_rule_parent_for_config "$temporary" "$(managed_region_parent)")"
+    if [[ $region_parent != "$(managed_region_parent)" ]]; then
+      if [[ $region_parent == "$REGION_MANAGED_PARENT" ]]; then
+        echo "新订阅没有唯一可确认的规则入口, 将迁移到 MiPilot 自有规则出口."
+      else
+        echo "新订阅提供了明确的规则入口, 将自定义分组挂载到 ${region_parent}."
+      fi
+      region_parent_migrated=1
+    fi
     region_temporary="$(mktemp /tmp/mihomo-region-override.XXXXXX.yaml)" || {
       rm -f -- "$temporary"
       return 1
     }
     echo "正在重新合并已保存的地区策略组..."
-    if ! apply_region_groups_to_config "$temporary" "$region_temporary" "$REGION_STATE_FILE"; then
+    if ! apply_region_groups_to_config "$temporary" "$region_temporary" "$REGION_STATE_FILE" "$region_parent"; then
       rm -f -- "$temporary" "$region_temporary"
       echo "无法将地区策略组合并到新订阅, 现有配置未改变."
       return 1
     fi
     mv -f -- "$region_temporary" "$temporary"
   fi
+
+  mode_override="$(sudo jq -r '.mode // empty' "$MANAGER_CONFIG_FILE" 2>/dev/null || true)"
+  if [[ $mode_override == rule || $mode_override == global || $mode_override == direct ]]; then
+    mode_temporary="$(mktemp /tmp/mihomo-mode-override.XXXXXX.yaml)" || {
+      rm -f -- "$temporary"
+      return 1
+    }
+    if ! render_mode_config "$temporary" "$mode_temporary" "$mode_override"; then
+      rm -f -- "$temporary" "$mode_temporary"
+      echo "无法将已保存的运行模式合并到新订阅, 现有配置未改变."
+      return 1
+    fi
+    mv -f -- "$mode_temporary" "$temporary"
+  fi
+
+  profile_temporary="$(mktemp /tmp/mihomo-profile-override.XXXXXX.yaml)" || {
+    rm -f -- "$temporary"
+    return 1
+  }
+  if ! render_store_selected_config "$temporary" "$profile_temporary"; then
+    rm -f -- "$temporary" "$profile_temporary"
+    echo "无法启用节点选择持久化, 现有配置未改变."
+    return 1
+  fi
+  mv -f -- "$profile_temporary" "$temporary"
+
+  proxy_temporary="$(mktemp /tmp/mihomo-proxy-listen-override.XXXXXX.yaml)" || {
+    rm -f -- "$temporary"
+    return 1
+  }
+  if ! render_local_proxy_config "$temporary" "$proxy_temporary"; then
+    rm -f -- "$temporary" "$proxy_temporary"
+    echo "无法限制代理端口为本机监听, 现有配置未改变."
+    return 1
+  fi
+  mv -f -- "$proxy_temporary" "$temporary"
 
   api_temporary="$(mktemp /tmp/mihomo-api-override.XXXXXX.yaml)" || {
     rm -f -- "$temporary"
@@ -2772,34 +4451,119 @@ download_and_apply_subscription() {
     return 1
   }
 
+  if (( region_parent_migrated == 1 )); then
+    previous_parent="$(mktemp /tmp/mihomo-subscription-parent-previous.XXXXXX)" || {
+      rm -f -- "$temporary"
+      return 1
+    }
+    if sudo test -f "$REGION_PARENT_FILE"; then
+      had_parent=1
+      sudo install -m 600 "$REGION_PARENT_FILE" "$previous_parent" || {
+        rm -f -- "$temporary"
+        sudo rm -f -- "$previous_parent"
+        return 1
+      }
+    fi
+    if ! save_region_parent "$region_parent"; then
+      rm -f -- "$temporary"
+      sudo rm -f -- "$previous_parent"
+      echo "无法保存新的规则入口, 现有配置未改变."
+      return 1
+    fi
+  fi
+
   atomic_install_file 600 "$temporary" "$CONFIG_FILE" || {
+    if (( region_parent_migrated == 1 )); then
+      restore_optional_managed_file "$previous_parent" "$had_parent" "$REGION_PARENT_FILE" || true
+      sync_mipilot_config_from_state || true
+      sudo rm -f -- "$previous_parent"
+    fi
     rm -f -- "$temporary"
     return 1
   }
   rm -f -- "$temporary"
 
-  if ! run_blocking "正在重启 Mihomo 服务" 35 sudo -n systemctl restart mihomo; then
+  if ! restart_mihomo_with_progress; then
     if rollback_config "$backup"; then
+      if (( region_parent_migrated == 1 )); then
+        restore_optional_managed_file "$previous_parent" "$had_parent" "$REGION_PARENT_FILE" || true
+        sync_mipilot_config_from_state || true
+      fi
       echo "新配置启动失败, 已自动回滚."
     else
       echo "新配置启动失败且自动回滚未完成, 请立即检查 ${backup}."
     fi
+    if (( region_parent_migrated == 1 )); then sudo rm -f -- "$previous_parent"; fi
     return 1
   fi
 
   if ! run_blocking "正在等待新订阅稳定运行" 15 wait_for_mihomo_stable 2; then
     if rollback_config "$backup"; then
+      if (( region_parent_migrated == 1 )); then
+        restore_optional_managed_file "$previous_parent" "$had_parent" "$REGION_PARENT_FILE" || true
+        sync_mipilot_config_from_state || true
+      fi
       echo "新配置未能稳定运行, 已自动回滚."
     else
       echo "新配置未稳定运行且自动回滚未完成, 请立即检查 ${backup}."
     fi
+    if (( region_parent_migrated == 1 )); then sudo rm -f -- "$previous_parent"; fi
     return 1
   fi
 
   refresh_api_config
+  restore_mipilot_selections || true
   sync_proxy_state
+  warn_empty_managed_region_groups || true
+  if (( region_parent_migrated == 1 )); then sudo rm -f -- "$previous_parent"; fi
   echo "订阅更新成功."
   echo "备份文件: ${backup}"
+}
+
+restore_mipilot_selections() {
+  local response
+  local parent
+  local group
+  local node
+  local target_url
+  local data
+  local failed=0
+
+  mipilot_config_is_valid || return 0
+  response="$(api_quick "${API}/proxies")" || return 1
+  parent="$(sudo jq -r '.rule_selection.parent // empty' "$MANAGER_CONFIG_FILE")"
+  group="$(sudo jq -r '.rule_selection.group // empty' "$MANAGER_CONFIG_FILE")"
+  if [[ -n $parent && -n $group ]] && \
+     jq -e --arg parent "$parent" --arg group "$group" \
+       '.proxies[$parent].all | index($group) != null' <<<"$response" >/dev/null; then
+    target_url="$(urlencode "$parent")"
+    data="$(jq -nc --arg name "$group" '{name: $name}')"
+    api_quick -X PUT -H 'Content-Type: application/json' --data "$data" \
+      "${API}/proxies/${target_url}" >/dev/null || failed=1
+  fi
+
+  while IFS=$'\t' read -r group node; do
+    [[ -n $group && -n $node ]] || continue
+    if jq -e --arg group "$group" --arg node "$node" \
+         '.proxies[$group].all | index($node) != null' <<<"$response" >/dev/null; then
+      target_url="$(urlencode "$group")"
+      data="$(jq -nc --arg name "$node" '{name: $name}')"
+      api_quick -X PUT -H 'Content-Type: application/json' --data "$data" \
+        "${API}/proxies/${target_url}" >/dev/null || failed=1
+    fi
+  done < <(sudo jq -r '.selector_selections | to_entries[] | [.key, .value] | @tsv' "$MANAGER_CONFIG_FILE")
+
+  node="$(sudo jq -r '.global_selection.node // empty' "$MANAGER_CONFIG_FILE")"
+  if [[ -n $node ]] && jq -e --arg node "$node" \
+       '.proxies.GLOBAL.all | index($node) != null' <<<"$response" >/dev/null; then
+    data="$(jq -nc --arg name "$node" '{name: $name}')"
+    api_quick -X PUT -H 'Content-Type: application/json' --data "$data" \
+      "${API}/proxies/GLOBAL" >/dev/null || failed=1
+  fi
+  if (( failed != 0 )); then
+    echo "警告: 新配置已运行, 但部分节点选择未能恢复."
+    return 1
+  fi
 }
 
 save_subscription_url() {
@@ -2814,6 +4578,7 @@ save_subscription_url() {
     return 1
   fi
   rm -f -- "$temporary"
+  sync_mipilot_config_from_state || return 1
   echo "已设为当前激活订阅."
 }
 
@@ -2841,6 +4606,9 @@ ensure_subscription_list() {
   atomic_install_file 600 "$temporary" "$SUBSCRIPTION_LIST_FILE"
   status=$?
   rm -f -- "$temporary"
+  if (( status == 0 )); then
+    sync_mipilot_config_from_state || return 1
+  fi
   return "$status"
 }
 
@@ -2920,6 +4688,19 @@ append_subscription_url() {
   atomic_install_file 600 "$temporary" "$SUBSCRIPTION_LIST_FILE"
   local status=$?
   rm -f -- "$temporary"
+  if (( status == 0 )); then
+    if ! sync_mipilot_config_from_state; then
+      temporary="$(mktemp /tmp/mihomo-subscriptions-rollback.XXXXXX)" || return 1
+      # shellcheck disable=SC2024
+      sudo awk -v target="$url" '$0 != target' "$SUBSCRIPTION_LIST_FILE" >"$temporary" || {
+        rm -f -- "$temporary"
+        return 1
+      }
+      atomic_install_file 600 "$temporary" "$SUBSCRIPTION_LIST_FILE" || true
+      rm -f -- "$temporary"
+      return 1
+    fi
+  fi
   return "$status"
 }
 
@@ -2940,6 +4721,12 @@ activate_subscription() {
   echo "正在激活订阅并更新对应节点:"
   echo "$url"
   if ! save_subscription_url "$url"; then
+    if (( had_previous == 1 )); then
+      atomic_install_file 600 "$previous_marker" "$SUBSCRIPTION_FILE" || true
+    else
+      sudo rm -f -- "$SUBSCRIPTION_FILE" || true
+    fi
+    sync_mipilot_config_from_state || true
     sudo rm -f -- "$previous_marker"
     echo "无法保存激活订阅标记, 当前节点未改变."
     return 1
@@ -2949,12 +4736,14 @@ activate_subscription() {
   if (( status != 0 )); then
     if (( had_previous == 1 )); then
       if atomic_install_file 600 "$previous_marker" "$SUBSCRIPTION_FILE"; then
+        sync_mipilot_config_from_state || true
         sudo rm -f -- "$previous_marker"
       else
         echo "警告: 原激活订阅标记恢复失败, 安全副本保留在 ${previous_marker}"
       fi
     else
       sudo rm -f -- "$SUBSCRIPTION_FILE" || true
+      sync_mipilot_config_from_state || true
       sudo rm -f -- "$previous_marker"
     fi
     return "$status"
@@ -3028,12 +4817,15 @@ snapshot_manager_runtime_state() {
   local name
   local path
 
-  for name in active list region tun; do
+  for name in active list region parent tun settings marker; do
     case "$name" in
       active) path="$SUBSCRIPTION_FILE" ;;
       list) path="$SUBSCRIPTION_LIST_FILE" ;;
       region) path="$REGION_STATE_FILE" ;;
+      parent) path="$REGION_PARENT_FILE" ;;
       tun) path="$TUN_STATE_FILE" ;;
+      settings) path="$MANAGER_CONFIG_FILE" ;;
+      marker) path="$INSTALL_MARKER" ;;
     esac
     if sudo test -f "$path"; then
       sudo install -m 600 "$path" "${snapshot_dir}/${name}" || return 1
@@ -3053,12 +4845,15 @@ restore_manager_runtime_state() {
   local name
   local path
 
-  for name in active list region tun; do
+  for name in active list region parent tun settings marker; do
     case "$name" in
       active) path="$SUBSCRIPTION_FILE" ;;
       list) path="$SUBSCRIPTION_LIST_FILE" ;;
       region) path="$REGION_STATE_FILE" ;;
+      parent) path="$REGION_PARENT_FILE" ;;
       tun) path="$TUN_STATE_FILE" ;;
+      settings) path="$MANAGER_CONFIG_FILE" ;;
+      marker) path="$INSTALL_MARKER" ;;
     esac
     if sudo test -f "${snapshot_dir}/${name}"; then
       atomic_install_file 600 "${snapshot_dir}/${name}" "$path" || return 1
@@ -3072,7 +4867,12 @@ restore_manager_runtime_state() {
     rm -f -- "$PROXY_STATE_FILE" || return 1
   fi
   apply_proxy_state
-  sync_tun_bypass_rules || true
+  if mipilot_config_is_valid; then
+    materialize_mipilot_state || return 1
+  else
+    sync_mipilot_config_from_state || return 1
+  fi
+  cleanup_legacy_tun_bypass || true
 }
 
 delete_managed_subscription() {
@@ -3176,9 +4976,10 @@ delete_managed_subscription() {
       return 1
     fi
     if ! atomic_install_file 600 "$temporary" "$SUBSCRIPTION_LIST_FILE" ||
-       ! sudo rm -f -- "$SUBSCRIPTION_FILE" "$REGION_STATE_FILE" ||
+       ! sudo rm -f -- "$SUBSCRIPTION_FILE" "$REGION_STATE_FILE" "$REGION_PARENT_FILE" ||
+       ! sudo rm -f -- "$MANAGER_CONFIG_FILE" ||
        ! save_tun_state false ||
-       ! write_proxy_state 0; then
+       ! disable_proxy_state; then
       if restore_manager_runtime_state "$state_snapshot"; then
         sudo rm -rf -- "$state_snapshot"
       else
@@ -3192,7 +4993,7 @@ delete_managed_subscription() {
       return 1
     fi
     apply_proxy_state
-    sync_tun_bypass_rules || true
+    cleanup_legacy_tun_bypass || true
     sudo rm -rf -- "$state_snapshot"
     rm -f -- "$temporary" "$config_temporary"
     refresh_api_config
@@ -3218,9 +5019,15 @@ delete_managed_subscription() {
       rm -f -- "$temporary"
       return 1
     fi
-    sudo rm -rf -- "$state_snapshot"
     echo "当前激活订阅已清除. 现有节点配置保持不变."
   fi
+  sync_mipilot_config_from_state || {
+    [[ -n ${state_snapshot:-} ]] && restore_manager_runtime_state "$state_snapshot" || true
+    rm -f -- "$temporary"
+    echo "MiPilot 配置更新失败, 已尝试恢复订阅状态."
+    return 1
+  }
+  [[ -n ${state_snapshot:-} ]] && sudo rm -rf -- "$state_snapshot"
   rm -f -- "$temporary"
   echo "订阅地址已删除."
 }
@@ -3317,6 +5124,135 @@ service_exists() {
   sudo test -f "$SERVICE_FILE" 2>/dev/null || systemctl cat mihomo >/dev/null 2>&1
 }
 
+installed_runtime_mode() {
+  local mode
+
+  mode="$(sudo jq -r '.runtime.type // empty' "$MANAGER_CONFIG_FILE" 2>/dev/null || true)"
+  if [[ $mode != manual && $mode != service ]]; then
+    mode="$(sudo awk -F= '$1 == "runtime" { print $2; exit }' "$INSTALL_MARKER" 2>/dev/null || true)"
+  fi
+  if [[ $mode == manual || $mode == service ]]; then
+    printf '%s\n' "$mode"
+  elif service_exists; then
+    printf 'service\n'
+  else
+    printf 'manual\n'
+  fi
+}
+
+manual_main_pid() {
+  local pid
+  local executable
+  local command_line
+
+  pid="$(sudo cat "$MANUAL_PID_FILE" 2>/dev/null || true)"
+  [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
+  sudo kill -0 "$pid" 2>/dev/null || return 1
+  executable="$(sudo readlink -f "/proc/${pid}/exe" 2>/dev/null || true)"
+  [[ $executable == "$(readlink -f -- "$MIHOMO_BIN")" ]] || return 1
+  command_line="$(sudo cat "/proc/${pid}/cmdline" 2>/dev/null | tr '\0' '\n' || true)"
+  grep -Fxq -- "$CONFIG_DIR" <<<"$command_line" || return 1
+  printf '%s\n' "$pid"
+}
+
+manual_is_active() {
+  manual_main_pid >/dev/null
+}
+
+runtime_is_active() {
+  if [[ $(installed_runtime_mode) == service ]]; then
+    systemctl is-active --quiet mihomo
+  else
+    manual_is_active
+  fi
+}
+
+runtime_main_pid() {
+  if [[ $(installed_runtime_mode) == service ]]; then
+    sudo -n systemctl show mihomo -p MainPID --value 2>/dev/null
+  else
+    manual_main_pid
+  fi
+}
+
+runtime_status_label() {
+  local mode
+
+  mode="$(installed_runtime_mode)"
+  if runtime_is_active; then
+    if [[ $mode == service ]]; then
+      printf '运行中(systemd服务)\n'
+    else
+      printf '运行中(手动模式)\n'
+    fi
+  elif [[ $mode == service ]]; then
+    printf '已停止(systemd服务)\n'
+  else
+    printf '已停止(手动模式)\n'
+  fi
+}
+
+manual_start() {
+  local pid_directory
+
+  manual_is_active && return 0
+  pid_directory="$(dirname -- "$MANUAL_PID_FILE")"
+  sudo install -d -m 700 "$STATE_DIR" "$pid_directory" || return 1
+  sudo rm -f -- "$MANUAL_PID_FILE" || return 1
+  sudo -n bash -c '
+    umask 077
+    setsid "$1" -d "$2" >>"$3" 2>&1 < /dev/null &
+    printf "%s\n" "$!" >"$4"
+  ' bash "$MIHOMO_BIN" "$CONFIG_DIR" "$MANUAL_LOG_FILE" "$MANUAL_PID_FILE"
+}
+
+manual_stop() {
+  local pid
+  local attempt
+
+  pid="$(manual_main_pid 2>/dev/null || true)"
+  if [[ -z $pid ]]; then
+    sudo rm -f -- "$MANUAL_PID_FILE"
+    return 0
+  fi
+  sudo -n kill -TERM "$pid" || return 1
+  for ((attempt = 0; attempt < 20; attempt++)); do
+    if ! sudo kill -0 "$pid" 2>/dev/null; then
+      sudo rm -f -- "$MANUAL_PID_FILE"
+      return 0
+    fi
+    sleep 0.5
+  done
+  if [[ $(manual_main_pid 2>/dev/null || true) == "$pid" ]]; then
+    sudo -n kill -KILL "$pid" || return 1
+  fi
+  sudo rm -f -- "$MANUAL_PID_FILE"
+}
+
+runtime_start() {
+  if [[ $(installed_runtime_mode) == service ]]; then
+    sudo -n systemctl start mihomo
+  else
+    manual_start
+  fi
+}
+
+runtime_stop() {
+  if [[ $(installed_runtime_mode) == service ]]; then
+    sudo -n systemctl stop mihomo
+  else
+    manual_stop
+  fi
+}
+
+runtime_restart() {
+  if [[ $(installed_runtime_mode) == service ]]; then
+    sudo -n systemctl restart mihomo
+  else
+    manual_stop && manual_start
+  fi
+}
+
 detect_install_state() {
   local binary_found=0
   local config_found=0
@@ -3328,14 +5264,13 @@ detect_install_state() {
   if service_exists; then service_found=1; fi
   if sudo test -f "$MANAGER_INSTALLED_SCRIPT" 2>/dev/null && \
      sudo test -x "$MANAGER_COMMAND" 2>/dev/null && \
-     sudo test -f "$CLEANUP_SERVICE_FILE" 2>/dev/null && \
-     sudo test -f "$CLEANUP_TIMER_FILE" 2>/dev/null && \
      grep -Fq "$SHELL_INTEGRATION_BEGIN" "$SHELL_RC_FILE" 2>/dev/null; then
     manager_found=1
   fi
 
   if sudo test -f "$INSTALL_MARKER" 2>/dev/null; then
-    if (( binary_found && config_found && service_found && manager_found )); then
+    if (( binary_found && config_found && manager_found )) && \
+       { [[ $(installed_runtime_mode) == manual ]] || (( service_found )); }; then
       printf 'managed\n'
     else
       printf 'partial\n'
@@ -3373,17 +5308,13 @@ check_supported_platform() {
     echo "当前架构不受支持: ${architecture}. 首版仅支持 amd64."
     return 1
   fi
-  if [[ ! -d /run/systemd/system ]]; then
-    echo "当前系统未使用 systemd, 无法安装服务."
-    return 1
-  fi
 }
 
 missing_runtime_commands() {
   local command_name
   local missing=()
 
-  for command_name in awk curl cut find flock gzip grep ip jq sed setsid sha256sum sort ss stat sudo systemctl timeout tr; do
+  for command_name in awk curl cut find flock gzip grep ip jq sed setsid sha256sum sort stat sudo systemctl timeout tr; do
     command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
   done
   printf '%s\n' "${missing[*]}"
@@ -3673,7 +5604,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${MIHOMO_BIN} -d ${CONFIG_DIR}
+ExecStart="${MIHOMO_BIN}" -d "${CONFIG_DIR}"
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1048576
@@ -3705,9 +5636,9 @@ wait_for_mihomo_stable() {
 
   for ((index = 0; index < checks; index++)); do
     sleep 1
-    sudo -n systemctl is-active --quiet mihomo || return 1
+    runtime_is_active || return 1
   done
-  main_pid="$(sudo -n systemctl show mihomo -p MainPID --value 2>/dev/null || true)"
+  main_pid="$(runtime_main_pid 2>/dev/null || true)"
   [[ $main_pid =~ ^[1-9][0-9]*$ ]] || return 1
   running_executable="$(sudo -n readlink -f "/proc/${main_pid}/exe" 2>/dev/null || true)"
   [[ $running_executable == "$(readlink -f -- "$MIHOMO_BIN")" ]] || return 1
@@ -3773,35 +5704,14 @@ EOF
   sudo systemctl enable --now "$(basename -- "$CLEANUP_TIMER_FILE")" >/dev/null
 }
 
-write_tun_bypass_unit() {
-  local temporary
-
-  temporary="$(mktemp /tmp/mipilot-tun-bypass-service.XXXXXX)" || return 1
-  cat >"$temporary" <<EOF
-[Unit]
-Description=Protect public service return traffic from Mihomo TUN routing
-After=network-online.target mihomo.service docker.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=${MANAGER_COMMAND} --sync-bypass-rules
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  atomic_install_file 644 "$temporary" "$TUN_BYPASS_SERVICE_FILE" || {
-    rm -f -- "$temporary"
-    return 1
-  }
-  rm -f -- "$temporary"
-  sudo systemctl daemon-reload || return 1
-  sudo systemctl enable --now "$(basename -- "$TUN_BYPASS_SERVICE_FILE")" >/dev/null
+remove_cleanup_units() {
+  sudo systemctl disable --now "$(basename -- "$CLEANUP_TIMER_FILE")" >/dev/null 2>&1 || true
+  sudo rm -f -- "$CLEANUP_SERVICE_FILE" "$CLEANUP_TIMER_FILE" || return 1
+  sudo systemctl daemon-reload
 }
 
 install_manager_files() {
-  local marker_temporary
+  local runtime_mode="${1:-$(installed_runtime_mode)}"
 
   sudo install -d -m 755 "$MANAGER_LIB_DIR" || return 1
   if [[ $SCRIPT_PATH != "$MANAGER_INSTALLED_SCRIPT" ]]; then
@@ -3809,24 +5719,14 @@ install_manager_files() {
   fi
   write_manager_wrapper || return 1
   sudo install -d -m 700 "$STATE_DIR" "$ROLLBACK_DIR" || return 1
-  if sudo test -f "$CONFIG_FILE"; then
-    refresh_tun_bypass_ports || return 1
-    sync_tun_bypass_rules || return 1
+  cleanup_legacy_tun_bypass || return 1
+  if [[ $runtime_mode == service ]]; then
+    write_cleanup_units || return 1
+  else
+    remove_cleanup_units || return 1
   fi
-  write_cleanup_units || return 1
-  write_tun_bypass_unit || return 1
   ensure_shell_integration || return 1
-  marker_temporary="$(mktemp /tmp/mipilot-marker.XXXXXX)" || return 1
-  {
-    printf 'version=%s\n' "$MANAGER_VERSION"
-    printf 'installed_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    printf 'installed_by=%s\n' "${USER:-unknown}"
-  } >"$marker_temporary"
-  atomic_install_file 600 "$marker_temporary" "$INSTALL_MARKER" || {
-    rm -f -- "$marker_temporary"
-    return 1
-  }
-  rm -f -- "$marker_temporary"
+  write_manager_install_marker "$MANAGER_VERSION" "$runtime_mode"
 }
 
 validate_existing_config_with_staged_core() {
@@ -3883,7 +5783,7 @@ clear_manager_runtime_state() {
   local empty_list
 
   empty_list="$(mktemp /tmp/mihomo-empty-subscriptions.XXXXXX)" || return 1
-  sudo rm -f -- "$SUBSCRIPTION_FILE" "$SUBSCRIPTION_LIST_FILE" "$REGION_STATE_FILE" "$TUN_STATE_FILE" || {
+  sudo rm -f -- "$SUBSCRIPTION_FILE" "$SUBSCRIPTION_LIST_FILE" "$REGION_STATE_FILE" "$REGION_PARENT_FILE" "$TUN_STATE_FILE" || {
     rm -f -- "$empty_list"
     return 1
   }
@@ -3892,15 +5792,16 @@ clear_manager_runtime_state() {
     return 1
   }
   rm -f -- "$empty_list"
+  sudo rm -f -- "$MANAGER_CONFIG_FILE" || return 1
   save_tun_state false || return 1
-  sync_tun_bypass_rules || return 1
-  write_proxy_state 0 || return 1
-  apply_proxy_state
+  cleanup_legacy_tun_bypass || return 1
+  disable_proxy_state
 }
 
 install_from_local_bundle() {
   local asset_directory="$1"
   local config_mode="${2:-preserve}"
+  local runtime_mode="${3:-manual}"
   local config_temporary=""
   local config_backup=""
   local runtime_snapshot=""
@@ -3935,7 +5836,11 @@ install_from_local_bundle() {
     fi
   fi
 
-  echo "所有文件已校验, 正在保存最近版本并重建服务; 此阶段不可中断."
+  if [[ $runtime_mode == service && ! -d /run/systemd/system ]]; then
+    echo "当前系统未使用 systemd, 无法安装为系统服务."
+    return 1
+  fi
+  echo "所有文件已校验, 正在保存最近版本并安装; 此阶段不可中断."
   save_component_rollback core || return 1
   save_component_rollback geo || return 1
   save_component_rollback service || return 1
@@ -3947,6 +5852,12 @@ install_from_local_bundle() {
     fi
     if sudo systemctl is-active --quiet mihomo; then
       echo "旧 Mihomo 服务仍在运行, 安装已停止."
+      return 1
+    fi
+  fi
+  if manual_is_active; then
+    if ! run_blocking "正在停止旧 Mihomo 进程" 35 manual_stop; then
+      echo "无法停止旧 Mihomo 进程, 尚未替换任何核心文件."
       return 1
     fi
   fi
@@ -3972,10 +5883,17 @@ install_from_local_bundle() {
       return 1
     }
   fi
-  write_service_unit || {
-    rollback_local_install "$config_backup" "$had_config"
-    return 1
-  }
+  if [[ $runtime_mode == service ]]; then
+    write_service_unit || {
+      rollback_local_install "$config_backup" "$had_config"
+      return 1
+    }
+  else
+    sudo rm -f -- "$SERVICE_FILE" || {
+      rollback_local_install "$config_backup" "$had_config"
+      return 1
+    }
+  fi
   sudo "$MIHOMO_BIN" -t -d "$CONFIG_DIR"
   status=$?
   if (( status != 0 )); then
@@ -3985,16 +5903,6 @@ install_from_local_bundle() {
   fi
   if ! sudo systemctl daemon-reload; then
     rollback_local_install "$config_backup" "$had_config"
-    return 1
-  fi
-  run_blocking "正在启用并启动 Mihomo 服务" 45 \
-    sudo -n systemctl enable --now mihomo || {
-    rollback_local_install "$config_backup" "$had_config"
-    return 1
-  }
-  if ! wait_for_mihomo_stable 3; then
-    rollback_local_install "$config_backup" "$had_config" || true
-    rm -f -- "$STAGED_MIHOMO_BIN" "$config_temporary"
     return 1
   fi
   if [[ $config_mode == reset ]]; then
@@ -4016,17 +5924,44 @@ install_from_local_bundle() {
       rollback_local_install "$config_backup" "$had_config" || true
       return 1
     }
-    sudo rm -rf -- "$runtime_snapshot"
   fi
-  install_manager_files || {
-    echo "Mihomo 已安装, 但管理命令安装失败. 再次运行脚本可进入修复流程."
+  install_manager_files "$runtime_mode" || {
+    rollback_local_install "$config_backup" "$had_config" || true
+    if [[ -n $runtime_snapshot ]] && restore_manager_runtime_state "$runtime_snapshot"; then
+      sudo rm -rf -- "$runtime_snapshot"
+    fi
+    echo "安装管理命令失败, 已尝试恢复安装前配置和状态."
     return 1
   }
+  if [[ $runtime_mode == service ]]; then
+    run_blocking "正在启用并启动 Mihomo 服务" 45 \
+      sudo -n systemctl enable --now mihomo || {
+      rollback_local_install "$config_backup" "$had_config"
+      if [[ -n $runtime_snapshot ]] && restore_manager_runtime_state "$runtime_snapshot"; then
+        sudo rm -rf -- "$runtime_snapshot"
+      fi
+      return 1
+    }
+    if ! wait_for_mihomo_stable 3; then
+      rollback_local_install "$config_backup" "$had_config" || true
+      if [[ -n $runtime_snapshot ]] && restore_manager_runtime_state "$runtime_snapshot"; then
+        sudo rm -rf -- "$runtime_snapshot"
+      fi
+      rm -f -- "$STAGED_MIHOMO_BIN" "$config_temporary"
+      return 1
+    fi
+  else
+    sudo systemctl disable mihomo >/dev/null 2>&1 || true
+  fi
   migrate_legacy_backups || true
   cleanup_expired_rollbacks || true
+  [[ -n $runtime_snapshot ]] && sudo rm -rf -- "$runtime_snapshot"
   rm -f -- "$STAGED_MIHOMO_BIN" "$config_temporary"
   STAGED_MIHOMO_BIN=""
   echo "Mihomo 和 mipilot 已安装完成."
+  if [[ $runtime_mode == manual ]]; then
+    echo "当前为手动模式, Mihomo 未启动. 请运行 mipilot 后在运行维护中启动."
+  fi
   [[ -n $config_backup ]] && echo "原配置备份: ${config_backup}"
 }
 
@@ -4080,7 +6015,7 @@ adopt_existing_install() {
     echo "请选择使用离线包重新安装, 以避免更新了文件却仍运行旧内核."
     return 1
   fi
-  install_manager_files || return 1
+  install_manager_files service || return 1
   migrate_legacy_backups || true
   cleanup_expired_rollbacks || true
   echo "已无损接管现有 Mihomo, 当前内核、配置和服务均未替换."
@@ -4095,6 +6030,18 @@ choose_reinstall_config_mode() {
     1) SELECTED="preserve" ;;
     2) SELECTED="reset" ;;
     *) echo "无效选项."; return 1 ;;
+  esac
+}
+
+choose_install_runtime_mode() {
+  local status
+
+  read_line_or_back "是否安装为 systemd 系统服务? (y/N, 默认手动启停, Esc返回): "
+  status=$?
+  if (( status != 0 )); then return "$status"; fi
+  case "${INPUT_LINE,,}" in
+    y|yes) SELECTED="service" ;;
+    *) SELECTED="manual" ;;
   esac
 }
 
@@ -4121,27 +6068,36 @@ offer_initial_subscription() {
 run_install_wizard() {
   local state="$1"
   local config_mode="reset"
+  local runtime_mode="manual"
 
   case "$state" in
     existing)
       echo "检测到已有但尚未由 mipilot 管理的 Mihomo."
       echo "  1) 直接接管现有安装(不替换内核、配置和服务)"
-      echo "  2) 使用脚本同级离线包重新安装并重建服务"
+      echo "  2) 使用脚本同级离线包重新安装"
       read_choice_or_back "输入编号(Esc/0退出): " || return 130
       case "$MENU_CHOICE" in
         1) adopt_existing_install || return 1 ;;
         2)
           choose_reinstall_config_mode || return $?
           config_mode="$SELECTED"
-          install_from_local_bundle "$SCRIPT_DIR" "$config_mode" || return 1
+          choose_install_runtime_mode || return $?
+          runtime_mode="$SELECTED"
+          install_from_local_bundle "$SCRIPT_DIR" "$config_mode" "$runtime_mode" || return 1
           ;;
         *) echo "无效选项."; return 1 ;;
       esac
       ;;
     absent)
       echo "未检测到 Mihomo, 即将使用脚本同级离线包执行首次安装."
-      install_from_local_bundle "$SCRIPT_DIR" reset || return 1
-      offer_initial_subscription
+      choose_install_runtime_mode || return $?
+      runtime_mode="$SELECTED"
+      install_from_local_bundle "$SCRIPT_DIR" reset "$runtime_mode" || return 1
+      if [[ $runtime_mode == service ]]; then
+        offer_initial_subscription
+      else
+        echo "手动模式首次安装保持停止, 启动 Mihomo 后可在订阅管理中添加订阅."
+      fi
       ;;
     partial)
       echo "检测到不完整的 Mihomo 或 mipilot 安装."
@@ -4149,12 +6105,14 @@ run_install_wizard() {
         echo "核心组件完整, 正在修复管理命令和状态文件."
         adopt_existing_install || return 1
       else
-        echo "需要使用脚本同级离线包修复核心组件和服务."
+        echo "需要使用脚本同级离线包修复核心组件和运行配置."
         if sudo test -f "$CONFIG_FILE"; then
           choose_reinstall_config_mode || return $?
           config_mode="$SELECTED"
         fi
-        install_from_local_bundle "$SCRIPT_DIR" "$config_mode" || return 1
+        choose_install_runtime_mode || return $?
+        runtime_mode="$SELECTED"
+        install_from_local_bundle "$SCRIPT_DIR" "$config_mode" "$runtime_mode" || return 1
       fi
       ;;
   esac
@@ -4228,35 +6186,35 @@ current_core_version() {
 
 start_mihomo_with_progress() {
   ensure_sudo_access || return 1
-  run_blocking "正在启动 Mihomo 服务" 35 sudo -n systemctl start mihomo
+  run_blocking "正在启动 Mihomo" 35 runtime_start
 }
 
 restart_mihomo_with_progress() {
   ensure_sudo_access || return 1
-  run_blocking "正在重启 Mihomo 服务" 35 sudo -n systemctl restart mihomo
+  run_blocking "正在重启 Mihomo" 35 runtime_restart
 }
 
 stop_mihomo_with_progress() {
   ensure_sudo_access || return 1
-  run_blocking "正在停止 Mihomo 服务" 35 sudo -n systemctl stop mihomo
+  run_blocking "正在停止 Mihomo" 35 runtime_stop
 }
 
 wait_mihomo_with_progress() {
   local checks="${1:-3}"
   local expected_version="${2:-}"
 
-  run_blocking "正在等待 Mihomo 服务稳定" 20 \
+  run_blocking "正在等待 Mihomo 稳定" 20 \
     wait_for_mihomo_stable "$checks" "$expected_version"
 }
 
 stop_mihomo_for_update() {
   if ! stop_mihomo_with_progress; then
-    if ! sudo systemctl is-active --quiet mihomo; then
+    if ! runtime_is_active; then
       start_mihomo_with_progress >/dev/null 2>&1 || true
     fi
     return 1
   fi
-  ! sudo systemctl is-active --quiet mihomo
+  ! runtime_is_active
 }
 
 recover_core_after_failed_update() {
@@ -4533,17 +6491,22 @@ manager_version_from_script() {
 
 write_manager_install_marker() {
   local version="$1"
+  local runtime_mode="${2:-$(installed_runtime_mode)}"
   local temporary
 
   temporary="$(mktemp /tmp/mipilot-marker.XXXXXX)" || return 1
   {
     printf 'version=%s\n' "$version"
+    printf 'runtime=%s\n' "$runtime_mode"
     printf 'installed_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf 'installed_by=%s\n' "${USER:-unknown}"
   } >"$temporary"
   atomic_install_file 600 "$temporary" "$INSTALL_MARKER"
   local status=$?
   rm -f -- "$temporary"
+  if (( status == 0 )); then
+    sync_mipilot_config_from_state || return 1
+  fi
   return "$status"
 }
 
@@ -4815,12 +6778,12 @@ update_all_from_files() {
     }
   fi
   if (( geo_changed == 1 )); then
-    atomic_install_file 644 "$country_file" "${CONFIG_DIR}/Country.mmdb" &&
-      atomic_install_file 644 "$geosite_file" "${CONFIG_DIR}/GeoSite.dat" || {
+    if ! atomic_install_file 644 "$country_file" "${CONFIG_DIR}/Country.mmdb" ||
+       ! atomic_install_file 644 "$geosite_file" "${CONFIG_DIR}/GeoSite.dat"; then
         recover_combined_update "$core_changed" "$geo_changed" "$current_version" || true
         rm -f -- "$staged_core"
         return 1
-      }
+    fi
   fi
   rm -f -- "$staged_core"
   if ! run_cancellable_named "正在验证组合更新配置" 45 \
@@ -5100,7 +7063,8 @@ show_component_status() {
   echo "Mihomo 内核: $(current_core_version)"
   echo "Country.mmdb SHA256: ${country_hash}"
   echo "GeoSite.dat SHA256: ${geosite_hash}"
-  echo "服务状态: $(systemctl is-active mihomo 2>/dev/null || true)"
+  echo "运行模式: $(installed_runtime_mode)"
+  echo "运行状态: $(runtime_status_label)"
   echo "配置备份: $(sudo find "$BACKUP_DIR" -maxdepth 1 -type f -name 'config-*.yaml' 2>/dev/null | wc -l | tr -d ' ') / ${BACKUP_LIMIT}"
   if rollback_is_usable core; then echo "可回退内核: $(rollback_created_label core)前版本"; fi
   if rollback_is_usable geo; then echo "可回退地理数据: $(rollback_created_label geo)前版本"; fi
@@ -5166,8 +7130,11 @@ restore_config_backup_menu() {
   local backup
   local index
   local selected_backup=""
+  local selected_settings=""
   local selected_copy
+  local settings_copy=""
   local current_backup
+  local current_settings
 
   mapfile -t backups < <(
     sudo find "$BACKUP_DIR" -maxdepth 1 -type f -name 'config-*.yaml' -printf '%T@ %p\n' 2>/dev/null \
@@ -5184,8 +7151,18 @@ restore_config_backup_menu() {
     if [[ ${labels[$index]} == "$SELECTED" ]]; then selected_backup="${backups[$index]}"; break; fi
   done
   [[ -n $selected_backup ]] || return 1
+  selected_settings="${selected_backup%.yaml}.mipilot.json"
   selected_copy="$(mktemp /tmp/mihomo-restore-config.XXXXXX.yaml)" || return 1
   sudo install -m 600 "$selected_backup" "$selected_copy" || return 1
+  if sudo test -f "$selected_settings"; then
+    settings_copy="$(mktemp /tmp/mipilot-restore-config.XXXXXX.json)" || return 1
+    sudo install -m 600 "$selected_settings" "$settings_copy" || return 1
+    jq -e '.schema_version == 1' "$settings_copy" >/dev/null || {
+      sudo rm -f -- "$selected_copy" "$settings_copy"
+      echo "备份中的 MiPilot 配置无效, 未执行恢复."
+      return 1
+    }
+  fi
   run_cancellable_named "正在验证备份配置" 45 \
     sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$selected_copy" || {
     sudo rm -f -- "$selected_copy"
@@ -5193,15 +7170,32 @@ restore_config_backup_menu() {
     return 1
   }
   current_backup="$(create_config_backup before-restore)" || {
-    sudo rm -f -- "$selected_copy"
+    sudo rm -f -- "$selected_copy" "$settings_copy"
     return 1
   }
+  current_settings="${current_backup%.yaml}.mipilot.json"
   atomic_install_file 600 "$selected_copy" "$CONFIG_FILE" || {
-    sudo rm -f -- "$selected_copy"
+    sudo rm -f -- "$selected_copy" "$settings_copy"
     return 1
   }
-  sudo rm -f -- "$selected_copy"
+  if [[ -n $settings_copy ]]; then
+    atomic_install_file 600 "$settings_copy" "$MANAGER_CONFIG_FILE" || {
+      atomic_install_file 600 "$current_backup" "$CONFIG_FILE" || true
+      sudo rm -f -- "$selected_copy" "$settings_copy"
+      return 1
+    }
+    materialize_mipilot_state || {
+      atomic_install_file 600 "$current_backup" "$CONFIG_FILE" || true
+      atomic_install_file 600 "$current_settings" "$MANAGER_CONFIG_FILE" || true
+      materialize_mipilot_state || true
+      sudo rm -f -- "$selected_copy" "$settings_copy"
+      return 1
+    }
+  fi
+  sudo rm -f -- "$selected_copy" "$settings_copy"
   if ! restart_mihomo_with_progress || ! wait_mihomo_with_progress 3; then
+    atomic_install_file 600 "$current_settings" "$MANAGER_CONFIG_FILE" || true
+    materialize_mipilot_state || true
     if rollback_config "$current_backup" && wait_mihomo_with_progress 3; then
       echo "恢复后的配置无法运行, 已自动恢复原配置."
     else
@@ -5209,6 +7203,11 @@ restore_config_backup_menu() {
     fi
     return 1
   fi
+  if ! reconcile_tun_runtime_state; then
+    echo "配置已恢复, 但 TUN 状态同步或旧版端口旁路清理失败."
+    return 1
+  fi
+  sync_mipilot_config_from_state || return 1
   refresh_api_config
   echo "配置备份已恢复."
 }
@@ -5240,12 +7239,58 @@ backup_menu() {
 
 toggle_service_state() {
   ensure_sudo_access || return 1
-  if systemctl is-active --quiet mihomo; then
+  if runtime_is_active; then
     stop_mihomo_with_progress
   else
     start_mihomo_with_progress
   fi
-  echo "当前状态: $(systemctl is-active mihomo 2>/dev/null || true)"
+  echo "当前状态: $(runtime_status_label)"
+}
+
+switch_runtime_mode() {
+  local current_mode
+  local current_version
+
+  ensure_sudo_access || return 1
+  current_mode="$(installed_runtime_mode)"
+  current_version="$(current_core_version)"
+  sudo "$MIHOMO_BIN" -t -d "$CONFIG_DIR" || return 1
+  save_component_rollback service || return 1
+
+  if [[ $current_mode == manual ]]; then
+    [[ -d /run/systemd/system ]] || {
+      echo "当前系统未使用 systemd, 无法切换为系统服务."
+      return 1
+    }
+    manual_stop || return 1
+    if ! write_service_unit || ! sudo systemctl daemon-reload || \
+       ! install_manager_files service || \
+       ! sudo systemctl enable --now mihomo || \
+       ! wait_for_mihomo_stable 3 "$current_version"; then
+      sudo systemctl disable --now mihomo >/dev/null 2>&1 || true
+      restore_component_rollback service || true
+      sudo systemctl daemon-reload || true
+      install_manager_files manual || true
+      echo "切换系统服务失败, 已恢复手动模式."
+      return 1
+    fi
+    echo "已切换为 systemd 服务模式并设置开机启动."
+  else
+    if ! sudo systemctl disable --now mihomo; then
+      echo "无法停止并禁用 Mihomo 服务, 未切换运行模式."
+      return 1
+    fi
+    if ! sudo rm -f -- "$SERVICE_FILE" || ! sudo systemctl daemon-reload || \
+       ! install_manager_files manual; then
+      restore_component_rollback service || true
+      sudo systemctl daemon-reload || true
+      install_manager_files service || true
+      sudo systemctl enable --now mihomo >/dev/null 2>&1 || true
+      echo "切换手动模式失败, 已尝试恢复系统服务."
+      return 1
+    fi
+    echo "已切换为手动模式. Mihomo 当前保持停止, 不会开机自启."
+  fi
 }
 
 redact_sensitive_output() {
@@ -5266,8 +7311,8 @@ generate_diagnostic_report() {
     echo "generated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "manager_version=${MANAGER_VERSION}"
     echo "kernel_version=$(current_core_version)"
-    echo "service_active=$(systemctl is-active mihomo 2>/dev/null || true)"
-    echo "service_enabled=$(systemctl is-enabled mihomo 2>/dev/null || true)"
+    echo "runtime_mode=$(installed_runtime_mode)"
+    echo "runtime_active=$(runtime_is_active && printf true || printf false)"
     echo "tun=$(tun_config_value 2>/dev/null || true)"
     echo "mode=$(config_value mode 2>/dev/null || true)"
     echo "ports:"
@@ -5277,8 +7322,11 @@ generate_diagnostic_report() {
     printf '%s\n' "$validation" \
       | redact_sensitive_output
     echo "recent_logs:"
-    sudo journalctl -u mihomo -n 50 --no-pager 2>/dev/null \
-      | redact_sensitive_output
+    if [[ $(installed_runtime_mode) == service ]]; then
+      sudo journalctl -u mihomo -n 50 --no-pager 2>/dev/null
+    else
+      sudo tail -n 50 "$MANUAL_LOG_FILE" 2>/dev/null
+    fi | redact_sensitive_output
   } >"$report"
   chmod 600 "$report"
   echo "脱敏诊断报告已保存: ${report}"
@@ -5286,25 +7334,29 @@ generate_diagnostic_report() {
 
 repair_installation_menu() {
   local directory
+  local config_mode
   local status
   local current_version
+  local runtime_mode
 
-  echo "  1) 使用当前内核和配置修复服务及 mipilot"
+  echo "  1) 使用当前内核和配置修复当前运行模式及 mipilot"
   echo "  2) 使用本地离线包重新安装"
   read_choice_or_back "输入编号(Esc/0返回): " || return 130
   case "$MENU_CHOICE" in
     1)
-      sudo test -x "$MIHOMO_BIN" && sudo test -f "$CONFIG_FILE" || {
+      if ! sudo test -x "$MIHOMO_BIN" || ! sudo test -f "$CONFIG_FILE"; then
         echo "当前核心文件不完整, 请使用本地离线包修复."
         return 1
-      }
+      fi
       sudo "$MIHOMO_BIN" -t -d "$CONFIG_DIR" || return 1
       current_version="$(current_core_version)"
+      runtime_mode="$(installed_runtime_mode)"
       save_component_rollback service || return 1
-      if ! write_service_unit ||
-         ! install_manager_files ||
+      if [[ $runtime_mode == service ]] && ! write_service_unit; then
+        return 1
+      fi
+      if ! install_manager_files "$runtime_mode" ||
          ! sudo systemctl daemon-reload ||
-         ! sudo systemctl enable mihomo ||
          ! restart_mihomo_with_progress ||
          ! wait_mihomo_with_progress 3 "$current_version"; then
         if restore_component_rollback service && sudo systemctl daemon-reload; then
@@ -5313,10 +7365,10 @@ repair_installation_menu() {
             sudo systemctl restart mihomo >/dev/null 2>&1 || true
           fi
         fi
-        echo "服务修复失败, 已尝试恢复原服务单元."
+        echo "运行环境修复失败, 已尝试恢复原状态."
         return 1
       fi
-      echo "服务和 mipilot 已修复."
+      echo "运行环境和 mipilot 已修复."
       ;;
     2)
       read_line_or_back "离线包目录(回车使用当前目录, Esc返回): "
@@ -5324,7 +7376,9 @@ repair_installation_menu() {
       if (( status != 0 )); then return "$status"; fi
       directory="${INPUT_LINE:-$PWD}"
       choose_reinstall_config_mode || return $?
-      install_from_local_bundle "$directory" "$SELECTED"
+      config_mode="$SELECTED"
+      choose_install_runtime_mode || return $?
+      install_from_local_bundle "$directory" "$config_mode" "$SELECTED"
       ;;
     *) echo "无效选项."; return 1 ;;
   esac
@@ -5341,6 +7395,7 @@ remove_managed_installation() {
         $CLEANUP_SERVICE_FILE != /etc/systemd/system/mipilot-cleanup.service ||
         $CLEANUP_TIMER_FILE != /etc/systemd/system/mipilot-cleanup.timer ||
         $TUN_BYPASS_SERVICE_FILE != /etc/systemd/system/mipilot-tun-bypass.service ||
+        $MANAGER_CONFIG_DIR != /etc/mipilot ||
         $PROXY_STATE_DIR != "${USER_HOME}/.config/mipilot" ]]; then
     echo "卸载路径不是标准受管路径, 为避免误删文件已中止."
     return 1
@@ -5350,9 +7405,11 @@ remove_managed_installation() {
     return 1
   fi
 
-  write_proxy_state 0 || echo "警告: 无法写入终端代理关闭状态, 将直接清理当前Shell变量."
-  unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY no_proxy NO_PROXY
-  export MIHOMO_PROXY_ENABLED=0
+  disable_proxy_state || echo "警告: 无法保存终端代理关闭状态, 当前Shell已尝试恢复原代理变量."
+  if manual_is_active && ! run_blocking "正在停止 Mihomo" 35 manual_stop; then
+    echo "无法停止手动运行的 Mihomo, 已中止卸载."
+    return 1
+  fi
   if service_exists || systemctl is-active --quiet mihomo 2>/dev/null; then
     if ! run_blocking "正在停止并禁用 Mihomo 服务" 45 \
          sudo -n systemctl disable --now mihomo; then
@@ -5364,13 +7421,16 @@ remove_managed_installation() {
       return 1
     fi
   fi
-  remove_all_tun_bypass_rules || echo "警告: 部分TUN公网服务保护规则未能删除."
+  cleanup_legacy_tun_bypass || echo "警告: 旧版TUN端口旁路未完全清理."
   sudo systemctl disable --now "$(basename -- "$CLEANUP_TIMER_FILE")" >/dev/null 2>&1 || true
-  sudo systemctl disable --now "$(basename -- "$TUN_BYPASS_SERVICE_FILE")" >/dev/null 2>&1 || true
   sudo rm -f -- "$SERVICE_FILE" "$CLEANUP_SERVICE_FILE" "$CLEANUP_TIMER_FILE" "$TUN_BYPASS_SERVICE_FILE" || return 1
   sudo systemctl daemon-reload || return 1
   sudo systemctl reset-failed mihomo >/dev/null 2>&1 || true
   sudo rm -f -- "$MIHOMO_BIN" "$MANAGER_COMMAND" || return 1
+  if [[ $MANUAL_PID_FILE == /run/mipilot/mihomo.pid ]]; then
+    sudo rm -f -- "$MANUAL_PID_FILE"
+    sudo rmdir -- "$(dirname -- "$MANUAL_PID_FILE")" 2>/dev/null || true
+  fi
 
   if [[ $MANAGER_LIB_DIR == /usr/local/lib/mipilot ]]; then
     sudo rm -rf -- "$MANAGER_LIB_DIR" || return 1
@@ -5391,6 +7451,12 @@ remove_managed_installation() {
       echo "拒绝删除非标准配置目录: ${CONFIG_DIR}"
       return 1
     fi
+    if [[ $MANAGER_CONFIG_DIR == /etc/mipilot ]]; then
+      sudo rm -rf -- "$MANAGER_CONFIG_DIR" || return 1
+    else
+      echo "拒绝删除非标准 MiPilot 配置目录: ${MANAGER_CONFIG_DIR}"
+      return 1
+    fi
   fi
   remove_shell_integration || return 1
   if [[ $PROXY_STATE_DIR == "${USER_HOME}/.config/mipilot" ]]; then
@@ -5406,7 +7472,7 @@ remove_managed_installation() {
 uninstall_menu() {
   local status
 
-  echo "  1) 卸载程序和服务, 保留 /etc/mihomo 配置"
+  echo "  1) 卸载程序和服务, 保留 /etc/mihomo 与 /etc/mipilot 配置"
   echo "  2) 彻底卸载程序、服务、配置、订阅、备份和状态"
   read_choice_or_back "输入编号(Esc/0返回): " || return 130
   case "$MENU_CHOICE" in
@@ -5445,20 +7511,26 @@ test_and_restart() {
   status=$?
   if (( status == 130 )); then return 130; fi
   if (( status != 0 )); then
-    echo "配置验证失败, 未重启服务."
+    echo "配置验证失败, 未重启 Mihomo."
     return 1
   fi
 
   if ! restart_mihomo_with_progress; then
-    echo "服务重启失败."
+    echo "Mihomo 重启失败."
     return 1
   fi
   wait_mihomo_with_progress 1 || return 1
-  sudo systemctl status mihomo --no-pager -l
+  echo "当前状态: $(runtime_status_label)"
 }
 
 show_logs() {
-  sudo journalctl -u mihomo -n 100 --no-pager
+  if [[ $(installed_runtime_mode) == service ]]; then
+    sudo journalctl -u mihomo -n 100 --no-pager
+  elif sudo test -f "$MANUAL_LOG_FILE"; then
+    sudo tail -n 100 "$MANUAL_LOG_FILE"
+  else
+    echo "手动模式日志尚未生成: ${MANUAL_LOG_FILE}"
+  fi
 }
 
 service_menu() {
@@ -5467,19 +7539,21 @@ service_menu() {
   while true; do
     (( MANAGER_SHOULD_EXIT == 1 )) && return 130
     clear
-    echo "Mihomo 服务状态: $(systemctl is-active mihomo 2>/dev/null || true)"
+    echo "Mihomo 运行模式: $(installed_runtime_mode)"
+    echo "Mihomo 运行状态: $(runtime_status_label)"
     echo
     cat <<'EOF'
-================ 服务维护 ================
- 1) 验证配置并重启服务
- 2) 启动/停止服务
+================ 运行维护 ================
+ 1) 验证配置并重启 Mihomo
+ 2) 启动/停止 Mihomo
  3) 查看最近 100 条日志
  4) 查看内核与数据版本
  5) 更新与版本回退
  6) 配置备份与恢复
  7) 生成脱敏诊断报告
  8) 修复或重新安装
- 9) 卸载
+ 9) 切换手动/系统服务模式
+10) 卸载
  0) 返回主菜单
 ==========================================
 EOF
@@ -5498,7 +7572,8 @@ EOF
       6) backup_menu ;;
       7) run_action run_blocking "正在生成脱敏诊断报告" 60 generate_diagnostic_report ;;
       8) run_action repair_installation_menu ;;
-      9) run_action uninstall_menu ;;
+      9) run_action switch_runtime_mode ;;
+      10) run_action uninstall_menu ;;
       0) return 130 ;;
       *) echo "无效选项."; pause ;;
     esac
@@ -5509,7 +7584,7 @@ check_dependencies() {
   local missing=()
   local command_name
 
-  for command_name in awk curl cut find flock gzip grep ip jq sed setsid sha256sum sort ss stat sudo systemctl timeout tr; do
+  for command_name in awk curl cut find flock gzip grep ip jq sed setsid sha256sum sort stat sudo systemctl timeout tr; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
       missing+=("$command_name")
     fi
@@ -5564,12 +7639,13 @@ main_menu() {
   1) 查看运行状态
   2) 管理订阅
   3) 节点管理
-  4) 切换规则/全局/直连模式
+  4) 地区分组管理
+  5) 切换规则/全局/直连模式
 EOF
-    printf '  5) %s\n' "$(terminal_proxy_action_label)"
-    printf '  6) %s\n' "$(tun_action_label)"
+    printf '  6) %s\n' "$(terminal_proxy_action_label)"
+    printf '  7) %s\n' "$(tun_action_label)"
     cat <<'EOF'
-  7) 服务维护
+  8) 运行维护
   0) 退出
 =====================================================
 EOF
@@ -5583,10 +7659,11 @@ EOF
       1) run_action show_runtime_status ;;
       2) manage_subscriptions ;;
       3) run_action manage_nodes_by_mode ;;
-      4) run_action switch_mode ;;
-      5) run_action toggle_terminal_proxy ;;
-      6) run_action toggle_tun_mode ;;
-      7) service_menu; (( MANAGER_SHOULD_EXIT == 1 )) && break ;;
+      4) manage_region_groups ;;
+      5) run_action switch_mode ;;
+      6) run_action toggle_terminal_proxy ;;
+      7) run_action toggle_tun_mode ;;
+      8) service_menu; (( MANAGER_SHOULD_EXIT == 1 )) && break ;;
       0) break ;;
       *) echo "无效选项."; pause ;;
     esac
@@ -5599,16 +7676,12 @@ main() {
   ensure_sudo_access || return 1
   acquire_manager_lock || return 1
   check_dependencies || { release_manager_lock; return 1; }
+  initialize_mipilot_config || { release_manager_lock; return 1; }
   ensure_subscription_list || { release_manager_lock; return 1; }
   ensure_shell_integration
   migrate_legacy_backups || true
   cleanup_expired_rollbacks || true
-  if [[ $(tun_config_value) == true ]]; then
-    run_blocking "正在刷新公网服务端口保护" 15 refresh_tun_bypass_ports || \
-      echo "警告: 无法刷新公网服务端口保护列表."
-    run_blocking "正在同步公网服务返回路由" 15 sync_tun_bypass_rules || \
-      echo "警告: 无法同步公网服务返回流量保护规则."
-  fi
+  cleanup_legacy_tun_bypass || echo "警告: 旧版TUN端口旁路未完全清理."
   refresh_api_config
   sync_proxy_state
   main_menu || status=$?
@@ -5634,11 +7707,6 @@ entrypoint() {
       release_manager_lock
       return "$cleanup_status"
       ;;
-    --sync-bypass-rules)
-      ensure_sudo_access || return 1
-      sync_tun_bypass_rules
-      return $?
-      ;;
     --menu)
       main
       return $?
@@ -5646,7 +7714,7 @@ entrypoint() {
     ""|--install) ;;
     *)
       echo "未知参数: ${action}"
-      echo "用法: mipilot [--version|--cleanup|--sync-bypass-rules]"
+      echo "用法: mipilot [--version|--cleanup]"
       return 1
       ;;
   esac
