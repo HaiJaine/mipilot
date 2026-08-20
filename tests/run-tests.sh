@@ -142,6 +142,45 @@ test_source_preserves_enabled_shell_options() {
   assert_equal "sourced:1:nounset=on:pipefail=on" "$output" "sourcing must preserve enabled caller shell options"
 }
 
+test_dependency_install_continues_after_partial_apt_update() {
+  local root
+  local output
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+
+  missing_runtime_commands() {
+    [[ -f $root/dependencies-installed ]] || printf 'nft\n'
+  }
+  dpkg-query() {
+    return 1
+  }
+  read_line_or_back() {
+    INPUT_LINE="y"
+    return 0
+  }
+  sudo() {
+    if [[ $1 == apt-get && $2 == update ]]; then
+      printf 'update\n' >>"$root/apt-calls"
+      return 100
+    fi
+    if [[ $1 == apt-get && $2 == install ]]; then
+      printf 'install\n' >>"$root/apt-calls"
+      touch "$root/dependencies-installed"
+      return 0
+    fi
+    return 1
+  }
+
+  if ! output="$(ensure_install_dependencies 2>&1)"; then
+    fail "dependency installation stopped after a partial apt update failure: ${output}"
+    return 1
+  fi
+  assert_equal $'update\ninstall' "$(cat "$root/apt-calls")" "APT update and install calls" || return 1
+  grep -Fq 'APT 软件源更新未完全成功' <<<"$output" || fail "partial APT update warning was not shown"
+}
+
 test_find_local_assets() {
   local root
   local country_name
@@ -2196,6 +2235,7 @@ run_test "bash -n" test_bash_syntax
 run_test "manager release version" test_manager_release_version
 run_test "testing source guard" test_source_testing_guard
 run_test "source preserves enabled shell options" test_source_preserves_enabled_shell_options
+run_test "dependency install survives partial APT update failure" test_dependency_install_continues_after_partial_apt_update
 run_test "local asset discovery" test_find_local_assets
 run_test "configuration backup pruning" test_prune_config_backups
 run_test "rollback expiration" test_cleanup_expired_rollbacks

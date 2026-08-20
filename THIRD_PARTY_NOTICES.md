@@ -9,7 +9,7 @@
 - 项目: MetaCubeX/mihomo
 - 上游仓库: <https://github.com/MetaCubeX/mihomo>
 - 发布页: <https://github.com/MetaCubeX/mihomo/releases>
-- 完整离线包使用的资产: 从 `mihomo-linux-amd64-v*.gz` 解压得到的 `mihomo`
+- 完整离线包使用的资产: `mihomo-linux-amd64-v1.19.30.gz`
 - MiPilot v1.0.1离线包版本: `v1.19.30`
 - 上游提交: `ac017cdd246ce8bd547653d927e7bf77d7ee73d5`
 - SHA-256: `cf06ce2c7d1421bdbda14ee4a5b6046672dc35ebf8eecd8e77504ec3c0ed9a84`

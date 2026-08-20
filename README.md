@@ -24,7 +24,7 @@ cd mipilot-v1.0.1
 bash ./mipilot
 ```
 
-完整离线包解压后就是可直接安装的完整项目目录, 包含管理脚本、测试文件、许可证、未压缩的 `mihomo` 可执行文件、`country.mmdb` 和 `geosite.dat`, 内部不再嵌套其他压缩包。首次安装这些组件不需要访问GitHub。
+完整离线包解压后就是可直接安装的完整项目目录, 包含管理脚本、测试文件、许可证、Mihomo上游原始资产 `mihomo-linux-amd64-v1.19.30.gz`、`country.mmdb` 和 `geosite.dat`。首次安装这些组件不需要访问GitHub。
 
 ### 克隆源码安装
 
@@ -75,14 +75,14 @@ mipilot
 mipilot
 country.mmdb
 geosite.dat
-mihomo
+mihomo-linux-amd64-v1.19.30.gz
 ```
 
 文件用途:
 
 | 文件 | 安装位置 | 来源 |
 | --- | --- | --- |
-| `mihomo` | `/usr/local/bin/mihomo` | 完整离线包内置, 来源为 [MetaCubeX/mihomo Releases](https://github.com/MetaCubeX/mihomo/releases) |
+| `mihomo-linux-amd64-v1.19.30.gz` | `/usr/local/bin/mihomo` | 完整离线包内置的上游原始资产, 安装时校验并解压 |
 | `country.mmdb` | `/etc/mihomo/Country.mmdb` | [MetaCubeX/meta-rules-dat Releases](https://github.com/MetaCubeX/meta-rules-dat/releases) |
 | `geosite.dat` | `/etc/mihomo/GeoSite.dat` | [MetaCubeX/meta-rules-dat Releases](https://github.com/MetaCubeX/meta-rules-dat/releases) |
 
@@ -95,7 +95,7 @@ bash ./mipilot
 安装向导会依次完成:
 
 1. 检查 Ubuntu 版本、amd64 架构、Bash、systemd 和 sudo.
-2. 检查所需系统命令. 缺少依赖时, 经确认后尝试使用 APT 安装.
+2. 检查所需系统命令. 缺少依赖时, 经确认后尝试使用 APT 安装; 单个第三方软件源更新失败时仍会继续尝试从可用索引安装依赖.
 3. 校验本地 Mihomo 文件、临时内核版本、地理数据和生成配置.
 4. 选择运行方式. 默认是手动模式; 只有明确输入 `y` 才安装并启用 systemd 服务.
 5. 安装 Mihomo、地理数据、安全的初始直连配置、管理脚本和 `mipilot` 命令.
@@ -204,7 +204,7 @@ MiPilot会在 `/var/lib/mipilot/tun-routing.state` 保存自己分配的规则�
 
 在线更新不可用时:
 
-1. 在可联网的设备上打开 [Mihomo 最新稳定版](https://github.com/MetaCubeX/mihomo/releases/latest), 下载名称严格匹配 `mihomo-linux-amd64-v*.gz` 的资产. 手动更新兼容该压缩文件; 完整离线包中使用的是解压后的 `mihomo` 文件.
+1. 在可联网的设备上打开 [Mihomo 最新稳定版](https://github.com/MetaCubeX/mihomo/releases/latest), 下载名称严格匹配 `mihomo-linux-amd64-v*.gz` 的资产. 手动更新和完整离线包均使用该上游原始压缩文件.
 2. 打开 [meta-rules-dat 最新版](https://github.com/MetaCubeX/meta-rules-dat/releases/latest), 下载 `country.mmdb` 和 `geosite.dat`.
 3. 将文件复制到任意目录. 默认可放回 `mipilot` 所在目录.
 4. 在更新菜单选择“使用本地文件更新”, 使用默认当前目录或输入文件所在目录.

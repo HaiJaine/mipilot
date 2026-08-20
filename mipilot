@@ -5728,7 +5728,9 @@ ensure_install_dependencies() {
   esac
 
   echo "正在更新软件源并安装依赖, 此过程可能需要几分钟..."
-  sudo apt-get update || return 1
+  if ! sudo apt-get update; then
+    echo "警告: APT 软件源更新未完全成功, 将尝试使用已更新或现有的软件包索引继续安装."
+  fi
   sudo apt-get install -y ca-certificates coreutils curl findutils gzip iproute2 jq nftables util-linux || return 1
   missing="$(missing_runtime_commands)"
   if [[ -n $missing ]]; then
@@ -5780,10 +5782,10 @@ show_required_local_assets() {
 请把以下文件放到同一目录后重试:
   country.mmdb
   geosite.dat
-  mihomo
-
-也兼容官方压缩文件:
   mihomo-linux-amd64-v<版本>.gz
+
+也兼容已解压的文件:
+  mihomo
 
 官方地址:
   https://github.com/MetaCubeX/mihomo/releases/latest
