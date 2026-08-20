@@ -3163,6 +3163,13 @@ render_region_overlay() {
       {
         line = $0
 
+        if (line ~ /^proxy-groups:[[:space:]]*\[[[:space:]]*\][[:space:]]*$/) {
+          groups_found = 1
+          in_groups = 1
+          print "proxy-groups:"
+          next
+        }
+
         if (line ~ /^proxy-groups:[[:space:]]*[^[:space:]#]/) {
           inline_groups = 1
         }

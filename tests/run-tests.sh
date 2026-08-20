@@ -1352,6 +1352,34 @@ test_custom_region_group_without_subscription_groups() {
   assert_file_has_line "$stale_parent_selector" '      - "DIRECT"' "stale-parent current rule fallback member"
 }
 
+test_empty_inline_proxy_groups_rule_selector_rendering() {
+  local root
+  local input_file
+  local output_file
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  input_file="$root/input.yaml"
+  output_file="$root/output.yaml"
+  printf '%s\n' \
+    'mode: direct' \
+    'proxies: []' \
+    'proxy-groups: []' \
+    'rules:' \
+    '  - MATCH,DIRECT' >"$input_file"
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+
+  apply_rule_selector_to_config "$input_file" "$output_file" 'MiPilot-规则出口' || return 1
+  assert_file_has_line "$output_file" 'proxy-groups:' "expanded empty proxy groups" || return 1
+  assert_file_has_line "$output_file" '  - name: "MiPilot-规则选择"' "initial rule selector definition" || return 1
+  assert_file_has_line "$output_file" '      - "DIRECT"' "initial direct selector member" || return 1
+  assert_file_has_line "$output_file" '  - MATCH,MiPilot-规则选择' "initial rule selector target"
+}
+
 test_region_group_strategy_refresh() {
   local root
   local input_file
@@ -2385,6 +2413,7 @@ run_test "selected-node persistence rendering" test_render_store_selected_config
 run_test "custom region group rendering" test_custom_region_group_rendering
 run_test "rule mode managed-group selection" test_rule_mode_selects_managed_group
 run_test "MiPilot rule selector rendering" test_direct_rule_strategy_rendering
+run_test "empty inline proxy groups rule selector rendering" test_empty_inline_proxy_groups_rule_selector_rendering
 run_test "MiPilot rule selector selection restore" test_rule_selector_selection_restore
 run_test "dynamic region parent selection" test_dynamic_region_parent_selection
 run_test "unreferenced selector falls back to managed outlet" test_unreferenced_selector_uses_managed_rule_outlet
