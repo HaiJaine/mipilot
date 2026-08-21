@@ -33,8 +33,21 @@ Mihomo 二进制是独立的第三方程序, 不属于本项目的 MIT 授权范
 
 这些数据文件是独立的第三方资产, 不属于本项目的 MIT 授权范围。数据文件还可能包含或派生自上游声明的其他数据源; 请一并保留并遵守上游仓库提供的归属和许可证信息。
 
+## yq
+
+- 项目: mikefarah/yq
+- 上游仓库: <https://github.com/mikefarah/yq>
+- 发布页: <https://github.com/mikefarah/yq/releases/tag/v4.53.3>
+- 完整离线包使用的资产: `yq_linux_amd64`
+- MiPilot v1.0.1离线包版本: `v4.53.3`
+- SHA-256: `fa52a4e758c63d38299163fbdd1edfb4c4963247918bf9c1c5d31d84789eded4`
+- 上游许可证: MIT License
+- 许可证文本: `licenses/yq-MIT.txt`
+
+yq安装在 `/usr/local/lib/mipilot/yq`, 仅供MiPilot内部结构化读取和修改YAML配置, 不替换系统中的同名命令。
+
 ## 再分发
 
 如果只发布 MiPilot 源码而不附带上述资产, 请保留本文件和 `.gitignore`, 并引导用户从上游获取文件。
 
-MiPilot v1.0.1完整离线包随附GPL-3.0许可证文本, Release同时提供 `mipilot-v1.0.1-third-party-sources.tar.gz`, 包含上述两个精确提交的源码快照。第三方版权和许可证仍归各上游项目所有。
+MiPilot v1.0.1完整离线包随附GPL-3.0和yq MIT许可证文本, Release同时提供 `mipilot-v1.0.1-third-party-sources.tar.gz`, 包含上述GPL组件的精确提交源码快照。第三方版权和许可证仍归各上游项目所有。

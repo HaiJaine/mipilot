@@ -59,9 +59,38 @@ assert_line_count() {
   assert_equal "$expected" "$actual" "$description"
 }
 
+assert_yaml_equal() {
+  local path="$1"
+  local expression="$2"
+  local expected="$3"
+  local description="$4"
+  local actual
+
+  actual="$("${MIPILOT_YQ_BIN:?test yq path is required}" --yaml-fix-merge-anchor-to-spec eval -r "$expression" "$path")" || return 1
+  assert_equal "$expected" "$actual" "$description"
+}
+
 run_as_mock_sudo() {
+  local create_directories=0
+  local paths=()
+
   while [[ ${1:-} == -n ]]; do shift; done
   [[ ${1:-} == -v ]] && return 0
+  if [[ ${1:-} == install && ${2:-} == -d ]]; then
+    shift 2
+    create_directories=1
+    while (( $# > 0 )); do
+      case "$1" in
+        -m) shift 2 ;;
+        --) shift ;;
+        -*) shift ;;
+        *) paths+=("$1"); shift ;;
+      esac
+    done
+    (( create_directories == 1 && ${#paths[@]} > 0 )) || return 1
+    mkdir -p -- "${paths[@]}"
+    return
+  fi
   "$@"
 }
 
@@ -209,6 +238,7 @@ test_find_local_assets() {
 
   printf 'country\n' >"$root/lower/country.mmdb"
   printf 'geosite\n' >"$root/lower/geosite.dat"
+  printf 'yq\n' >"$root/lower/yq_linux_amd64"
   : >"$root/lower/mihomo-linux-amd64-v1.9.12.gz"
   : >"$root/lower/mihomo-linux-amd64-v1.19.28.gz"
   : >"$root/lower/mihomo-linux-amd64-v1.20.1.gz"
@@ -221,9 +251,11 @@ test_find_local_assets() {
   assert_equal "$root/lower/mihomo-linux-amd64-v1.20.1.gz" "$LOCAL_MIHOMO_SOURCE" "highest amd64 version" || return 1
   assert_equal "$root/lower/country.mmdb" "$LOCAL_COUNTRY_MMDB" "lowercase country database" || return 1
   assert_equal "$root/lower/geosite.dat" "$LOCAL_GEOSITE_DAT" "lowercase geosite database" || return 1
+  assert_equal "$root/lower/yq_linux_amd64" "$LOCAL_YQ_SOURCE" "yq binary" || return 1
 
   printf 'country\n' >"$root/upper/Country.mmdb"
   printf 'geosite\n' >"$root/upper/GeoSite.dat"
+  printf 'yq\n' >"$root/upper/yq_linux_amd64"
   : >"$root/upper/mihomo-linux-amd64-v2.0.0.gz"
 
   find_local_assets "$root/upper" || {
@@ -238,6 +270,7 @@ test_find_local_assets() {
   printf 'plain-mihomo\n' >"$root/plain/mihomo"
   printf 'country\n' >"$root/plain/country.mmdb"
   printf 'geosite\n' >"$root/plain/geosite.dat"
+  printf 'yq\n' >"$root/plain/yq_linux_amd64"
   printf 'compressed-mihomo\n' | gzip >"$root/plain/mihomo-linux-amd64-v9.9.9.gz"
   find_local_assets "$root/plain" || {
     fail "uncompressed Mihomo asset was not detected"
@@ -252,6 +285,7 @@ test_find_local_assets() {
 
   printf 'country\n' >"$root/wrong-arch/country.mmdb"
   printf 'geosite\n' >"$root/wrong-arch/geosite.dat"
+  printf 'yq\n' >"$root/wrong-arch/yq_linux_amd64"
   : >"$root/wrong-arch/mihomo-linux-arm64-v3.0.0.gz"
   : >"$root/wrong-arch/mihomo-linux-amd64-v3.0.gz"
 
@@ -1078,14 +1112,14 @@ test_custom_region_group_rendering() {
   }
 
   apply_region_groups_to_config "$input_file" "$output_file" "$state_file" || return 1
-  assert_file_has_line "$output_file" '  - name: "MiPilot-亚洲优选"' "custom group definition" || return 1
+  assert_yaml_equal "$output_file" '."proxy-groups"[] | select(.name == "MiPilot-亚洲优选") | .type' fallback "custom group definition" || return 1
   if grep -Fq '      - "MiPilot-亚洲优选"' "$output_file"; then
     fail "custom group was nested under a subscription selector"
     return 1
   fi
-  assert_file_has_line "$output_file" '    type: fallback' "custom group fallback type" || return 1
-  assert_file_has_line "$output_file" '    type: select' "custom group manual selection type" || return 1
-  assert_file_has_line "$output_file" '    type: url-test' "legacy group automatic selection type" || return 1
+  assert_yaml_equal "$output_file" '."proxy-groups"[] | select(.name == "MiPilot-亚洲优选") | .type' fallback "custom group fallback type" || return 1
+  assert_yaml_equal "$output_file" '."proxy-groups"[] | select(.name == "MiPilot-日本手动") | .type' select "custom group manual selection type" || return 1
+  assert_yaml_equal "$output_file" '."proxy-groups"[] | select(.name == "MiPilot-旧版自动") | .type' url-test "legacy group automatic selection type" || return 1
   grep -Fq '日本|Japan|JP|新加坡|Singapore|SG' "$output_file" || fail "custom group combined filter was missing"
 }
 
@@ -1189,17 +1223,17 @@ test_direct_rule_strategy_rendering() {
   }
 
   apply_rule_selector_to_config "$input_file" "$output_file" Proxy || return 1
-  assert_file_has_line "$output_file" '  - name: "MiPilot-规则选择"' "MiPilot rule selector definition" || return 1
-  assert_file_has_line "$output_file" '      - "Proxy"' "subscription strategy selector member" || return 1
-  assert_file_has_line "$output_file" '      - "MiPilot-日本"' "custom strategy selector member" || return 1
-  assert_file_has_line "$output_file" '  - DOMAIN-SUFFIX,example.com,"MiPilot-规则选择" # keep' "quoted rule selector target" || return 1
-  assert_file_has_line "$output_file" '  - IP-CIDR,1.1.1.1/32,MiPilot-规则选择,no-resolve' "no-resolve rule selector target" || return 1
-  assert_file_has_line "$output_file" '  - DOMAIN-SUFFIX,internal.example,DIRECT' "DIRECT rule preserved" || return 1
-  assert_file_has_line "$output_file" '  - DOMAIN-SUFFIX,blocked.example,REJECT' "REJECT rule preserved" || return 1
-  assert_file_has_line "$output_file" '  - MATCH,MiPilot-规则选择' "MATCH rule selector target" || return 1
+  assert_yaml_equal "$output_file" '."proxy-groups"[] | select(.name == "MiPilot-规则选择") | .type' select "MiPilot rule selector definition" || return 1
+  assert_yaml_equal "$output_file" '."proxy-groups"[] | select(.name == "MiPilot-规则选择") | .proxies[] | select(. == "Proxy")' Proxy "subscription strategy selector member" || return 1
+  assert_yaml_equal "$output_file" '."proxy-groups"[] | select(.name == "MiPilot-规则选择") | .proxies[] | select(. == "MiPilot-日本")' 'MiPilot-日本' "custom strategy selector member" || return 1
+  assert_yaml_equal "$output_file" '.rules[0]' 'DOMAIN-SUFFIX,example.com,MiPilot-规则选择' "quoted rule selector target" || return 1
+  assert_yaml_equal "$output_file" '.rules[1]' 'IP-CIDR,1.1.1.1/32,MiPilot-规则选择,no-resolve' "no-resolve rule selector target" || return 1
+  assert_yaml_equal "$output_file" '.rules[2]' 'DOMAIN-SUFFIX,internal.example,DIRECT' "DIRECT rule preserved" || return 1
+  assert_yaml_equal "$output_file" '.rules[3]' 'DOMAIN-SUFFIX,blocked.example,REJECT' "REJECT rule preserved" || return 1
+  assert_yaml_equal "$output_file" '.rules[4]' 'MATCH,MiPilot-规则选择' "MATCH rule selector target" || return 1
   apply_rule_selector_to_config "$output_file" "$second_output" Proxy || return 1
-  assert_line_count "$second_output" '  - name: "MiPilot-规则选择"' 1 "idempotent MiPilot rule selector" || return 1
-  assert_file_has_line "$second_output" '  - MATCH,MiPilot-规则选择' "idempotent rule selector target"
+  assert_yaml_equal "$second_output" '[."proxy-groups"[] | select(.name == "MiPilot-规则选择")] | length' 1 "idempotent MiPilot rule selector" || return 1
+  assert_yaml_equal "$second_output" '.rules[4]' 'MATCH,MiPilot-规则选择' "idempotent rule selector target"
 }
 
 test_rule_selector_selection_restore() {
@@ -1336,20 +1370,20 @@ test_custom_region_group_without_subscription_groups() {
   }
 
   apply_region_groups_to_config "$input_file" "$output_file" "$state_file" || return 1
-  assert_file_has_line "$output_file" '  - name: "MiPilot-日本优选"' "standalone custom group definition" || return 1
+  assert_yaml_equal "$output_file" '."proxy-groups"[] | select(.name == "MiPilot-日本优选") | .type' url-test "standalone custom group definition" || return 1
   assert_file_has_line "$output_file" '  - GEOIP,CN,DIRECT' "preserved direct rule" || return 1
   assert_file_has_line "$output_file" '  - MATCH,DIRECT' "preserved match rule" || return 1
   apply_rule_selector_to_config "$output_file" "$with_selector" DIRECT || return 1
-  assert_file_has_line "$with_selector" '  - name: "MiPilot-规则选择"' "standalone MiPilot rule selector" || return 1
-  assert_file_has_line "$with_selector" '      - "MiPilot-日本优选"' "standalone custom strategy selector member" || return 1
-  assert_file_has_line "$with_selector" '      - "DIRECT"' "standalone original rule fallback member" || return 1
-  assert_file_has_line "$with_selector" '  - MATCH,MiPilot-规则选择' "standalone rule selector target" || return 1
+  assert_yaml_equal "$with_selector" '."proxy-groups"[] | select(.name == "MiPilot-规则选择") | .type' select "standalone MiPilot rule selector" || return 1
+  assert_yaml_equal "$with_selector" '."proxy-groups"[] | select(.name == "MiPilot-规则选择") | .proxies[] | select(. == "MiPilot-日本优选")' 'MiPilot-日本优选' "standalone custom strategy selector member" || return 1
+  assert_yaml_equal "$with_selector" '."proxy-groups"[] | select(.name == "MiPilot-规则选择") | .proxies[] | select(. == "DIRECT")' DIRECT "standalone original rule fallback member" || return 1
+  assert_yaml_equal "$with_selector" '.rules[-1]' 'MATCH,MiPilot-规则选择' "standalone rule selector target" || return 1
   apply_rule_selector_to_config "$output_file" "$stale_parent_selector" OldParent || return 1
   if grep -Fq 'OldParent' "$stale_parent_selector"; then
     fail "stale missing rule parent was added to MiPilot rule selector"
     return 1
   fi
-  assert_file_has_line "$stale_parent_selector" '      - "DIRECT"' "stale-parent current rule fallback member"
+  assert_yaml_equal "$stale_parent_selector" '."proxy-groups"[] | select(.name == "MiPilot-规则选择") | .proxies[] | select(. == "DIRECT")' DIRECT "stale-parent current rule fallback member"
 }
 
 test_empty_inline_proxy_groups_rule_selector_rendering() {
@@ -1375,9 +1409,85 @@ test_empty_inline_proxy_groups_rule_selector_rendering() {
 
   apply_rule_selector_to_config "$input_file" "$output_file" 'MiPilot-规则出口' || return 1
   assert_file_has_line "$output_file" 'proxy-groups:' "expanded empty proxy groups" || return 1
-  assert_file_has_line "$output_file" '  - name: "MiPilot-规则选择"' "initial rule selector definition" || return 1
-  assert_file_has_line "$output_file" '      - "DIRECT"' "initial direct selector member" || return 1
-  assert_file_has_line "$output_file" '  - MATCH,MiPilot-规则选择' "initial rule selector target"
+  assert_yaml_equal "$output_file" '."proxy-groups"[] | select(.name == "MiPilot-规则选择") | .type' select "initial rule selector definition" || return 1
+  assert_yaml_equal "$output_file" '."proxy-groups"[] | select(.name == "MiPilot-规则选择") | .proxies[] | select(. == "DIRECT")' DIRECT "initial direct selector member" || return 1
+  assert_yaml_equal "$output_file" '.rules[-1]' 'MATCH,MiPilot-规则选择' "initial rule selector target"
+}
+
+test_indentless_proxy_groups_rule_selector_rendering() {
+  local root
+  local input_file
+  local output_file
+  local second_output
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  input_file="$root/input.yaml"
+  output_file="$root/output.yaml"
+  second_output="$root/output-second.yaml"
+  printf '%s\n' \
+    'proxy-groups:' \
+    '- name: Proxy' \
+    '  type: select' \
+    '  proxies:' \
+    '  - DIRECT' \
+    'rules:' \
+    '- MATCH,Proxy' >"$input_file"
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+
+  apply_rule_selector_to_config "$input_file" "$output_file" Proxy || return 1
+  assert_yaml_equal "$output_file" '."proxy-groups"[] | select(.name == "MiPilot-规则选择") | .type' select "indentless rule selector definition" || return 1
+  assert_yaml_equal "$output_file" '.rules[-1]' 'MATCH,MiPilot-规则选择' "indentless rule selector target" || return 1
+  apply_rule_selector_to_config "$output_file" "$second_output" Proxy || return 1
+  assert_yaml_equal "$second_output" '[."proxy-groups"[] | select(.name == "MiPilot-规则选择")] | length' 1 "idempotent indentless rule selector"
+}
+
+test_structured_yaml_subscription_variants() {
+  local root
+  local input_file
+  local grouped_file
+  local output_file
+  local state_file
+  local malformed_file
+  local malformed_output
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  input_file="$root/input.yaml"
+  grouped_file="$root/grouped.yaml"
+  output_file="$root/output.yaml"
+  state_file="$root/regions.state"
+  malformed_file="$root/malformed.yaml"
+  malformed_output="$root/malformed-output.yaml"
+  printf '%s\n' \
+    'defaults: &defaults {type: select, proxies: [DIRECT]}' \
+    'proxy-groups: [{name: "Proxy: #1", <<: *defaults}]' \
+    'rules: ["DOMAIN-SUFFIX,example.com,Proxy: #1", "MATCH,Proxy: #1"]' >"$input_file"
+  printf '%s\n' 'jp;MiPilot-日本优选;日本|Japan|JP;fallback' >"$state_file"
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+
+  apply_region_groups_to_config "$input_file" "$grouped_file" "$state_file" || return 1
+  region_group_rules_current "$grouped_file" "$state_file" || return 1
+  assert_yaml_equal "$grouped_file" '."proxy-groups"[] | select(.name == "Proxy: #1") | .type' select "flow-map subscription group" || return 1
+  assert_yaml_equal "$grouped_file" '."proxy-groups"[] | select(.name == "MiPilot-日本优选") | .type' fallback "structured custom group" || return 1
+
+  apply_rule_selector_to_config "$grouped_file" "$output_file" 'Proxy: #1' || return 1
+  assert_yaml_equal "$output_file" '."proxy-groups"[] | select(.name == "MiPilot-规则选择") | .proxies[] | select(. == "Proxy: #1")' 'Proxy: #1' "special-character selector member" || return 1
+  assert_yaml_equal "$output_file" '.rules[-1]' 'MATCH,MiPilot-规则选择' "inline rule list update" || return 1
+
+  printf '%s\n' 'proxy-groups: [{name: broken' >"$malformed_file"
+  if apply_region_groups_to_config "$malformed_file" "$malformed_output" "$state_file" >/dev/null 2>&1; then
+    fail "malformed YAML unexpectedly accepted"
+    return 1
+  fi
 }
 
 test_region_group_strategy_refresh() {
@@ -1411,9 +1521,9 @@ test_region_group_strategy_refresh() {
   }
 
   refresh_saved_region_definitions "$input_file" "$output_file" "$state_file" || return 1
-  assert_file_has_line "$output_file" '    type: fallback' "updated managed group type" || return 1
-  assert_file_has_line "$output_file" '    interval: 300' "updated fallback interval" || return 1
-  if grep -Fq 'tolerance:' "$output_file"; then
+  assert_yaml_equal "$output_file" '."proxy-groups"[] | select(.name == "MiPilot-日本") | .type' fallback "updated managed group type" || return 1
+  assert_yaml_equal "$output_file" '."proxy-groups"[] | select(.name == "MiPilot-日本") | .interval' 300 "updated fallback interval" || return 1
+  if [[ $("$MIPILOT_YQ_BIN" eval -r '."proxy-groups"[] | select(.name == "MiPilot-日本") | .tolerance // ""' "$output_file") != "" ]]; then
     fail "fallback group retained URLTest tolerance"
     return 1
   fi
@@ -1512,7 +1622,7 @@ test_managed_outlet_keeps_subscription_groups() {
 
   apply_region_groups_to_config "$input_file" "$output_file" "$state_file" || return 1
   assert_file_has_line "$output_file" '  - name: "订阅自动选择"' "subscription group preserved" || return 1
-  assert_file_has_line "$output_file" '  - name: "MiPilot-日本优选"' "custom group added at same level" || return 1
+  assert_yaml_equal "$output_file" '."proxy-groups"[] | select(.name == "MiPilot-日本优选") | .type' url-test "custom group added at same level" || return 1
   assert_file_has_line "$output_file" '  - MATCH,订阅自动选择' "subscription rule target preserved"
 }
 
@@ -1847,6 +1957,7 @@ test_online_manager_update_and_rollback() {
   local root
   local release_script
   local release_sidecar
+  local release_yq
   local hash
 
   root="$(make_temp_dir)" || return 1
@@ -1855,6 +1966,7 @@ test_online_manager_update_and_rollback() {
   MANAGER_VERSION="1.0.0-dev"
   MANAGER_LIB_DIR="$root/usr/local/lib/mipilot"
   MANAGER_INSTALLED_SCRIPT="$MANAGER_LIB_DIR/mipilot"
+  YQ_BIN="$MANAGER_LIB_DIR/yq"
   INSTALL_MARKER="$root/var/lib/mipilot/install-marker"
   ROLLBACK_DIR="$root/var/lib/mipilot/rollback"
   mkdir -p -- "$MANAGER_LIB_DIR" "$(dirname -- "$INSTALL_MARKER")"
@@ -1864,6 +1976,7 @@ test_online_manager_update_and_rollback() {
 
   release_script="$root/release-mipilot"
   release_sidecar="$root/release-mipilot.sha256"
+  release_yq="${MIPILOT_YQ_BIN:?test yq path is required}"
   printf '%s\n' \
     '#!/usr/bin/env bash' \
     'MANAGER_VERSION="1.0.0"' \
@@ -1875,6 +1988,7 @@ test_online_manager_update_and_rollback() {
     case "$1" in
       */mipilot) cp -- "$release_script" "$2" ;;
       */mipilot.sha256) cp -- "$release_sidecar" "$2" ;;
+      */yq_linux_amd64) cp -- "$release_yq" "$2" ;;
       *) return 1 ;;
     esac
   }
@@ -1901,9 +2015,17 @@ test_online_manager_update_and_rollback() {
   systemctl() {
     return 0
   }
+  sync_mipilot_config_from_state() {
+    return 0
+  }
+  installed_runtime_mode() {
+    printf 'manual\n'
+  }
+  YQ_LINUX_AMD64_SHA256="$(sha256sum "$release_yq" | awk '{print $1}')"
 
   online_update_manager || return 1
   grep -Fq 'MANAGER_VERSION="1.0.0"' "$MANAGER_INSTALLED_SCRIPT" || fail "manager update did not install candidate"
+  [[ -x $YQ_BIN ]] || fail "manager update did not install yq"
   grep -Fq 'MANAGER_VERSION="1.0.0-dev"' "$ROLLBACK_DIR/manager/mipilot" || fail "manager rollback copy was not saved"
   assert_equal "1" "$MANAGER_SHOULD_EXIT" "manager update exit flag" || return 1
 
@@ -1915,6 +2037,7 @@ test_online_manager_update_and_rollback() {
 
 test_subscription_activation_marker_rollback() {
   local root
+  local output
   local status=0
 
   root="$(make_temp_dir)" || return 1
@@ -1933,11 +2056,15 @@ test_subscription_activation_marker_rollback() {
     return 1
   }
 
-  activate_subscription 'https://new.example/sub' >/dev/null 2>&1 || status=$?
+  output="$(activate_subscription 'https://new.example/sub' 2>&1)" || status=$?
   [[ $status -ne 0 ]] || {
     fail "failed subscription activation unexpectedly succeeded"
     return 1
   }
+  if [[ $output == *'已设为当前激活订阅.'* ]]; then
+    fail "failed subscription activation reported success"
+    return 1
+  fi
   assert_equal 'https://old.example/sub' "$(head -n 1 "$SUBSCRIPTION_FILE")" "active subscription marker rollback" || return 1
 }
 
@@ -2117,7 +2244,7 @@ test_stale_saved_parent_is_ignored() {
   assert_equal 'OldParent' "$REGION_PARENT" "saved original rule parent remains available after direct selection"
 }
 
-test_inline_rules_rejected_for_managed_outlet() {
+test_inline_rules_supported_for_managed_outlet() {
   local root
   local input_file
   local output_file
@@ -2135,10 +2262,8 @@ test_inline_rules_rejected_for_managed_outlet() {
     run_as_mock_sudo "$@"
   }
 
-  if render_rule_strategy_selection "$input_file" "$output_file" DIRECT Proxy >/dev/null 2>&1; then
-    fail "inline rules unexpectedly accepted"
-    return 1
-  fi
+  render_rule_strategy_selection "$input_file" "$output_file" DIRECT Proxy || return 1
+  assert_yaml_equal "$output_file" '.rules[0]' 'MATCH,Proxy' "structured inline rule update"
 }
 
 test_region_metadata_restored_when_config_commit_fails() {
@@ -2414,6 +2539,8 @@ run_test "custom region group rendering" test_custom_region_group_rendering
 run_test "rule mode managed-group selection" test_rule_mode_selects_managed_group
 run_test "MiPilot rule selector rendering" test_direct_rule_strategy_rendering
 run_test "empty inline proxy groups rule selector rendering" test_empty_inline_proxy_groups_rule_selector_rendering
+run_test "indentless proxy groups rule selector rendering" test_indentless_proxy_groups_rule_selector_rendering
+run_test "structured YAML subscription variants" test_structured_yaml_subscription_variants
 run_test "MiPilot rule selector selection restore" test_rule_selector_selection_restore
 run_test "dynamic region parent selection" test_dynamic_region_parent_selection
 run_test "unreferenced selector falls back to managed outlet" test_unreferenced_selector_uses_managed_rule_outlet
@@ -2440,7 +2567,7 @@ run_test "uninstall stop-before-delete guard" test_uninstall_stops_before_delete
 run_test "rule policy parsing edge cases" test_rule_policy_parsing_edges
 run_test "multiple rule selectors require explicit choice" test_multiple_rule_selectors_require_choice
 run_test "stale saved rule parent ignored" test_stale_saved_parent_is_ignored
-run_test "inline rules rejected for managed outlet" test_inline_rules_rejected_for_managed_outlet
+run_test "inline rules supported for managed outlet" test_inline_rules_supported_for_managed_outlet
 run_test "region metadata rollback on config failure" test_region_metadata_restored_when_config_commit_fails
 run_test "TUN state failure preserves config" test_tun_state_failure_preserves_config
 run_test "TUN restart failure restores state" test_tun_restart_failure_restores_state

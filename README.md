@@ -24,7 +24,7 @@ cd mipilot-v1.0.1
 bash ./mipilot
 ```
 
-完整离线包解压后就是可直接安装的完整项目目录, 包含管理脚本、测试文件、许可证、Mihomo上游原始资产 `mihomo-linux-amd64-v1.19.30.gz`、`country.mmdb` 和 `geosite.dat`。首次安装这些组件不需要访问GitHub。
+完整离线包解压后就是可直接安装的完整项目目录, 包含管理脚本、测试文件、许可证、Mihomo上游原始资产 `mihomo-linux-amd64-v1.19.30.gz`、`country.mmdb`、`geosite.dat` 和 yq v4.53.3。首次安装这些组件不需要访问GitHub。
 
 ### 克隆源码安装
 
@@ -33,22 +33,23 @@ git clone https://github.com/HaiJaine/mipilot.git
 cd mipilot
 ```
 
-从可信设备下载以下 3 个文件, 再复制到 `mipilot` 项目根目录:
+从可信设备下载以下 4 个文件, 再复制到 `mipilot` 项目根目录:
 
 ```text
 country.mmdb
 geosite.dat
 mihomo-linux-amd64-v1.19.30.gz
+yq_linux_amd64
 ```
 
-确认 3 个文件与脚本位于同一目录:
+确认 4 个文件与脚本位于同一目录:
 
 ```bash
-ls -lh mipilot country.mmdb geosite.dat mihomo-linux-amd64-v1.19.30.gz
+ls -lh mipilot country.mmdb geosite.dat mihomo-linux-amd64-v1.19.30.gz yq_linux_amd64
 bash ./mipilot
 ```
 
-Git仓库不会提交这3个第三方大文件。它们可以从 [Mihomo v1.19.30](https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.30) 和 [meta-rules-dat Releases](https://github.com/MetaCubeX/meta-rules-dat/releases) 获取; GitHub无法访问时也可以在其他设备下载后传入服务器。
+Git仓库不会提交这4个第三方文件。它们可以从 [Mihomo v1.19.30](https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.30)、[meta-rules-dat Releases](https://github.com/MetaCubeX/meta-rules-dat/releases) 和 [yq v4.53.3](https://github.com/mikefarah/yq/releases/tag/v4.53.3) 获取; GitHub无法访问时也可以在其他设备下载后传入服务器。
 
 安装完成后执行:
 
@@ -76,6 +77,7 @@ mipilot
 country.mmdb
 geosite.dat
 mihomo-linux-amd64-v1.19.30.gz
+yq_linux_amd64
 ```
 
 文件用途:
@@ -85,6 +87,7 @@ mihomo-linux-amd64-v1.19.30.gz
 | `mihomo-linux-amd64-v1.19.30.gz` | `/usr/local/bin/mihomo` | 完整离线包内置的上游原始资产, 安装时校验并解压 |
 | `country.mmdb` | `/etc/mihomo/Country.mmdb` | [MetaCubeX/meta-rules-dat Releases](https://github.com/MetaCubeX/meta-rules-dat/releases) |
 | `geosite.dat` | `/etc/mihomo/GeoSite.dat` | [MetaCubeX/meta-rules-dat Releases](https://github.com/MetaCubeX/meta-rules-dat/releases) |
+| `yq_linux_amd64` | `/usr/local/lib/mipilot/yq` | [mikefarah/yq v4.53.3](https://github.com/mikefarah/yq/releases/tag/v4.53.3), 仅供MiPilot内部结构化处理YAML |
 
 以普通用户执行脚本, 并按提示授权 `sudo`:
 

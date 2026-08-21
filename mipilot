@@ -36,6 +36,9 @@ BACKUP_DIR="${CONFIG_DIR}/backups"
 BACKUP_LIMIT=3
 MANAGER_LIB_DIR="${MIPILOT_LIB_DIR:-/usr/local/lib/mipilot}"
 MANAGER_INSTALLED_SCRIPT="${MANAGER_LIB_DIR}/mipilot"
+YQ_VERSION="4.53.3"
+YQ_BIN="${MIPILOT_YQ_BIN:-${MANAGER_LIB_DIR}/yq}"
+YQ_LINUX_AMD64_SHA256="fa52a4e758c63d38299163fbdd1edfb4c4963247918bf9c1c5d31d84789eded4"
 MANAGER_COMMAND="${MIPILOT_COMMAND:-/usr/local/bin/mipilot}"
 MIHOMO_BIN="${MIPILOT_MIHOMO_BIN:-/usr/local/bin/mihomo}"
 SERVICE_FILE="${MIPILOT_SERVICE_FILE:-/etc/systemd/system/mihomo.service}"
@@ -2440,190 +2443,85 @@ region_exclude_pattern() {
   printf '%s\n' '剩余流量|流量剩余|到期时间|过期时间|套餐到期|重置时间|流量重置|Traffic|Expire|Expiration|Bandwidth|Reset'
 }
 
+yaml_processor_available() {
+  [[ -x $YQ_BIN ]] && "$YQ_BIN" --version 2>/dev/null | grep -Fq "version v${YQ_VERSION}"
+}
+
 config_has_group() {
   local config_file="$1"
   local group_name="$2"
 
-  sudo awk -v target="$group_name" '
-    function parse_group_name(text, value, quote) {
-      value = text
-      sub(/^[[:space:]]*-[[:space:]]*[{]?[[:space:]]*name[[:space:]]*:[[:space:]]*/, "", value)
-      quote = substr(value, 1, 1)
-      if (quote == "\"") {
-        sub(/^"/, "", value)
-        sub(/".*/, "", value)
-      } else if (quote == "\047") {
-        sub(/^\047/, "", value)
-        sub(/\047.*/, "", value)
-      } else {
-        sub(/[[:space:]]*[,}#].*$/, "", value)
-        sub(/[[:space:]]+$/, "", value)
-      }
-      return value
-    }
-
-    /^proxy-groups:[[:space:]]*$/ { in_groups = 1; next }
-    in_groups && /^[^[:space:]#][^:]*:/ { exit }
-    in_groups && /^[[:space:]]*-[[:space:]]*([{][[:space:]]*)?name[[:space:]]*:/ {
-      if (parse_group_name($0) == target) {
-        found = 1
-        exit
-      }
-    }
-    END { exit(found ? 0 : 1) }
-  ' "$config_file"
+  yaml_processor_available || return 1
+  sudo env MIPILOT_GROUP_NAME="$group_name" "$YQ_BIN" --yaml-fix-merge-anchor-to-spec eval -r \
+    '.["proxy-groups"][]? | select(.name == strenv(MIPILOT_GROUP_NAME)) | .name' \
+    "$config_file" | grep -Fqx -- "$group_name"
 }
 
 list_config_group_names() {
   local config_file="$1"
 
-  sudo awk '
-    function parse_group_name(text, value, quote) {
-      value = text
-      sub(/^[[:space:]]*-[[:space:]]*[{]?[[:space:]]*name[[:space:]]*:[[:space:]]*/, "", value)
-      quote = substr(value, 1, 1)
-      if (quote == "\"") {
-        sub(/^"/, "", value)
-        sub(/".*/, "", value)
-      } else if (quote == "\047") {
-        sub(/^\047/, "", value)
-        sub(/\047.*/, "", value)
-      } else {
-        sub(/[[:space:]]*[,}#].*$/, "", value)
-        sub(/[[:space:]]+$/, "", value)
-      }
-      return value
-    }
-
-    /^proxy-groups:[[:space:]]*$/ { in_groups = 1; next }
-    in_groups && /^[^[:space:]#][^:]*:/ { exit }
-    in_groups && /^[[:space:]]*-[[:space:]]*([{][[:space:]]*)?name[[:space:]]*:/ {
-      name = parse_group_name($0)
-      if (name != "") print name
-    }
-  ' "$config_file"
+  yaml_processor_available || return 1
+  sudo "$YQ_BIN" --yaml-fix-merge-anchor-to-spec eval -r '.["proxy-groups"][]?.name // ""' "$config_file" | sed '/^$/d'
 }
 
 list_config_selector_names() {
   local config_file="$1"
 
-  sudo awk '
-    function parse_group_name(text, value, quote) {
-      value = text
-      sub(/^[[:space:]]*-[[:space:]]*[{]?[[:space:]]*name[[:space:]]*:[[:space:]]*/, "", value)
-      quote = substr(value, 1, 1)
-      if (quote == "\"") {
-        sub(/^"/, "", value)
-        sub(/".*/, "", value)
-      } else if (quote == "\047") {
-        sub(/^\047/, "", value)
-        sub(/\047.*/, "", value)
-      } else {
-        sub(/[[:space:]]*[,}#].*$/, "", value)
-        sub(/[[:space:]]+$/, "", value)
-      }
-      return value
-    }
-
-    function finish_group() {
-      if (group_name != "" && group_type == "select") print group_name
-      group_name = ""
-      group_type = ""
-    }
-
-    /^proxy-groups:[[:space:]]*$/ { in_groups = 1; next }
-    in_groups && /^[^[:space:]#][^:]*:/ { finish_group(); exit }
-    in_groups && /^[[:space:]]*-[[:space:]]*([{][[:space:]]*)?name[[:space:]]*:/ {
-      finish_group()
-      group_name = parse_group_name($0)
-      if ($0 ~ /type[[:space:]]*:[[:space:]]*select([[:space:],}]|$)/) group_type = "select"
-      next
-    }
-    in_groups && group_name != "" && /^[[:space:]]+type[[:space:]]*:[[:space:]]*/ {
-      value = $0
-      sub(/^[[:space:]]+type[[:space:]]*:[[:space:]]*/, "", value)
-      sub(/[[:space:]#].*$/, "", value)
-      group_type = tolower(value)
-    }
-    END { if (in_groups) finish_group() }
-  ' "$config_file"
+  yaml_processor_available || return 1
+  sudo "$YQ_BIN" --yaml-fix-merge-anchor-to-spec eval -r \
+    '.["proxy-groups"][]? | select((.type // "") == "select") | .name // ""' \
+    "$config_file" | sed '/^$/d'
 }
 
 list_config_rule_policy_names() {
   local config_file="$1"
 
-  sudo awk '
-    function trim(value) {
-      sub(/^[[:space:]"\047]+/, "", value)
-      sub(/[[:space:]"\047]+$/, "", value)
-      return value
-    }
-
-    /^rules:[[:space:]]*(#.*)?$/ { in_rules = 1; next }
-    in_rules && /^[^[:space:]#][^:]*:/ { exit }
-    in_rules && /^[[:space:]]*-[[:space:]]*/ {
-      line = $0
-      sub(/^[[:space:]]*-[[:space:]]*/, "", line)
-      sub(/[[:space:]]+#.*$/, "", line)
-      line = trim(line)
-      count = split(line, fields, ",")
-      if (count < 2) next
-      policy_index = count
-      if (tolower(trim(fields[count])) == "no-resolve") policy_index--
-      policy = trim(fields[policy_index])
-      if (policy != "" && policy != "DIRECT" && policy != "REJECT" && policy != "PASS") print policy
-    }
+  yaml_processor_available || return 1
+  sudo "$YQ_BIN" --yaml-fix-merge-anchor-to-spec eval -r '
+    .["rules"][]?
+    | select(tag == "!!str")
+    | split(",")
+    | (
+        (select((.[-1] | downcase | sub("^\\s+|\\s+$"; "")) == "no-resolve") | .[-2]),
+        (select((.[-1] | downcase | sub("^\\s+|\\s+$"; "")) != "no-resolve") | .[-1])
+      )
+    | sub("^\\s+|\\s+$"; "")
+    | sub("^[\"\\x27]|[\"\\x27]$"; "")
+    | select(. != "" and . != "DIRECT" and . != "REJECT" and . != "PASS")
   ' "$config_file"
 }
 
 config_match_policy() {
   local config_file="$1"
 
-  sudo awk '
-    function trim(value) {
-      sub(/^[[:space:]"\047]+/, "", value)
-      sub(/[[:space:]"\047]+$/, "", value)
-      return value
-    }
-
-    /^rules:[[:space:]]*(#.*)?$/ { in_rules = 1; next }
-    in_rules && /^[^[:space:]#][^:]*:/ { exit }
-    in_rules && /^[[:space:]]*-[[:space:]]*["\047]?MATCH[[:space:]]*,/ {
-      line = $0
-      sub(/^[[:space:]]*-[[:space:]]*/, "", line)
-      sub(/[[:space:]]+#.*$/, "", line)
-      count = split(line, fields, ",")
-      if (count >= 2) policy = trim(fields[2])
-    }
-    END { if (policy != "") print policy }
-  ' "$config_file"
+  yaml_processor_available || return 1
+  sudo "$YQ_BIN" --yaml-fix-merge-anchor-to-spec eval -r '
+    .["rules"][]?
+    | select(tag == "!!str")
+    | select(test("^\\s*MATCH\\s*,"))
+    | split(",")[1]
+    | sub("^\\s+|\\s+$"; "")
+    | sub("^[\"\\x27]|[\"\\x27]$"; "")
+  ' "$config_file" | tail -n 1
 }
 
 config_rules_reference_policy() {
   local config_file="$1"
   local target="$2"
 
-  sudo awk -v target="$target" '
-    function trim(value) {
-      sub(/^[[:space:]"\047]+/, "", value)
-      sub(/[[:space:]"\047]+$/, "", value)
-      return value
-    }
-
-    /^rules:[[:space:]]*(#.*)?$/ { in_rules = 1; next }
-    in_rules && /^[^[:space:]#][^:]*:/ { exit }
-    in_rules && /^[[:space:]]*-[[:space:]]*/ {
-      line = $0
-      sub(/^[[:space:]]*-[[:space:]]*/, "", line)
-      sub(/[[:space:]]+#.*$/, "", line)
-      count = split(line, fields, ",")
-      if (count < 2) next
-      policy_index = count
-      if (tolower(trim(fields[count])) == "no-resolve") policy_index--
-      if (trim(fields[policy_index]) == target) found = 1
-    }
-    END { exit(found ? 0 : 1) }
-  ' "$config_file"
+  yaml_processor_available || return 1
+  sudo env MIPILOT_POLICY_NAME="$target" "$YQ_BIN" --yaml-fix-merge-anchor-to-spec eval -r '
+    .["rules"][]?
+    | select(tag == "!!str")
+    | split(",")
+    | (
+        (select((.[-1] | downcase | sub("^\\s+|\\s+$"; "")) == "no-resolve") | .[-2]),
+        (select((.[-1] | downcase | sub("^\\s+|\\s+$"; "")) != "no-resolve") | .[-1])
+      )
+    | sub("^\\s+|\\s+$"; "")
+    | sub("^[\"\\x27]|[\"\\x27]$"; "")
+    | select(. == strenv(MIPILOT_POLICY_NAME))
+  ' "$config_file" | grep -Fqx -- "$target"
 }
 
 render_rule_strategy_selection() {
@@ -2634,71 +2532,27 @@ render_rule_strategy_selection() {
 
   [[ -n $source_policy && -n $selected_group ]] || return 1
   [[ $source_policy != *','* && $selected_group != *','* ]] || return 1
+  yaml_processor_available || return 1
+  if [[ $source_policy != "$selected_group" ]] && ! config_rules_reference_policy "$input_file" "$source_policy"; then
+    echo "规则中找不到当前策略目标 ${source_policy}, 未修改文件." >&2
+    return 1
+  fi
   # The input needs sudo; the caller-owned output path intentionally does not.
   # shellcheck disable=SC2024
-  sudo awk -v source="$source_policy" -v selected="$selected_group" '
-    function trim(value) {
-      sub(/^[[:space:]"\047]+/, "", value)
-      sub(/[[:space:]"\047]+$/, "", value)
-      return value
-    }
-
-    function replace_policy(line, raw, value, leading, trailing, quote) {
-      raw = fields[policy_index]
-      value = raw
-      sub(/^[[:space:]]*/, "", value)
-      leading = substr(raw, 1, length(raw) - length(value))
-      value = raw
-      sub(/[[:space:]]*$/, "", value)
-      trailing = substr(raw, length(value) + 1)
-      value = trim(raw)
-      quote = ""
-      if (substr(raw, index(raw, value) - 1, 1) == "\"" || substr(raw, index(raw, value) - 1, 1) == "\047") {
-        quote = substr(raw, index(raw, value) - 1, 1)
-      }
-      fields[policy_index] = leading (quote == "" ? selected : quote selected quote) trailing
-      output = fields[1]
-      for (field_index = 2; field_index <= count; field_index++) output = output "," fields[field_index]
-      return prefix output comment
-    }
-
-    {
-      line = $0
-      if (line ~ /^rules:[[:space:]]*[^[:space:]#]/) inline_rules = 1
-      if (line ~ /^rules:[[:space:]]*(#.*)?$/) { in_rules = 1; print; next }
-      if (in_rules && line ~ /^[^[:space:]#][^:]*:/) in_rules = 0
-      if (!in_rules || line !~ /^[[:space:]]*-[[:space:]]*/) { print; next }
-
-      prefix = line
-      sub(/[^[:space:]].*$/, "", prefix)
-      sub(/^[[:space:]]*-[[:space:]]*/, "", line)
-      prefix = prefix "- "
-      comment = ""
-      comment_pos = index(line, " #")
-      if (comment_pos > 0) {
-        comment = substr(line, comment_pos)
-        line = substr(line, 1, comment_pos - 1)
-      }
-      count = split(line, fields, ",")
-      if (count < 2) { print $0; next }
-      policy_index = count
-      if (tolower(trim(fields[count])) == "no-resolve") policy_index--
-      if (trim(fields[policy_index]) == source) {
-        print replace_policy(line)
-        changed++
-      } else print $0
-    }
-    END {
-      if (inline_rules) {
-        print "不支持行内 rules 配置, 未修改文件." > "/dev/stderr"
-        exit 42
-      }
-      if (source != selected && changed == 0) {
-        print "规则中找不到当前策略目标 " source ", 未修改文件." > "/dev/stderr"
-        exit 42
-      }
-    }
-  ' "$input_file" >"$output_file"
+  sudo env MIPILOT_SOURCE_POLICY="$source_policy" MIPILOT_SELECTED_POLICY="$selected_group" \
+    "$YQ_BIN" --yaml-fix-merge-anchor-to-spec eval '
+      (.["rules"][]?
+        | select(tag == "!!str")
+        | select((split(",") | .[-1] | downcase | sub("^\\s+|\\s+$"; "")) == "no-resolve")
+        | select((split(",") | .[-2] | sub("^\\s+|\\s+$"; "") | sub("^[\"\\x27]|[\"\\x27]$"; "")) == strenv(MIPILOT_SOURCE_POLICY)))
+      |= (split(",") | .[-2] = strenv(MIPILOT_SELECTED_POLICY) | join(","))
+      |
+      (.["rules"][]?
+        | select(tag == "!!str")
+        | select((split(",") | .[-1] | downcase | sub("^\\s+|\\s+$"; "")) != "no-resolve")
+        | select((split(",") | .[-1] | sub("^\\s+|\\s+$"; "") | sub("^[\"\\x27]|[\"\\x27]$"; "")) == strenv(MIPILOT_SOURCE_POLICY)))
+      |= (split(",") | .[-1] = strenv(MIPILOT_SELECTED_POLICY) | join(","))
+    ' "$input_file" >"$output_file"
 }
 
 list_rule_selector_names() {
@@ -2714,68 +2568,14 @@ parent_group_has_child() {
   local parent_name="$2"
   local child_name="$3"
 
-  sudo awk -v parent="$parent_name" -v child="$child_name" '
-    function parse_group_name(text, value, quote) {
-      value = text
-      sub(/^[[:space:]]*-[[:space:]]*[{]?[[:space:]]*name[[:space:]]*:[[:space:]]*/, "", value)
-      quote = substr(value, 1, 1)
-      if (quote == "\"") {
-        sub(/^"/, "", value)
-        sub(/".*/, "", value)
-      } else if (quote == "\047") {
-        sub(/^\047/, "", value)
-        sub(/\047.*/, "", value)
-      } else {
-        sub(/[[:space:]]*[,}#].*$/, "", value)
-        sub(/[[:space:]]+$/, "", value)
-      }
-      return value
-    }
-
-    function trim(value) {
-      sub(/^[[:space:]"\047]+/, "", value)
-      sub(/[[:space:]"\047]+$/, "", value)
-      return value
-    }
-
-    function inline_has_child(line, body, count, fields, field_index) {
-      body = line
-      sub(/^.*proxies[[:space:]]*:[[:space:]]*\[/, "", body)
-      sub(/\].*$/, "", body)
-      count = split(body, fields, ",")
-      for (field_index = 1; field_index <= count; field_index++) {
-        if (trim(fields[field_index]) == child) return 1
-      }
-      return 0
-    }
-
-    /^proxy-groups:[[:space:]]*$/ { in_groups = 1; next }
-    in_groups && /^[^[:space:]#][^:]*:/ { exit }
-    in_groups && /^[[:space:]]*-[[:space:]]*([{][[:space:]]*)?name[[:space:]]*:/ {
-      in_parent = parse_group_name($0) == parent
-      in_proxies = 0
-      if (in_parent && $0 ~ /proxies[[:space:]]*:[[:space:]]*\[/ && inline_has_child($0)) found = 1
-    }
-    in_parent && /^[[:space:]]+proxies[[:space:]]*:/ {
-      in_proxies = 1
-      match($0, /^[[:space:]]*/)
-      proxies_indent = RLENGTH
-      if ($0 ~ /\[/ && inline_has_child($0)) found = 1
-      next
-    }
-    in_parent && in_proxies {
-      match($0, /^[[:space:]]*/)
-      if ($0 !~ /^[[:space:]]*($|#)/ && RLENGTH <= proxies_indent) {
-        in_proxies = 0
-      } else if ($0 ~ /^[[:space:]]*-[[:space:]]*/) {
-        value = $0
-        sub(/^[[:space:]]*-[[:space:]]*/, "", value)
-        sub(/[[:space:]]+#.*$/, "", value)
-        if (trim(value) == child) found = 1
-      }
-    }
-    END { exit(found ? 0 : 1) }
-  ' "$config_file"
+  yaml_processor_available || return 1
+  sudo env MIPILOT_PARENT_NAME="$parent_name" MIPILOT_CHILD_NAME="$child_name" \
+    "$YQ_BIN" --yaml-fix-merge-anchor-to-spec eval -r '
+      .["proxy-groups"][]?
+      | select(.name == strenv(MIPILOT_PARENT_NAME))
+      | .proxies[]?
+      | select(. == strenv(MIPILOT_CHILD_NAME))
+    ' "$config_file" | grep -Fqx -- "$child_name"
 }
 
 prepare_region_overlay() {
@@ -2788,9 +2588,12 @@ prepare_region_overlay() {
   local pattern
   local group_mode
   local exclude_pattern
+  local records_file
 
+  : "$config_file"
   : >"$refs_file"
-  : >"$definitions_file"
+  records_file="$(mktemp /tmp/mihomo-region-records.XXXXXX.json)" || return 1
+  : >"$records_file"
   exclude_pattern="$(region_exclude_pattern)"
 
   while IFS=';' read -r code name pattern group_mode; do
@@ -2800,651 +2603,36 @@ prepare_region_overlay() {
       url-test|fallback|load-balance|select) ;;
       *) group_mode="url-test" ;;
     esac
-
-    if ! config_has_group "$config_file" "$name"; then
-      {
-        printf '%s\n' "- name: \"${name}\""
-        printf '%s\n' "  type: ${group_mode}"
-        printf '%s\n' '  include-all-proxies: true'
-        printf '%s\n' "  filter: \"(?i)(${pattern})\""
-        printf '%s\n' "  exclude-filter: \"(?i)(${exclude_pattern})\""
-        case "$group_mode" in
-          url-test)
-            printf '%s\n' '  url: https://cp.cloudflare.com'
-            printf '%s\n' '  interval: 300'
-            printf '%s\n' '  tolerance: 50'
-            printf '%s\n' '  lazy: true'
-            printf '%s\n' '  expected-status: 200/204'
-            ;;
-          fallback)
-            printf '%s\n' '  url: https://cp.cloudflare.com'
-            printf '%s\n' '  interval: 300'
-            printf '%s\n' '  lazy: true'
-            printf '%s\n' '  expected-status: 200/204'
-            ;;
-          load-balance)
-            printf '%s\n' '  strategy: consistent-hashing'
-            printf '%s\n' '  url: https://cp.cloudflare.com'
-            printf '%s\n' '  interval: 300'
-            printf '%s\n' '  lazy: true'
-            printf '%s\n' '  expected-status: 200/204'
-            ;;
-        esac
-        printf '%s\n' '  empty-fallback: REJECT'
-      } >>"$definitions_file"
-    fi
-
+    jq -cn \
+      --arg name "$name" \
+      --arg type "$group_mode" \
+      --arg filter "(?i)(${pattern})" \
+      --arg exclude "(?i)(${exclude_pattern})" '
+        {
+          name: $name,
+          type: $type,
+          "include-all-proxies": true,
+          filter: $filter,
+          "exclude-filter": $exclude,
+          "empty-fallback": "REJECT"
+        }
+        + if $type == "select" then {} else {
+            url: "https://cp.cloudflare.com",
+            interval: 300,
+            lazy: true,
+            "expected-status": "200/204"
+          } end
+        + if $type == "url-test" then {tolerance: 50} else {} end
+        + if $type == "load-balance" then {strategy: "consistent-hashing"} else {} end
+      ' >>"$records_file" || {
+        rm -f -- "$records_file"
+        return 1
+      }
   done < <(sudo cat "$state_file")
-}
 
-refresh_saved_region_definitions() {
-  local input_file="$1"
-  local output_file="$2"
-  local state_file="$3"
-  local exclude_pattern
-
-  exclude_pattern="$(region_exclude_pattern)"
-  # The input needs sudo; the caller-owned output path intentionally does not.
-  # shellcheck disable=SC2024
-  sudo awk \
-    -v state_file="$state_file" \
-    -v exclude_pattern="$exclude_pattern" '
-      function parse_group_name(text, value, quote) {
-        value = text
-        sub(/^[[:space:]]*-[[:space:]]*[{]?[[:space:]]*name[[:space:]]*:[[:space:]]*/, "", value)
-        quote = substr(value, 1, 1)
-        if (quote == "\"") {
-          sub(/^"/, "", value)
-          sub(/".*/, "", value)
-        } else if (quote == "\047") {
-          sub(/^\047/, "", value)
-          sub(/\047.*/, "", value)
-        } else {
-          sub(/[[:space:]]*[,}#].*$/, "", value)
-          sub(/[[:space:]]+$/, "", value)
-        }
-        return value
-      }
-
-      function finish_managed_group() {
-        if (!managed) return
-        if (!type_written) print field_indent "type: " modes[current_group]
-        if (!filter_written) {
-          print field_indent "filter: \"(?i)(" patterns[current_group] ")\""
-        }
-        if (!exclude_written) {
-          print field_indent "exclude-filter: \"(?i)(" exclude_pattern ")\""
-        }
-        if (modes[current_group] != "select") {
-          if (!url_written) print field_indent "url: https://cp.cloudflare.com"
-          if (!interval_written) print field_indent "interval: 300"
-          if (!lazy_written) print field_indent "lazy: true"
-          if (!expected_status_written) print field_indent "expected-status: 200/204"
-        }
-        if (modes[current_group] == "url-test" && !tolerance_written) {
-          print field_indent "tolerance: 50"
-        }
-        if (modes[current_group] == "load-balance" && !strategy_written) {
-          print field_indent "strategy: consistent-hashing"
-        }
-        managed = 0
-      }
-
-      BEGIN {
-        while ((getline record < state_file) > 0) {
-          field_count = split(record, fields, ";")
-          if (field_count >= 3 && fields[2] != "" && fields[3] != "") {
-            patterns[fields[2]] = fields[3]
-            modes[fields[2]] = fields[4]
-            if (modes[fields[2]] != "url-test" && modes[fields[2]] != "fallback" &&
-                modes[fields[2]] != "load-balance" && modes[fields[2]] != "select") {
-              modes[fields[2]] = "url-test"
-            }
-          }
-        }
-        close(state_file)
-      }
-
-      {
-        line = $0
-
-        if (in_groups && line ~ /^[^[:space:]#][^:]*:/) {
-          finish_managed_group()
-          in_groups = 0
-        }
-
-        if (line ~ /^proxy-groups:[[:space:]]*$/) {
-          in_groups = 1
-          print line
-          next
-        }
-
-        if (in_groups && line ~ /^[[:space:]]*-[[:space:]]*([{][[:space:]]*)?name[[:space:]]*:/) {
-          finish_managed_group()
-          current_group = parse_group_name(line)
-          managed = current_group in patterns
-          type_written = 0
-          filter_written = 0
-          exclude_written = 0
-          url_written = 0
-          interval_written = 0
-          tolerance_written = 0
-          lazy_written = 0
-          expected_status_written = 0
-          strategy_written = 0
-          match(line, /^[[:space:]]*/)
-          field_indent = substr(line, RSTART, RLENGTH) "  "
-          if (managed && line ~ /[}][[:space:]]*$/) unsupported = 1
-          print line
-          next
-        }
-
-        if (managed && line ~ /^[[:space:]]+type[[:space:]]*:/) {
-          print field_indent "type: " modes[current_group]
-          type_written = 1
-          next
-        }
-
-        if (managed && line ~ /^[[:space:]]+filter[[:space:]]*:/) {
-          print field_indent "filter: \"(?i)(" patterns[current_group] ")\""
-          filter_written = 1
-          next
-        }
-
-        if (managed && line ~ /^[[:space:]]+exclude-filter[[:space:]]*:/) {
-          print field_indent "exclude-filter: \"(?i)(" exclude_pattern ")\""
-          exclude_written = 1
-          next
-        }
-
-        if (managed && line ~ /^[[:space:]]+url[[:space:]]*:/) {
-          if (modes[current_group] != "select") {
-            print field_indent "url: https://cp.cloudflare.com"
-            url_written = 1
-          }
-          next
-        }
-        if (managed && line ~ /^[[:space:]]+interval[[:space:]]*:/) {
-          if (modes[current_group] != "select") {
-            print field_indent "interval: 300"
-            interval_written = 1
-          }
-          next
-        }
-        if (managed && line ~ /^[[:space:]]+tolerance[[:space:]]*:/) {
-          if (modes[current_group] == "url-test") {
-            print field_indent "tolerance: 50"
-            tolerance_written = 1
-          }
-          next
-        }
-        if (managed && line ~ /^[[:space:]]+lazy[[:space:]]*:/) {
-          if (modes[current_group] != "select") {
-            print field_indent "lazy: true"
-            lazy_written = 1
-          }
-          next
-        }
-        if (managed && line ~ /^[[:space:]]+expected-status[[:space:]]*:/) {
-          if (modes[current_group] != "select") {
-            print field_indent "expected-status: 200/204"
-            expected_status_written = 1
-          }
-          next
-        }
-        if (managed && line ~ /^[[:space:]]+strategy[[:space:]]*:/) {
-          if (modes[current_group] == "load-balance") {
-            print field_indent "strategy: consistent-hashing"
-            strategy_written = 1
-          }
-          next
-        }
-
-        print line
-      }
-
-      END {
-        finish_managed_group()
-        if (unsupported) {
-          print "已保存的自定义策略组使用不支持的单行定义, 未修改文件." > "/dev/stderr"
-          exit 42
-        }
-      }
-    ' "$input_file" >"$output_file"
-}
-
-region_group_rules_current() {
-  local config_file="$1"
-  local state_file="$2"
-  local exclude_pattern
-
-  exclude_pattern="$(region_exclude_pattern)"
-  # The input needs sudo; the caller-owned output path intentionally does not.
-  # shellcheck disable=SC2024
-  sudo awk \
-    -v state_file="$state_file" \
-    -v exclude_pattern="$exclude_pattern" '
-      function parse_group_name(text, value, quote) {
-        value = text
-        sub(/^[[:space:]]*-[[:space:]]*[{]?[[:space:]]*name[[:space:]]*:[[:space:]]*/, "", value)
-        quote = substr(value, 1, 1)
-        if (quote == "\"") {
-          sub(/^"/, "", value)
-          sub(/".*/, "", value)
-        } else if (quote == "\047") {
-          sub(/^\047/, "", value)
-          sub(/\047.*/, "", value)
-        } else {
-          sub(/[[:space:]]*[,}#].*$/, "", value)
-          sub(/[[:space:]]+$/, "", value)
-        }
-        return value
-      }
-
-      function finish_managed_group() {
-        if (!managed) return
-        seen[current_group] = 1
-        if (!filter_ok || !exclude_ok) invalid = 1
-        managed = 0
-      }
-
-      BEGIN {
-        while ((getline record < state_file) > 0) {
-          field_count = split(record, fields, ";")
-          if (field_count >= 3 && fields[2] != "" && fields[3] != "") {
-            patterns[fields[2]] = fields[3]
-            expected++
-          }
-        }
-        close(state_file)
-      }
-
-      /^proxy-groups:[[:space:]]*$/ { in_groups = 1; next }
-      in_groups && /^[^[:space:]#][^:]*:/ {
-        finish_managed_group()
-        in_groups = 0
-      }
-      in_groups && /^[[:space:]]*-[[:space:]]*([{][[:space:]]*)?name[[:space:]]*:/ {
-        finish_managed_group()
-        current_group = parse_group_name($0)
-        managed = current_group in patterns
-        filter_ok = 0
-        exclude_ok = 0
-        next
-      }
-      managed && /^[[:space:]]+filter[[:space:]]*:/ {
-        desired = "filter: \"(?i)(" patterns[current_group] ")\""
-        if (index($0, desired)) filter_ok = 1
-      }
-      managed && /^[[:space:]]+exclude-filter[[:space:]]*:/ {
-        desired = "exclude-filter: \"(?i)(" exclude_pattern ")\""
-        if (index($0, desired)) exclude_ok = 1
-      }
-
-      END {
-        finish_managed_group()
-        for (name in patterns) {
-          if (!(name in seen)) invalid = 1
-        }
-        exit(invalid ? 1 : 0)
-      }
-    ' "$config_file"
-}
-
-render_region_overlay() {
-  local input_file="$1"
-  local output_file="$2"
-  local refs_file="$3"
-  local definitions_file="$4"
-  local parent="${5:-$(managed_region_parent)}"
-
-  # The input needs sudo; the caller-owned output path intentionally does not.
-  # shellcheck disable=SC2024
-  sudo awk \
-    -v refs_file="$refs_file" \
-    -v definitions_file="$definitions_file" \
-    -v parent_name="$parent" '
-      function parse_group_name(text, value, quote) {
-        value = text
-        sub(/^[[:space:]]*-[[:space:]]*[{]?[[:space:]]*name[[:space:]]*:[[:space:]]*/, "", value)
-        quote = substr(value, 1, 1)
-        if (quote == "\"") {
-          sub(/^"/, "", value)
-          sub(/".*/, "", value)
-        } else if (quote == "\047") {
-          sub(/^\047/, "", value)
-          sub(/\047.*/, "", value)
-        } else {
-          sub(/[[:space:]]*[,}#].*$/, "", value)
-          sub(/[[:space:]]+$/, "", value)
-        }
-        return value
-      }
-
-      function append_definitions(line) {
-        if (definitions_added) return
-        if (group_indent == "") group_indent = "  "
-        while ((getline line < definitions_file) > 0) {
-          print group_indent line
-        }
-        close(definitions_file)
-        definitions_added = 1
-      }
-
-      function append_block_refs(indent, i) {
-        for (i = 1; i <= ref_count; i++) {
-          print indent "- \"" refs[i] "\""
-        }
-        refs_inserted = 1
-      }
-
-      function add_inline_refs(line, segment, addition, separator, end_pos, i) {
-        if (!match(line, /proxies:[[:space:]]*\[[^]]*/)) return ""
-        segment = substr(line, RSTART, RLENGTH)
-        separator = segment ~ /\[[[:space:]]*$/ ? "" : ", "
-        addition = ""
-        for (i = 1; i <= ref_count; i++) {
-          addition = addition separator "\"" refs[i] "\""
-          separator = ", "
-        }
-        end_pos = RSTART + RLENGTH
-        refs_inserted = 1
-        return substr(line, 1, end_pos - 1) addition substr(line, end_pos)
-      }
-
-      BEGIN {
-        while ((getline ref < refs_file) > 0) {
-          if (ref != "") refs[++ref_count] = ref
-        }
-        close(refs_file)
-        if (ref_count == 0) refs_inserted = 1
-      }
-
-      {
-        line = $0
-
-        if (line ~ /^proxy-groups:[[:space:]]*\[[[:space:]]*\][[:space:]]*$/) {
-          groups_found = 1
-          in_groups = 1
-          print "proxy-groups:"
-          next
-        }
-
-        if (line ~ /^proxy-groups:[[:space:]]*[^[:space:]#]/) {
-          inline_groups = 1
-        }
-
-        if (in_groups && line ~ /^[^[:space:]#][^:]*:/) {
-          append_definitions()
-          in_groups = 0
-          in_parent = 0
-        }
-
-        if (line ~ /^proxy-groups:[[:space:]]*$/) {
-          groups_found = 1
-          in_groups = 1
-          print line
-          next
-        }
-
-        if (in_groups && group_indent == "" && line ~ /^[[:space:]]*-[[:space:]]/) {
-          match(line, /^[[:space:]]*/)
-          group_indent = substr(line, RSTART, RLENGTH)
-        }
-
-        if (in_groups && line ~ /^[[:space:]]*-[[:space:]]*([{][[:space:]]*)?name[[:space:]]*:/) {
-          in_parent = parse_group_name(line) == parent_name
-        }
-
-        if (in_parent && line ~ /proxies:[[:space:]]*\[/ && ref_count > 0) {
-          changed = add_inline_refs(line)
-          if (changed == "") {
-            fatal = 1
-            exit 42
-          }
-          print changed
-          next
-        }
-
-        if (in_parent && line ~ /^[[:space:]]+proxies:[[:space:]]*$/ && ref_count > 0) {
-          print line
-          match(line, /^[[:space:]]*/)
-          append_block_refs(substr(line, RSTART, RLENGTH) "  ")
-          next
-        }
-
-        print line
-      }
-
-      END {
-        if (fatal) exit 42
-        if (in_groups) append_definitions()
-        if (!groups_found) {
-          if (inline_groups) {
-            print "不支持行内 proxy-groups 配置, 未修改文件." > "/dev/stderr"
-            exit 42
-          }
-          print ""
-          print "proxy-groups:"
-          group_indent = "  "
-          append_definitions()
-          groups_found = 1
-        }
-        if (!refs_inserted) {
-          print "找不到主策略组 " parent_name " 的 proxies 列表, 未修改文件." > "/dev/stderr"
-          exit 42
-        }
-      }
-  ' "$input_file" >"$output_file"
-}
-
-render_managed_rule_outlet() {
-  local input_file="$1"
-  local output_file="$2"
-
-  # The input needs sudo; the caller-owned output path intentionally does not.
-  # shellcheck disable=SC2024
-  sudo awk -v outlet="$REGION_MANAGED_PARENT" '
-    function append_match() {
-      if (!match_written) {
-        print "  - MATCH,\"" outlet "\""
-        match_written = 1
-      }
-    }
-
-    {
-      line = $0
-
-      if (in_rules && line ~ /^[^[:space:]#][^:]*:/) {
-        append_match()
-        in_rules = 0
-      }
-
-      if (line ~ /^rules:[[:space:]]*(#.*)?$/) {
-        rules_found = 1
-        in_rules = 1
-        print line
-        next
-      }
-
-      if (line ~ /^rules:[[:space:]]*[^[:space:]#]/) {
-        inline_rules = 1
-      }
-
-      if (in_rules && line ~ /^[[:space:]]*-[[:space:]]*["\047]?MATCH[[:space:]]*,/) {
-        match(line, /^[[:space:]]*/)
-        print substr(line, RSTART, RLENGTH) "- MATCH,\"" outlet "\""
-        match_written = 1
-        next
-      }
-
-      print line
-    }
-
-    END {
-      if (inline_rules) {
-        print "不支持行内 rules 配置, 未修改文件." > "/dev/stderr"
-        exit 42
-      }
-      if (in_rules) append_match()
-      if (!rules_found) {
-        print ""
-        print "rules:"
-        append_match()
-      }
-    }
-  ' "$input_file" >"$output_file"
-}
-
-apply_region_groups_to_config() {
-  local input_file="$1"
-  local output_file="$2"
-  local state_file="$3"
-  local refs_file
-  local definitions_file
-  local refreshed_file
-  local overlay_file
-  local status
-
-  refs_file="$(mktemp /tmp/mihomo-region-refs.XXXXXX)" || return
-  definitions_file="$(mktemp /tmp/mihomo-region-definitions.XXXXXX)" || {
-    rm -f -- "$refs_file"
-    return 1
-  }
-  refreshed_file="$(mktemp /tmp/mihomo-region-refreshed.XXXXXX.yaml)" || {
-    rm -f -- "$refs_file" "$definitions_file"
-    return 1
-  }
-  overlay_file="$(mktemp /tmp/mihomo-region-overlay.XXXXXX.yaml)" || {
-    rm -f -- "$refs_file" "$definitions_file" "$refreshed_file"
-    return 1
-  }
-
-  refresh_saved_region_definitions "$input_file" "$refreshed_file" "$state_file"
-  status=$?
-  if (( status == 0 )); then
-    prepare_region_overlay "$refreshed_file" "$state_file" "$refs_file" "$definitions_file"
-    status=$?
-  fi
-  if (( status == 0 )); then
-    render_region_overlay "$refreshed_file" "$overlay_file" "$refs_file" "$definitions_file"
-    status=$?
-  fi
-  if (( status == 0 )); then
-    mv -f -- "$overlay_file" "$output_file"
-    status=$?
-  fi
-
-  rm -f -- "$refs_file" "$definitions_file" "$refreshed_file" "$overlay_file"
-  return "$status"
-}
-
-apply_rule_selector_to_config() {
-  local input_file="$1"
-  local output_file="$2"
-  local source_policy="${3:-}"
-  local selected_group
-  local current_policy
-  local without_selector
-  local refs_file
-  local definitions_file
-  local with_selector
-  local group_name
-  local escaped_name
-  local status=0
-  local group_count=0
-  local source_included=0
-  local current_included=0
-  local source_available=0
-
-  without_selector="$(mktemp /tmp/mihomo-rule-selector-base.XXXXXX.yaml)" || return 1
-  refs_file="$(mktemp /tmp/mihomo-rule-selector-refs.XXXXXX)" || {
-    rm -f -- "$without_selector"
-    return 1
-  }
-  definitions_file="$(mktemp /tmp/mihomo-rule-selector-definition.XXXXXX)" || {
-    rm -f -- "$without_selector" "$refs_file"
-    return 1
-  }
-  with_selector="$(mktemp /tmp/mihomo-rule-selector-config.XXXXXX.yaml)" || {
-    rm -f -- "$without_selector" "$refs_file" "$definitions_file"
-    return 1
-  }
-
-  selected_group="$(sudo jq -r '.rule_selection.group // empty' "$MANAGER_CONFIG_FILE" 2>/dev/null || true)"
-  if config_rules_reference_policy "$input_file" "$RULE_SELECTOR_GROUP"; then
-    current_policy="$RULE_SELECTOR_GROUP"
-  elif [[ -n $selected_group ]] && config_rules_reference_policy "$input_file" "$selected_group"; then
-    current_policy="$selected_group"
-  elif [[ -n $source_policy ]] && config_rules_reference_policy "$input_file" "$source_policy"; then
-    current_policy="$source_policy"
-  else
-    current_policy="$(config_match_policy "$input_file")"
-  fi
-  if [[ $source_policy == DIRECT || $source_policy == REJECT || $source_policy == PASS ]] ||
-     config_rules_reference_policy "$input_file" "$source_policy" ||
-     parent_group_has_child "$input_file" "$RULE_SELECTOR_GROUP" "$source_policy"; then
-    source_available=1
-  fi
-
-  render_without_region_group "$input_file" "$without_selector" "$RULE_SELECTOR_GROUP" || status=$?
-  : >"$refs_file"
-  if (( status == 0 )); then
-    {
-      printf '%s\n' "- name: \"${RULE_SELECTOR_GROUP}\""
-      printf '%s\n' '  type: select'
-      printf '%s\n' '  proxies:'
-      while IFS= read -r group_name; do
-        [[ -n $group_name ]] || continue
-        [[ $group_name == "$RULE_SELECTOR_GROUP" || $group_name == "$REGION_MANAGED_PARENT" ]] && continue
-        escaped_name="${group_name//\\/\\\\}"
-        escaped_name="${escaped_name//\"/\\\"}"
-        printf '    - "%s"\n' "$escaped_name"
-        group_count=$((group_count + 1))
-        if [[ $group_name == "$source_policy" ]]; then
-          source_included=1
-        fi
-        if [[ $group_name == "$current_policy" ]]; then
-          current_included=1
-        fi
-      done < <(list_config_group_names "$without_selector")
-      if [[ -n $source_policy && $source_policy != "$RULE_SELECTOR_GROUP" ]] &&
-         (( source_included == 0 && source_available == 1 )); then
-        escaped_name="${source_policy//\\/\\\\}"
-        escaped_name="${escaped_name//\"/\\\"}"
-        printf '    - "%s"\n' "$escaped_name"
-        group_count=$((group_count + 1))
-        if [[ $current_policy == "$source_policy" ]]; then
-          current_included=1
-        fi
-      fi
-      if [[ -n $current_policy && $current_policy != "$RULE_SELECTOR_GROUP" ]] && (( current_included == 0 )); then
-        escaped_name="${current_policy//\\/\\\\}"
-        escaped_name="${escaped_name//\"/\\\"}"
-        printf '    - "%s"\n' "$escaped_name"
-        group_count=$((group_count + 1))
-      fi
-      if (( group_count == 0 )); then
-        printf '%s\n' '    - DIRECT'
-      fi
-    } >"$definitions_file"
-    render_region_overlay "$without_selector" "$with_selector" "$refs_file" "$definitions_file" || status=$?
-  fi
-
-  if (( status == 0 )); then
-    if [[ $current_policy == "$RULE_SELECTOR_GROUP" ]]; then
-      mv -f -- "$with_selector" "$output_file" || status=$?
-    else
-      if [[ -z $current_policy ]]; then
-        echo "当前配置没有可识别的规则策略目标." >&2
-        status=1
-      else
-        render_rule_strategy_selection "$with_selector" "$output_file" "$current_policy" "$RULE_SELECTOR_GROUP" || status=$?
-      fi
-    fi
-  fi
-
-  rm -f -- "$without_selector" "$refs_file" "$definitions_file" "$with_selector"
+  jq -s '.' "$records_file" >"$definitions_file"
+  local status=$?
+  rm -f -- "$records_file"
   return "$status"
 }
 
@@ -3871,80 +3059,224 @@ change_managed_region_group_mode() {
   return "$status"
 }
 
+refresh_saved_region_definitions() {
+  local input_file="$1"
+  local output_file="$2"
+  local state_file="$3"
+  local refs_file
+  local definitions_file
+  local status=0
+
+  refs_file="$(mktemp /tmp/mihomo-region-refresh-refs.XXXXXX)" || return 1
+  definitions_file="$(mktemp /tmp/mihomo-region-refresh-definitions.XXXXXX.json)" || {
+    rm -f -- "$refs_file"
+    return 1
+  }
+  prepare_region_overlay "$input_file" "$state_file" "$refs_file" "$definitions_file" || status=$?
+  if (( status == 0 )); then
+    render_region_overlay "$input_file" "$output_file" "$refs_file" "$definitions_file" || status=$?
+  fi
+  rm -f -- "$refs_file" "$definitions_file"
+  return "$status"
+}
+
+region_group_rules_current() {
+  local config_file="$1"
+  local state_file="$2"
+  local refs_file
+  local definitions_file
+  local actual_file
+  local status=0
+
+  refs_file="$(mktemp /tmp/mihomo-region-check-refs.XXXXXX)" || return 1
+  definitions_file="$(mktemp /tmp/mihomo-region-check-definitions.XXXXXX.json)" || {
+    rm -f -- "$refs_file"
+    return 1
+  }
+  actual_file="$(mktemp /tmp/mihomo-region-check-actual.XXXXXX.json)" || {
+    rm -f -- "$refs_file" "$definitions_file"
+    return 1
+  }
+  prepare_region_overlay "$config_file" "$state_file" "$refs_file" "$definitions_file" || status=$?
+  if (( status == 0 )); then
+    sudo "$YQ_BIN" --yaml-fix-merge-anchor-to-spec eval -o=json '.["proxy-groups"] // []' "$config_file" >"$actual_file" || status=$?
+  fi
+  if (( status == 0 )); then
+    jq -e --slurpfile expected "$definitions_file" '
+      ($expected[0] | map(.name)) as $names
+      | ([.[] | select(.name as $name | $names | index($name))] == $expected[0])
+    ' "$actual_file" >/dev/null || status=$?
+  fi
+  rm -f -- "$refs_file" "$definitions_file" "$actual_file"
+  return "$status"
+}
+
+render_region_overlay() {
+  local input_file="$1"
+  local output_file="$2"
+  local refs_file="$3"
+  local definitions_file="$4"
+
+  [[ ! -s $refs_file ]] || {
+    echo "结构化策略组不支持隐式挂载到其他策略组." >&2
+    return 1
+  }
+  yaml_processor_available || return 1
+  sudo "$YQ_BIN" --yaml-fix-merge-anchor-to-spec eval-all '
+    select(fileIndex == 0) as $base
+    | select(fileIndex == 1) as $defs
+    | ($defs | map(.name)) as $names
+    | $base
+    | .["proxy-groups"] =
+        (((.["proxy-groups"] // [])
+          | map(select(.name as $name | $names | any_c(. == $name) | not)))
+         + $defs)
+  ' "$input_file" "$definitions_file" >"$output_file"
+}
+
+render_managed_rule_outlet() {
+  local input_file="$1"
+  local output_file="$2"
+  local current_policy
+
+  current_policy="$(config_match_policy "$input_file")" || return 1
+  if [[ -n $current_policy ]]; then
+    render_rule_strategy_selection "$input_file" "$output_file" "$current_policy" "$REGION_MANAGED_PARENT"
+    return
+  fi
+  sudo env MIPILOT_RULE_OUTLET="$REGION_MANAGED_PARENT" "$YQ_BIN" --yaml-fix-merge-anchor-to-spec eval '
+    .rules = ((.rules // []) + ["MATCH," + strenv(MIPILOT_RULE_OUTLET)])
+  ' "$input_file" >"$output_file"
+}
+
 render_without_region_group() {
   local input_file="$1"
   local output_file="$2"
   local removed_group="$3"
 
-  # The input needs sudo; the caller-owned output path intentionally does not.
-  # shellcheck disable=SC2024
-  sudo awk -v removed="$removed_group" '
-    function parse_group_name(text, value, quote) {
-      value = text
-      sub(/^[[:space:]]*-[[:space:]]*[{]?[[:space:]]*name[[:space:]]*:[[:space:]]*/, "", value)
-      quote = substr(value, 1, 1)
-      if (quote == "\"") { sub(/^"/, "", value); sub(/".*/, "", value) }
-      else if (quote == "\047") { sub(/^\047/, "", value); sub(/\047.*/, "", value) }
-      else { sub(/[[:space:]]*[,}#].*$/, "", value); sub(/[[:space:]]+$/, "", value) }
-      return value
-    }
-    function trim(value) {
-      sub(/^[[:space:]"\047]+/, "", value)
-      sub(/[[:space:]"\047]+$/, "", value)
-      return value
-    }
-    function remove_inline(line, prefix, body, suffix, count, fields, field_index, output, separator, raw) {
-      prefix = substr(line, 1, index(line, "["))
-      suffix = substr(line, index(line, "]"))
-      body = substr(line, index(line, "[") + 1)
-      sub(/\].*$/, "", body)
-      count = split(body, fields, ",")
-      output = prefix
-      separator = ""
-      for (field_index = 1; field_index <= count; field_index++) {
-        if (trim(fields[field_index]) == removed) continue
-        if (trim(fields[field_index]) == "") continue
-        raw = fields[field_index]
-        sub(/^[[:space:]]+/, "", raw)
-        sub(/[[:space:]]+$/, "", raw)
-        output = output separator raw
-        separator = ", "
-      }
-      return output suffix
-    }
-
-    /^proxy-groups:[[:space:]]*$/ { in_groups = 1; print; next }
-    in_groups && /^[^[:space:]#][^:]*:/ { in_groups = 0; skip_group = 0; in_proxies = 0 }
-    in_groups && /^[[:space:]]*-[[:space:]]*([{][[:space:]]*)?name[[:space:]]*:/ {
-      skip_group = parse_group_name($0) == removed
-      in_proxies = 0
-      if (!skip_group) {
-        if ($0 ~ /proxies[[:space:]]*:[[:space:]]*\[/) print remove_inline($0)
-        else print
-      }
-      next
-    }
-    in_groups && skip_group { next }
-    in_groups && /^[[:space:]]+proxies[[:space:]]*:/ {
-      in_proxies = 1
-      match($0, /^[[:space:]]*/)
-      proxies_indent = RLENGTH
-      if ($0 ~ /\[/) print remove_inline($0)
-      else print
-      next
-    }
-    in_groups && in_proxies {
-      match($0, /^[[:space:]]*/)
-      if ($0 !~ /^[[:space:]]*($|#)/ && RLENGTH <= proxies_indent) in_proxies = 0
-      else if ($0 ~ /^[[:space:]]*-[[:space:]]*/) {
-        value = $0
-        sub(/^[[:space:]]*-[[:space:]]*/, "", value)
-        sub(/[[:space:]]+#.*$/, "", value)
-        if (trim(value) == removed) next
-      }
-    }
-    { print }
+  yaml_processor_available || return 1
+  sudo env MIPILOT_REMOVED_GROUP="$removed_group" "$YQ_BIN" --yaml-fix-merge-anchor-to-spec eval '
+    del(.["proxy-groups"][]? | select(.name == strenv(MIPILOT_REMOVED_GROUP)))
+    | (.["proxy-groups"][]? | select(.proxies != null) | .proxies)
+        |= map(select(. != strenv(MIPILOT_REMOVED_GROUP)))
   ' "$input_file" >"$output_file"
+}
+
+apply_region_groups_to_config() {
+  local input_file="$1"
+  local output_file="$2"
+  local state_file="$3"
+  local refs_file
+  local definitions_file
+  local status=0
+
+  refs_file="$(mktemp /tmp/mihomo-region-refs.XXXXXX)" || return 1
+  definitions_file="$(mktemp /tmp/mihomo-region-definitions.XXXXXX.json)" || {
+    rm -f -- "$refs_file"
+    return 1
+  }
+  prepare_region_overlay "$input_file" "$state_file" "$refs_file" "$definitions_file" || status=$?
+  if (( status == 0 )); then
+    render_region_overlay "$input_file" "$output_file" "$refs_file" "$definitions_file" || status=$?
+  fi
+  rm -f -- "$refs_file" "$definitions_file"
+  return "$status"
+}
+
+apply_rule_selector_to_config() {
+  local input_file="$1"
+  local output_file="$2"
+  local source_policy="${3:-}"
+  local selected_group
+  local current_policy
+  local without_selector
+  local refs_file
+  local groups_file
+  local definitions_file
+  local with_selector
+  local group_name
+  local status=0
+  local source_included=0
+  local current_included=0
+  local source_available=0
+
+  without_selector="$(mktemp /tmp/mihomo-rule-selector-base.XXXXXX.yaml)" || return 1
+  refs_file="$(mktemp /tmp/mihomo-rule-selector-refs.XXXXXX)" || {
+    rm -f -- "$without_selector"
+    return 1
+  }
+  groups_file="$(mktemp /tmp/mihomo-rule-selector-groups.XXXXXX)" || {
+    rm -f -- "$without_selector" "$refs_file"
+    return 1
+  }
+  definitions_file="$(mktemp /tmp/mihomo-rule-selector-definition.XXXXXX.json)" || {
+    rm -f -- "$without_selector" "$refs_file" "$groups_file"
+    return 1
+  }
+  with_selector="$(mktemp /tmp/mihomo-rule-selector-config.XXXXXX.yaml)" || {
+    rm -f -- "$without_selector" "$refs_file" "$groups_file" "$definitions_file"
+    return 1
+  }
+
+  selected_group="$(sudo jq -r '.rule_selection.group // empty' "$MANAGER_CONFIG_FILE" 2>/dev/null || true)"
+  if config_rules_reference_policy "$input_file" "$RULE_SELECTOR_GROUP"; then
+    current_policy="$RULE_SELECTOR_GROUP"
+  elif [[ -n $selected_group ]] && config_rules_reference_policy "$input_file" "$selected_group"; then
+    current_policy="$selected_group"
+  elif [[ -n $source_policy ]] && config_rules_reference_policy "$input_file" "$source_policy"; then
+    current_policy="$source_policy"
+  else
+    current_policy="$(config_match_policy "$input_file")"
+  fi
+  if [[ $source_policy == DIRECT || $source_policy == REJECT || $source_policy == PASS ]] ||
+     config_rules_reference_policy "$input_file" "$source_policy" ||
+     parent_group_has_child "$input_file" "$RULE_SELECTOR_GROUP" "$source_policy"; then
+    source_available=1
+  fi
+
+  render_without_region_group "$input_file" "$without_selector" "$RULE_SELECTOR_GROUP" || status=$?
+  : >"$refs_file"
+  : >"$groups_file"
+  if (( status == 0 )); then
+    while IFS= read -r group_name; do
+      [[ -n $group_name ]] || continue
+      [[ $group_name == "$RULE_SELECTOR_GROUP" || $group_name == "$REGION_MANAGED_PARENT" ]] && continue
+      printf '%s\n' "$group_name" >>"$groups_file"
+      [[ $group_name == "$source_policy" ]] && source_included=1
+      [[ $group_name == "$current_policy" ]] && current_included=1
+    done < <(list_config_group_names "$without_selector")
+    if [[ -n $source_policy && $source_policy != "$RULE_SELECTOR_GROUP" ]] &&
+       (( source_included == 0 && source_available == 1 )); then
+      printf '%s\n' "$source_policy" >>"$groups_file"
+      [[ $current_policy == "$source_policy" ]] && current_included=1
+    fi
+    if [[ -n $current_policy && $current_policy != "$RULE_SELECTOR_GROUP" ]] && (( current_included == 0 )); then
+      printf '%s\n' "$current_policy" >>"$groups_file"
+    fi
+    if [[ ! -s $groups_file ]]; then
+      printf '%s\n' DIRECT >"$groups_file"
+    fi
+    jq -Rn --arg name "$RULE_SELECTOR_GROUP" '
+      [inputs | select(length > 0)] as $groups
+      | [{name: $name, type: "select", proxies: $groups}]
+    ' <"$groups_file" >"$definitions_file" || status=$?
+  fi
+  if (( status == 0 )); then
+    render_region_overlay "$without_selector" "$with_selector" "$refs_file" "$definitions_file" || status=$?
+  fi
+  if (( status == 0 )); then
+    if [[ $current_policy == "$RULE_SELECTOR_GROUP" ]]; then
+      mv -f -- "$with_selector" "$output_file" || status=$?
+    elif [[ -z $current_policy ]]; then
+      echo "当前配置没有可识别的规则策略目标." >&2
+      status=1
+    else
+      render_rule_strategy_selection "$with_selector" "$output_file" "$current_policy" "$RULE_SELECTOR_GROUP" || status=$?
+    fi
+  fi
+
+  rm -f -- "$without_selector" "$refs_file" "$groups_file" "$definitions_file" "$with_selector"
+  return "$status"
 }
 
 delete_managed_region_group() {
@@ -5195,7 +4527,6 @@ save_subscription_url() {
   fi
   rm -f -- "$temporary"
   sync_mipilot_config_from_state || return 1
-  echo "已设为当前激活订阅."
 }
 
 ensure_subscription_list() {
@@ -5365,6 +4696,7 @@ activate_subscription() {
     return "$status"
   fi
   sudo rm -f -- "$previous_marker"
+  echo "已设为当前激活订阅."
 }
 
 add_managed_subscription() {
@@ -5978,6 +5310,7 @@ ensure_install_dependencies() {
 LOCAL_MIHOMO_SOURCE=""
 LOCAL_COUNTRY_MMDB=""
 LOCAL_GEOSITE_DAT=""
+LOCAL_YQ_SOURCE=""
 STAGED_MIHOMO_BIN=""
 
 find_local_assets() {
@@ -5989,6 +5322,7 @@ find_local_assets() {
   LOCAL_MIHOMO_SOURCE=""
   LOCAL_COUNTRY_MMDB=""
   LOCAL_GEOSITE_DAT=""
+  LOCAL_YQ_SOURCE=""
   [[ -d $directory ]] || return 1
 
   while IFS= read -r -d '' candidate; do
@@ -6009,8 +5343,11 @@ find_local_assets() {
   for candidate in "$directory/geosite.dat" "$directory/GeoSite.dat"; do
     if [[ -s $candidate ]]; then LOCAL_GEOSITE_DAT="$candidate"; break; fi
   done
+  if [[ -s $directory/yq_linux_amd64 ]]; then
+    LOCAL_YQ_SOURCE="$directory/yq_linux_amd64"
+  fi
 
-  [[ -n $LOCAL_MIHOMO_SOURCE && -n $LOCAL_COUNTRY_MMDB && -n $LOCAL_GEOSITE_DAT ]]
+  [[ -n $LOCAL_MIHOMO_SOURCE && -n $LOCAL_COUNTRY_MMDB && -n $LOCAL_GEOSITE_DAT && -n $LOCAL_YQ_SOURCE ]]
 }
 
 show_required_local_assets() {
@@ -6018,6 +5355,7 @@ show_required_local_assets() {
 请把以下文件放到同一目录后重试:
   country.mmdb
   geosite.dat
+  yq_linux_amd64
   mihomo-linux-amd64-v<版本>.gz
 
 也兼容已解压的文件:
@@ -6026,7 +5364,25 @@ show_required_local_assets() {
 官方地址:
   https://github.com/MetaCubeX/mihomo/releases/latest
   https://github.com/MetaCubeX/meta-rules-dat/releases/latest
+  https://github.com/mikefarah/yq/releases/tag/v${YQ_VERSION}
 EOF
+}
+
+validate_yq_asset() {
+  local source_file="$1"
+  local actual_hash
+
+  [[ -s $source_file ]] || return 1
+  actual_hash="$(sha256sum "$source_file" | awk '{print $1}')"
+  [[ $actual_hash == "$YQ_LINUX_AMD64_SHA256" ]] || {
+    echo "yq SHA-256 校验失败: ${source_file}"
+    return 1
+  }
+  chmod 755 "$source_file" 2>/dev/null || true
+  "$source_file" --version 2>/dev/null | grep -Fq "version v${YQ_VERSION}" || {
+    echo "提供的程序不是预期的 yq v${YQ_VERSION}."
+    return 1
+  }
 }
 
 stage_mihomo_source() {
@@ -6047,7 +5403,8 @@ validate_local_assets() {
   local validation_dir
   local validation_config
 
-  [[ -s $LOCAL_MIHOMO_SOURCE && -s $LOCAL_COUNTRY_MMDB && -s $LOCAL_GEOSITE_DAT ]] || return 1
+  [[ -s $LOCAL_MIHOMO_SOURCE && -s $LOCAL_COUNTRY_MMDB && -s $LOCAL_GEOSITE_DAT && -s $LOCAL_YQ_SOURCE ]] || return 1
+  validate_yq_asset "$LOCAL_YQ_SOURCE" || return 1
   STAGED_MIHOMO_BIN="$(mktemp /tmp/mipilot-core.XXXXXX)" || return 1
   stage_mihomo_source "$LOCAL_MIHOMO_SOURCE" "$STAGED_MIHOMO_BIN" || {
     echo "Mihomo 文件校验失败: ${LOCAL_MIHOMO_SOURCE}"
@@ -6166,6 +5523,14 @@ save_component_rollback() {
       else
         sudo touch "${temporary}/mihomo.service.absent" || return 1
       fi
+      if sudo test -x "$YQ_BIN"; then
+        sudo install -m 755 "$YQ_BIN" "${temporary}/yq" || {
+          sudo rm -rf -- "$temporary"
+          return 1
+        }
+      else
+        sudo touch "${temporary}/yq.absent" || return 1
+      fi
       ;;
   esac
   printf '%s\n' "$(date +%s)" | sudo tee "${temporary}/created_at" >/dev/null || {
@@ -6224,6 +5589,11 @@ restore_component_rollback() {
         sudo install -m 644 "${slot}/mihomo.service" "$SERVICE_FILE" || return 1
       elif sudo test -f "${slot}/mihomo.service.absent"; then
         sudo rm -f -- "$SERVICE_FILE" || return 1
+      fi
+      if sudo test -f "${slot}/yq"; then
+        atomic_install_file 755 "${slot}/yq" "$YQ_BIN" || return 1
+      elif sudo test -f "${slot}/yq.absent"; then
+        sudo rm -f -- "$YQ_BIN" || return 1
       fi
       ;;
   esac
@@ -6377,8 +5747,19 @@ remove_cleanup_units() {
 
 install_manager_files() {
   local runtime_mode="${1:-$(installed_runtime_mode)}"
+  local yq_source="${LOCAL_YQ_SOURCE:-}"
 
   sudo install -d -m 755 "$MANAGER_LIB_DIR" || return 1
+  if [[ -z $yq_source && -s $SCRIPT_DIR/yq_linux_amd64 ]]; then
+    yq_source="$SCRIPT_DIR/yq_linux_amd64"
+  fi
+  if [[ -n $yq_source ]]; then
+    validate_yq_asset "$yq_source" || return 1
+    atomic_install_file 755 "$yq_source" "$YQ_BIN" || return 1
+  elif ! yaml_processor_available; then
+    echo "缺少 yq v${YQ_VERSION}, 无法安装结构化 YAML 处理组件."
+    return 1
+  fi
   if [[ $SCRIPT_PATH != "$MANAGER_INSTALLED_SCRIPT" ]]; then
     atomic_install_file 755 "$SCRIPT_PATH" "$MANAGER_INSTALLED_SCRIPT" || return 1
   fi
@@ -6420,6 +5801,7 @@ rollback_local_install() {
   restore_component_rollback core || failed=1
   restore_component_rollback geo || failed=1
   restore_component_rollback service || failed=1
+  restore_component_rollback manager || failed=1
   if [[ -n $config_backup ]]; then
     atomic_install_file 600 "$config_backup" "$CONFIG_FILE" || failed=1
   elif (( had_config == 0 )); then
@@ -6510,6 +5892,7 @@ install_from_local_bundle() {
   save_component_rollback core || return 1
   save_component_rollback geo || return 1
   save_component_rollback service || return 1
+  save_component_rollback manager || return 1
   if service_exists; then
     if ! run_blocking "正在停止旧 Mihomo 服务" 45 \
          sudo -n systemctl disable --now mihomo; then
@@ -6832,9 +6215,14 @@ offer_local_manager_upgrade() {
   local status
 
   installed_version="$(installed_manager_version)"
-  if [[ -n $installed_version ]] && version_is_newer "$MANAGER_VERSION" "$installed_version"; then
-    echo "检测到本地管理脚本可升级: ${installed_version} -> ${MANAGER_VERSION}"
-    read_line_or_back "是否安装这个本地版本? (Y/n): "
+  if [[ -n $installed_version ]] &&
+     { version_is_newer "$MANAGER_VERSION" "$installed_version" || ! yaml_processor_available; }; then
+    if version_is_newer "$MANAGER_VERSION" "$installed_version"; then
+      echo "检测到本地管理脚本可升级: ${installed_version} -> ${MANAGER_VERSION}"
+    else
+      echo "当前安装缺少结构化 YAML 组件, 将使用本地包修复."
+    fi
+    read_line_or_back "是否安装这个本地版本及 YAML 组件? (Y/n): "
     status=$?
     if (( status != 0 )); then return "$status"; fi
     case "${INPUT_LINE,,}" in
@@ -7178,12 +6566,14 @@ online_update_manager() {
   local temporary_dir
   local candidate
   local sidecar
+  local yq_candidate
   local candidate_version
   local status
 
   temporary_dir="$(mktemp -d /tmp/mipilot-manager-update.XXXXXX)" || return 1
   candidate="${temporary_dir}/mipilot"
   sidecar="${temporary_dir}/mipilot.sha256"
+  yq_candidate="${temporary_dir}/yq_linux_amd64"
   download_file "${MANAGER_RELEASE_BASE}/mipilot" "$candidate" "MiPilot 稳定版脚本" || {
     rm -rf -- "$temporary_dir"
     echo "无法下载稳定版管理脚本, 当前版本未改变."
@@ -7199,6 +6589,17 @@ online_update_manager() {
     echo "MiPilot SHA-256 校验失败, 当前版本未改变."
     return 1
   fi
+  download_file "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_amd64" \
+    "$yq_candidate" "yq v${YQ_VERSION}" || {
+    rm -rf -- "$temporary_dir"
+    echo "无法下载结构化 YAML 处理组件, 当前版本未改变."
+    return 1
+  }
+  validate_yq_asset "$yq_candidate" || {
+    rm -rf -- "$temporary_dir"
+    echo "yq 校验失败, 当前版本未改变."
+    return 1
+  }
   if ! head -n 1 "$candidate" | grep -Fqx '#!/usr/bin/env bash' || \
      ! grep -Fq 'MANAGER_INSTALLED_SCRIPT=' "$candidate" || \
      ! run_cancellable_named "正在检查新管理脚本语法" 20 bash -n "$candidate"; then
@@ -7218,18 +6619,18 @@ online_update_manager() {
   fi
   echo "当前 MiPilot: ${MANAGER_VERSION}"
   echo "最新稳定版: ${candidate_version}"
-  if [[ $candidate_version == "$MANAGER_VERSION" ]]; then
+  if [[ $candidate_version == "$MANAGER_VERSION" ]] && yaml_processor_available; then
     rm -rf -- "$temporary_dir"
     echo "当前已经是最新稳定版."
     return 0
   fi
-  if ! version_is_newer "$candidate_version" "$MANAGER_VERSION"; then
+  if [[ $candidate_version != "$MANAGER_VERSION" ]] && ! version_is_newer "$candidate_version" "$MANAGER_VERSION"; then
     rm -rf -- "$temporary_dir"
     echo "稳定Release版本不高于当前版本, 已拒绝自动降级."
     return 1
   fi
 
-  read_line_or_back "确认更新 MiPilot 到 ${candidate_version}? (y/N, Esc返回): "
+  read_line_or_back "确认安装 MiPilot ${candidate_version} 及 YAML 组件? (y/N, Esc返回): "
   status=$?
   if (( status != 0 )); then rm -rf -- "$temporary_dir"; return "$status"; fi
   case "${INPUT_LINE,,}" in
@@ -7244,9 +6645,10 @@ online_update_manager() {
     return 1
   }
   chmod 755 "$candidate"
-  if ! atomic_install_file 755 "$candidate" "$MANAGER_INSTALLED_SCRIPT" || \
+  if ! atomic_install_file 755 "$yq_candidate" "$YQ_BIN" || \
+     ! atomic_install_file 755 "$candidate" "$MANAGER_INSTALLED_SCRIPT" || \
      ! write_manager_install_marker "$candidate_version" || \
-     { [[ $(installed_runtime_mode) != service ]] || write_service_unit; } || \
+     ! { [[ $(installed_runtime_mode) != service ]] || write_service_unit; } || \
      ! sudo systemctl daemon-reload; then
     restore_component_rollback manager || true
     sudo systemctl daemon-reload || true
@@ -8291,6 +7693,12 @@ check_dependencies() {
   if (( ${#missing[@]} > 0 )); then
     echo "缺少命令: ${missing[*]}"
     echo "请先安装缺失依赖."
+    return 1
+  fi
+
+  if ! yaml_processor_available; then
+    echo "缺少 MiPilot 私有 yq v${YQ_VERSION}: ${YQ_BIN}"
+    echo "请重新运行完整离线包中的 ./mipilot 进行修复."
     return 1
   fi
 
