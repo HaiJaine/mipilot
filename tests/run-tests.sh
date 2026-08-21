@@ -1044,7 +1044,7 @@ EOF
   render_tun_config "$input_file" "$output_file" true || return 1
   assert_yaml_equal "$output_file" '.tun.enable' true "enabled TUN" || return 1
   assert_yaml_equal "$output_file" '.tun."auto-route"' true "enabled auto-route" || return 1
-  assert_yaml_equal "$output_file" '.tun."auto-redirect"' true "enabled automatic redirect" || return 1
+  assert_yaml_equal "$output_file" '.tun."auto-redirect"' false "disabled conflicting automatic redirect" || return 1
   assert_yaml_equal "$output_file" '.tun."auto-detect-interface"' true "enabled interface detection" || return 1
   assert_yaml_equal "$output_file" '.tun."strict-route"' false "server-compatible strict route" || return 1
   assert_yaml_equal "$output_file" '.tun."route-exclude-address"[] | select(. == "192.168.0.0/16")' '192.168.0.0/16' "LAN route exclusion" || return 1
@@ -2121,7 +2121,7 @@ test_render_minimal_config() {
 
   assert_file_has_line "$output_file" "mode: direct" "direct mode" || return 1
   assert_file_has_line "$output_file" "  enable: false" "disabled TUN" || return 1
-  assert_file_has_line "$output_file" "  auto-redirect: true" "native Linux redirect mode" || return 1
+  assert_file_has_line "$output_file" "  auto-redirect: false" "native Linux route mode" || return 1
   assert_file_has_line "$output_file" "    - 192.168.0.0/16" "LAN route exclusion" || return 1
   assert_file_has_line "$output_file" "proxies: []" "empty proxy nodes" || return 1
   assert_file_has_line "$output_file" "proxy-groups: []" "empty proxy groups" || return 1

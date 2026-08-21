@@ -1317,7 +1317,7 @@ render_tun_config() {
       | .tun.enable = env(MIPILOT_TUN_ENABLED)
       | .tun.stack = (.tun.stack // "mixed")
       | .tun."auto-route" = true
-      | .tun."auto-redirect" = true
+      | .tun."auto-redirect" = false
       | .tun."auto-detect-interface" = true
       | .tun."strict-route" = false
     ' "$input_file" >"$temporary" || status=$?
@@ -1912,7 +1912,15 @@ apply_tun_setting() {
   echo "[2/5] 验证配置"
   run_cancellable_named "正在验证 TUN 配置" 35 \
     sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$temporary" 2>&1 \
-    | awk '!/level=info/ && !/INFO\[/'
+    | awk '
+        /level=warning/ {
+          sub(/^time="[^"]+" level=warning msg="/, "警告: ")
+          sub(/"$/, "")
+          print
+          next
+        }
+        !/level=info/ && !/INFO\[/
+      '
   status=$?
   if (( status == 130 )); then
     rm -f -- "$temporary"
@@ -5733,7 +5741,7 @@ tun:
   enable: false
   stack: mixed
   auto-route: true
-  auto-redirect: true
+  auto-redirect: false
   auto-detect-interface: true
   strict-route: false
   route-exclude-address:

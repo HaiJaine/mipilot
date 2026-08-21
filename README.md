@@ -150,7 +150,7 @@ mipilot
 
 ### TUN与公网服务兼容
 
-开启TUN时, MiPilot使用Mihomo原生的 `auto-route: true`、`auto-redirect: true` 和 `auto-detect-interface: true`, 网络接管和Linux转发规则由Mihomo维护。MiPilot不扫描监听端口, 不排除Docker网卡, 也不根据Docker是否已安装生成静态规则; 容器访问公网时仍可进入TUN并由Mihomo规则决定 `DIRECT` 或代理。因此开启TUN后再安装Docker、创建网络或发布新端口不需要重新配置MiPilot。显式代理监听在订阅未配置时默认限制为本机; 如果订阅明确设置 `allow-lan: true` 和对应的 `bind-address`、认证或允许网段, MiPilot会保留这些设置, 供受控的局域网或Docker容器使用。
+开启TUN时, MiPilot使用Mihomo原生的 `auto-route: true` 和 `auto-detect-interface: true`, 并关闭可能与服务器现有netlink或nftables规则冲突的 `auto-redirect`, 网络接管和Linux路由由Mihomo维护。MiPilot不扫描监听端口, 不排除Docker网卡, 也不根据Docker是否已安装生成静态规则; 容器访问公网时仍可进入TUN并由Mihomo规则决定 `DIRECT` 或代理。因此开启TUN后再安装Docker、创建网络或发布新端口不需要重新配置MiPilot。显式代理监听在订阅未配置时默认限制为本机; 如果订阅明确设置 `allow-lan: true` 和对应的 `bind-address`、认证或允许网段, MiPilot会保留这些设置, 供受控的局域网或Docker容器使用。
 
 TUN开启时, MiPilot会通过 `route-exclude-address` 排除本机、RFC1918局域网、CGNAT、链路本地和组播地址, 并在规则列表顶部加入对应的 `DIRECT` 规则; TUN关闭状态下合并新订阅时不会额外插入这些规则。Docker bridge内部通信直接访问私有地址, 容器访问公网则继续交给TUN。`strict-route`默认关闭, 避免强制接管本机服务和远程管理链路。订阅没有DNS配置时, MiPilot会生成可用的 `redir-host` DNS配置并启用53端口劫持; 订阅已有DNS配置时保留其设置, 仅在DNS已启用时补齐标准劫持项, 关闭TUN也不会删除订阅自定义的 `dns-hijack`。启用后会检查Mihomo API、IPv4路由和当前SSH客户端回程; 多默认路由、无法解析SSH回程或回程经过TUN只告警, 不阻止TUN开启。运行维护中的“网络兼容性检查”或 `sudo mipilot --doctor` 可以只读查看默认路由、相关虚拟接口、旧版规则残留和本地DNS监听。
 
