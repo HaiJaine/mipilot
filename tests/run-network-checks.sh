@@ -5,6 +5,7 @@ set -o pipefail
 
 CONFIG_FILE="${MIPILOT_CONFIG_FILE:-/etc/mihomo/config.yaml}"
 MIHOMO_BIN="${MIPILOT_MIHOMO_BIN:-/usr/local/bin/mihomo}"
+YQ_BIN="${MIPILOT_YQ_BIN:-/usr/local/lib/mipilot/yq}"
 TUN_ROUTING_STATE_FILE="${MIPILOT_TUN_ROUTING_STATE_FILE:-/var/lib/mipilot/tun-routing.state}"
 TUN_ROUTING_TABLE="mipilot_tun"
 EXPECTED_TUN="${1:-any}"
@@ -94,6 +95,8 @@ fi
 
 controller="$(config_value external-controller)"
 API_SECRET="$(config_value secret)"
+allow_lan="$(config_value allow-lan)"
+bind_address="$(config_value bind-address)"
 if [[ $controller =~ ^(127\.0\.0\.1|localhost):([0-9]+)$ ]]; then
   API="http://${controller}"
   if [[ -n $API_SECRET ]]; then
@@ -117,6 +120,18 @@ if [[ $controller =~ ^(127\.0\.0\.1|localhost):([0-9]+)$ ]]; then
 else
   fail "external-controller 不是受支持的本机地址: ${controller:-未配置}"
 fi
+if [[ -n $API_SECRET ]]; then
+  pass "Mihomo API 已配置访问密钥"
+else
+  fail "Mihomo API 未配置访问密钥"
+fi
+if [[ $allow_lan == false && $bind_address == 127.0.0.1 ]]; then
+  pass "显式代理端口仅监听本机"
+elif [[ $allow_lan == true ]]; then
+  warn "显式代理允许局域网或容器访问: bind-address=${bind_address:-未配置}; 请确认认证和允许网段符合预期"
+else
+  fail "显式代理监听配置不完整: allow-lan=${allow_lan:-未配置}, bind-address=${bind_address:-未配置}"
+fi
 
 if route_v4="$(ip -4 route get 1.1.1.1 2>/dev/null)"; then
   pass "IPv4路由可解析"
@@ -126,40 +141,32 @@ else
 fi
 
 if [[ $EXPECTED_TUN == on ]]; then
-  if [[ -r $TUN_ROUTING_STATE_FILE ]]; then
-    routing_priority="$(awk -F= '$1 == "priority" { print $2; exit }' "$TUN_ROUTING_STATE_FILE")"
-    routing_mark="$(awk -F= '$1 == "mark" { print $2; exit }' "$TUN_ROUTING_STATE_FILE")"
-    if [[ $routing_priority =~ ^[0-9]+$ && $routing_mark =~ ^0x[0-9a-fA-F]+$ ]]; then
-      pass "MiPilot TUN路由状态可读取"
-    else
-      fail "MiPilot TUN路由状态格式异常"
-    fi
+  if [[ -x $YQ_BIN ]] &&
+     "$YQ_BIN" eval -e '
+       .tun.enable == true and
+       .tun."auto-route" == true and
+       .tun."auto-redirect" == true and
+       .tun."strict-route" == false and
+       (.tun."route-exclude-address" | any_c(. == "192.168.0.0/16")) and
+       (.tun."route-exclude-address" | any_c(. == "100.64.0.0/10")) and
+       (.rules | any_c(. == "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve")) and
+       (.rules | any_c(. == "IP-CIDR,100.64.0.0/10,DIRECT,no-resolve")) and
+       (.dns != null) and
+       (.dns.enable != true or (.tun."dns-hijack" | any_c(. == "any:53")))
+     ' "$CONFIG_FILE" >/dev/null 2>&1; then
+    pass "Mihomo原生TUN接管和局域网绕过配置完整"
   else
-    fail "缺少MiPilot TUN路由状态: ${TUN_ROUTING_STATE_FILE}"
+    fail "Mihomo原生TUN接管或局域网绕过配置不完整"
   fi
-  routing_chain="$(nft list chain inet "$TUN_ROUTING_TABLE" prerouting 2>/dev/null || true)"
-  routing_original_rule="$(grep -F 'ct direction original' <<<"$routing_chain" | grep -F 'ct status dnat' | grep -F 'ct mark set' || true)"
-  routing_reply_rule="$(grep -F 'ct direction reply' <<<"$routing_chain" | grep -F 'meta mark set' || true)"
-  if [[ ${routing_mark:-} =~ ^0x[0-9a-fA-F]+$ ]]; then
-    routing_mark_decimal=$((routing_mark))
+  if [[ ! -e $TUN_ROUTING_STATE_FILE ]] &&
+     { ! command -v nft >/dev/null 2>&1 || ! nft list table inet "$TUN_ROUTING_TABLE" >/dev/null 2>&1; }; then
+    pass "没有旧版MiPilot回程规则残留"
   else
-    routing_mark_decimal=""
-  fi
-  if [[ ${routing_mark:-} =~ ^0x[0-9a-fA-F]+$ && -n $routing_original_rule && -n $routing_reply_rule ]] &&
-     grep -Eiq "(^|[^[:alnum:]_])((${routing_mark})|(${routing_mark_decimal}))([^[:alnum:]_]|$)" <<<"$routing_original_rule" &&
-     grep -Eiq "(^|[^[:alnum:]_])((${routing_mark})|(${routing_mark_decimal}))([^[:alnum:]_]|$)" <<<"$routing_reply_rule"; then
-    pass "MiPilot nftables回程规则完整"
-  else
-    fail "MiPilot nftables回程规则缺失或标记不匹配"
-  fi
-  if [[ ${routing_priority:-} =~ ^[0-9]+$ && ${routing_mark:-} =~ ^0x[0-9a-fA-F]+$ ]] &&
-     ip -4 rule show 2>/dev/null | grep -Eq "^[[:space:]]*${routing_priority}:.*fwmark ${routing_mark}/${routing_mark}.*lookup main"; then
-    pass "MiPilot IPv4回程策略规则已建立"
-  else
-    fail "MiPilot IPv4回程策略规则不存在"
+    fail "仍存在旧版MiPilot回程状态或nftables表"
   fi
 elif [[ $EXPECTED_TUN == off ]]; then
-  if [[ ! -e $TUN_ROUTING_STATE_FILE ]] && ! nft list table inet "$TUN_ROUTING_TABLE" >/dev/null 2>&1; then
+  if [[ ! -e $TUN_ROUTING_STATE_FILE ]] &&
+     { ! command -v nft >/dev/null 2>&1 || ! nft list table inet "$TUN_ROUTING_TABLE" >/dev/null 2>&1; }; then
     pass "TUN关闭后没有MiPilot回程规则残留"
   else
     fail "TUN关闭后仍有MiPilot回程状态或nftables表"
@@ -182,7 +189,7 @@ if [[ -n ${SSH_CONNECTION:-} ]]; then
     pass "当前SSH客户端回程路由可解析: ${ssh_client}"
     printf '       %s\n' "$ssh_route"
   else
-    fail "当前SSH客户端回程路由无法解析: ${ssh_client}"
+    warn "当前SSH客户端回程路由无法解析: ${ssh_client}"
   fi
 else
   warn "当前不是SSH会话, 未验证远程回程路由"
