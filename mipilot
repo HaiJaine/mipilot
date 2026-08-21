@@ -973,7 +973,11 @@ materialize_mipilot_state() {
   local temporary
 
   mipilot_config_is_valid || return 1
-  sudo install -d -m 700 "$CONFIG_DIR" || return 1
+  if [[ $(installed_runtime_mode) == service ]]; then
+    ensure_service_runtime_permissions || return 1
+  else
+    sudo install -d -m 700 "$CONFIG_DIR" || return 1
+  fi
   temporary="$(mktemp /tmp/mipilot-derived.XXXXXX)" || return 1
 
   # shellcheck disable=SC2024

@@ -573,7 +573,16 @@ EOF
   assert_file_has_line "$SUBSCRIPTION_LIST_FILE" 'https://two.example/sub' "materialized subscriptions" || return 1
   assert_file_has_line "$REGION_STATE_FILE" 'custom-1;MiPilot-日本;Japan;url-test' "materialized custom group" || return 1
   assert_equal "Proxy" "$(cat "$REGION_PARENT_FILE")" "materialized rule parent" || return 1
-  assert_equal "true" "$(cat "$TUN_STATE_FILE")" "materialized TUN state"
+  assert_equal "true" "$(cat "$TUN_STATE_FILE")" "materialized TUN state" || return 1
+
+  installed_runtime_mode() {
+    printf 'service\n'
+  }
+  ensure_service_runtime_permissions() {
+    touch "$root/service-permissions-preserved"
+  }
+  materialize_mipilot_state || return 1
+  assert_exists "$root/service-permissions-preserved"
 }
 
 test_reconcile_skips_semantic_only_changes() {
