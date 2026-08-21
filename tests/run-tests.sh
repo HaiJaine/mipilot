@@ -332,7 +332,7 @@ test_find_local_assets() {
   register_temp_dir_cleanup "$root"
   load_manager || return 1
 
-  mkdir -p -- "$root/lower" "$root/upper" "$root/plain" "$root/wrong-arch"
+  mkdir -p -- "$root/lower" "$root/upper" "$root/plain" "$root/update" "$root/wrong-arch"
 
   printf 'country\n' >"$root/lower/country.mmdb"
   printf 'geosite\n' >"$root/lower/geosite.dat"
@@ -380,6 +380,18 @@ test_find_local_assets() {
   assert_equal "plain-mihomo" "$(cat "$staged")" "staged uncompressed Mihomo" || return 1
   stage_mihomo_source "$root/plain/mihomo-linux-amd64-v9.9.9.gz" "$staged" || return 1
   assert_equal "compressed-mihomo" "$(cat "$staged")" "staged compressed Mihomo" || return 1
+
+  printf 'country\n' >"$root/update/country.mmdb"
+  printf 'geosite\n' >"$root/update/geosite.dat"
+  printf 'core\n' >"$root/update/mihomo"
+  if find_local_assets "$root/update"; then
+    fail "installation assets without yq were accepted"
+    return 1
+  fi
+  find_local_assets "$root/update" 0 || {
+    fail "three-file local update assets were rejected"
+    return 1
+  }
 
   printf 'country\n' >"$root/wrong-arch/country.mmdb"
   printf 'geosite\n' >"$root/wrong-arch/geosite.dat"
@@ -1005,6 +1017,7 @@ test_download_uses_curl_without_forced_proxy() {
   assert_equal "1" "$route_notice_count" "route notice count" || return 1
   assert_line_count "$arguments_file" "curl" 2 "download command count" || return 1
   assert_file_has_line "$arguments_file" "-4" "IPv4 download option" || return 1
+  assert_file_has_line "$arguments_file" "600" "slow release download timeout" || return 1
   assert_file_has_line "$arguments_file" "https://example.test/file" "download URL" || return 1
   if grep -Eq -- '^--(proxy|noproxy)$' "$arguments_file"; then
     fail "download command forced a proxy mode"
@@ -2467,6 +2480,47 @@ test_terminal_output_sanitization() {
   output="$(cat "$root/output")"
   [[ $output != *$'\e'* && $output != *$'\t'* ]] || fail "control characters leaked into selection output" || return 1
   assert_equal "$unsafe" "$SELECTED" "unsanitized selected value"
+}
+
+test_mihomo_validation_output_filter() {
+  local output
+
+  load_manager || return 1
+  output="$(printf '%s\n' \
+    'time="2026-08-21T00:00:00Z" level=info msg="initializing"' \
+    'time="2026-08-21T00:00:01Z" level=warning msg="deprecated setting"' \
+    'time="2026-08-21T00:00:02Z" level=error msg="invalid setting"' \
+    'configuration file /tmp/config.yaml test is successful' \
+    | filter_mihomo_validation_output)"
+  [[ $output != *'level=info'* && $output != *'2026-08-21'* ]] || return 1
+  [[ $output == *'警告: deprecated setting'* ]] || return 1
+  [[ $output == *'错误: invalid setting'* ]] || return 1
+  [[ $output == *'configuration file /tmp/config.yaml test is successful'* ]] || return 1
+}
+
+test_mihomo_validation_call_sites_use_filter() {
+  if grep -Eq '^[[:space:]]+sudo( -n)? "\$[^\"]+" -t -d' "$MANAGER_SCRIPT"; then
+    fail "found a Mihomo validation call that bypasses run_mihomo_validation"
+    return 1
+  fi
+}
+
+test_install_marker_updates_persistent_runtime() {
+  local body
+
+  body="$(sed -n '/^write_manager_install_marker() {/,/^}/p' "$MANAGER_SCRIPT")"
+  grep -Fq 'update_mipilot_runtime "$runtime_mode" || return 1' <<<"$body" || \
+    fail "installation marker does not synchronize persistent runtime mode"
+}
+
+test_existing_adoption_prepares_service_permissions() {
+  local body
+
+  body="$(sed -n '/^adopt_existing_install() {/,/^}/p' "$MANAGER_SCRIPT")"
+  grep -Fq 'ensure_service_account ||' <<<"$body" || \
+    fail "existing installation adoption does not create the managed service account"
+  grep -Fq 'ensure_service_runtime_permissions ||' <<<"$body" || \
+    fail "existing installation adoption does not apply the service permission contract"
 }
 
 test_custom_strategy_name_rejects_control_characters() {
@@ -4151,6 +4205,10 @@ run_test "progress runner output streams" test_progress_runner_preserves_output_
 run_test "progress runner waits for external command" test_progress_runner_waits_for_external_command
 run_test "progress timeout stops child processes" test_progress_timeout_stops_child_processes
 run_test "terminal output sanitization" test_terminal_output_sanitization
+run_test "Mihomo validation output filter" test_mihomo_validation_output_filter
+run_test "Mihomo validation call-site filter" test_mihomo_validation_call_sites_use_filter
+run_test "install marker persistent runtime sync" test_install_marker_updates_persistent_runtime
+run_test "existing adoption service permissions" test_existing_adoption_prepares_service_permissions
 run_test "interactive menu requires TTY" test_interactive_menu_requires_tty
 run_test "service account validation" test_service_account_validation
 run_test "config permission snapshot restore" test_config_permission_snapshot_restore

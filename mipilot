@@ -200,6 +200,29 @@ terminal_safe_stderr() {
   fi
 }
 
+filter_mihomo_validation_output() {
+  awk '
+    /level=warning/ {
+      sub(/^time="[^"]+" level=warning msg="/, "警告: ")
+      sub(/"$/, "")
+      print
+      next
+    }
+    /level=error/ {
+      sub(/^time="[^"]+" level=error msg="/, "错误: ")
+      sub(/"$/, "")
+      print
+      next
+    }
+    !/level=info/ && !/INFO\[/
+  '
+}
+
+run_mihomo_validation() {
+  "$@" 2>&1 | filter_mihomo_validation_output
+  return "${PIPESTATUS[0]}"
+}
+
 require_interactive_terminal() {
   if [[ ! -t 0 || ! -t 1 ]]; then
     echo "交互菜单需要连接终端, 不支持通过管道或重定向提供输入." >&2
@@ -1118,7 +1141,7 @@ reconcile_runtime_config_from_mipilot() {
     return 0
   fi
   echo "检测到 MiPilot 持久设置与当前配置不一致, 正在同步 Mihomo 配置..."
-  sudo "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$tun_temporary" || {
+  run_mihomo_validation sudo "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$tun_temporary" || {
     rm -f -- "$mode_temporary" "$tun_temporary"
     echo "MiPilot 持久配置无法通过 Mihomo 验证, 现有运行配置未改变."
     return 1
@@ -1911,16 +1934,7 @@ apply_tun_setting() {
 
   echo "[2/5] 验证配置"
   run_cancellable_named "正在验证 TUN 配置" 35 \
-    sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$temporary" 2>&1 \
-    | awk '
-        /level=warning/ {
-          sub(/^time="[^"]+" level=warning msg="/, "警告: ")
-          sub(/"$/, "")
-          print
-          next
-        }
-        !/level=info/ && !/INFO\[/
-      '
+    run_mihomo_validation sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$temporary"
   status=$?
   if (( status == 130 )); then
     rm -f -- "$temporary"
@@ -2388,7 +2402,7 @@ ensure_store_selected() {
     return 1
   fi
   run_cancellable_named "正在验证节点选择持久化配置" 45 \
-    sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$temporary"
+    run_mihomo_validation sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$temporary"
   status=$?
   if (( status != 0 )); then
     rm -f -- "$temporary"
@@ -3198,7 +3212,7 @@ apply_region_group_state() {
   fi
   mv -f -- "$selector_config" "$temporary_config"
   run_cancellable_named "正在验证地区策略组配置" 45 \
-    sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$temporary_config"
+    run_mihomo_validation sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$temporary_config"
   status=$?
   if (( status != 0 )); then
     rm -f -- "$temporary_config"
@@ -4605,7 +4619,7 @@ switch_mode() {
     return 1
   fi
   run_cancellable_named "正在验证运行模式配置" 45 \
-    sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$temporary"
+    run_mihomo_validation sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$temporary"
   status=$?
   if (( status != 0 )); then
     rm -f -- "$temporary"
@@ -4936,7 +4950,7 @@ download_and_apply_subscription() {
   mv -f -- "$api_temporary" "$temporary"
 
   run_cancellable_named "正在验证新订阅配置" 45 \
-    sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$temporary"
+    run_mihomo_validation sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$temporary"
   status=$?
   if (( status == 130 )); then
     rm -f -- "$temporary"
@@ -5559,7 +5573,7 @@ delete_managed_subscription() {
       return 1
     }
     run_cancellable_named "正在验证无节点直连配置" 45 \
-      sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$config_temporary"
+      run_mihomo_validation sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$config_temporary"
     status=$?
     if (( status != 0 )); then
       sudo rm -rf -- "$state_snapshot"
@@ -6016,6 +6030,7 @@ STAGED_MIHOMO_BIN=""
 
 find_local_assets() {
   local directory="${1:-$SCRIPT_DIR}"
+  local require_yq="${2:-1}"
   local candidate
   local candidates=()
   local sorted=()
@@ -6048,7 +6063,8 @@ find_local_assets() {
     LOCAL_YQ_SOURCE="$directory/yq_linux_amd64"
   fi
 
-  [[ -n $LOCAL_MIHOMO_SOURCE && -n $LOCAL_COUNTRY_MMDB && -n $LOCAL_GEOSITE_DAT && -n $LOCAL_YQ_SOURCE ]]
+  [[ -n $LOCAL_MIHOMO_SOURCE && -n $LOCAL_COUNTRY_MMDB && -n $LOCAL_GEOSITE_DAT ]] || return 1
+  (( require_yq == 0 )) || [[ -n $LOCAL_YQ_SOURCE ]]
 }
 
 show_required_local_assets() {
@@ -6066,6 +6082,22 @@ show_required_local_assets() {
   https://github.com/MetaCubeX/mihomo/releases/latest
   https://github.com/MetaCubeX/meta-rules-dat/releases/latest
   https://github.com/mikefarah/yq/releases/tag/v${YQ_VERSION}
+EOF
+}
+
+show_required_local_update_assets() {
+  cat <<'EOF'
+请把以下3个文件放到同一目录后重试:
+  country.mmdb
+  geosite.dat
+  mihomo-linux-amd64-v<版本>.gz
+
+也兼容已解压的文件:
+  mihomo
+
+官方地址:
+  https://github.com/MetaCubeX/mihomo/releases/latest
+  https://github.com/MetaCubeX/meta-rules-dat/releases/latest
 EOF
 }
 
@@ -6134,7 +6166,7 @@ rules:
   - GEOIP,cn,DIRECT,no-resolve
   - MATCH,DIRECT
 EOF
-  if ! "$STAGED_MIHOMO_BIN" -t -d "$validation_dir" -f "$validation_config"; then
+  if ! run_mihomo_validation "$STAGED_MIHOMO_BIN" -t -d "$validation_dir" -f "$validation_config"; then
     echo "Mihomo 或地理数据验证失败."
     rm -rf -- "$validation_dir"
     rm -f -- "$STAGED_MIHOMO_BIN"
@@ -6635,7 +6667,7 @@ validate_existing_config_with_staged_core() {
     sudo rm -rf -- "$validation_dir"
     return 1
   fi
-  sudo "$STAGED_MIHOMO_BIN" -t -d "$validation_dir"
+  run_mihomo_validation sudo "$STAGED_MIHOMO_BIN" -t -d "$validation_dir"
   local status=$?
   sudo rm -rf -- "$validation_dir"
   return "$status"
@@ -6753,7 +6785,7 @@ install_from_local_bundle() {
   else
     config_temporary="$(mktemp /tmp/mipilot-initial.XXXXXX.yaml)" || return 1
     render_minimal_config "$config_temporary" || return 1
-    "$STAGED_MIHOMO_BIN" -t -d "$(dirname -- "$config_temporary")" -f "$config_temporary" || {
+    run_mihomo_validation "$STAGED_MIHOMO_BIN" -t -d "$(dirname -- "$config_temporary")" -f "$config_temporary" || {
       rm -f -- "$STAGED_MIHOMO_BIN" "$config_temporary"
       return 1
     }
@@ -6835,7 +6867,7 @@ install_from_local_bundle() {
       return 1
     }
   fi
-  sudo "$MIHOMO_BIN" -t -d "$CONFIG_DIR" 2>&1 | terminal_safe_stdout
+  run_mihomo_validation sudo "$MIHOMO_BIN" -t -d "$CONFIG_DIR" | terminal_safe_stdout
   status=${PIPESTATUS[0]}
   if (( status != 0 )); then
     rollback_local_install "$config_backup" "$had_config" "$previous_runtime_active" "$previous_service_enabled"
@@ -6942,6 +6974,7 @@ release_manager_lock() {
 
 adopt_existing_install() {
   local existing_binary
+  local permission_snapshot
   local service_exec_start
 
   if ! command -v mihomo >/dev/null 2>&1 && [[ ! -x $MIHOMO_BIN ]]; then
@@ -6964,7 +6997,20 @@ adopt_existing_install() {
     echo "请选择使用离线包重新安装, 以避免更新了文件却仍运行旧内核."
     return 1
   fi
-  install_manager_files service || return 1
+  permission_snapshot="$(mktemp /tmp/mipilot-adopt-permissions.XXXXXX)" || return 1
+  capture_config_permission_state "$permission_snapshot" || {
+    rm -f -- "$permission_snapshot"
+    return 1
+  }
+  if ! ensure_service_account ||
+     ! ensure_service_runtime_permissions ||
+     ! install_manager_files service; then
+    restore_config_permission_state "$permission_snapshot" || true
+    rm -f -- "$permission_snapshot"
+    echo "现有 Mihomo 权限接管失败, 已尝试恢复原权限."
+    return 1
+  fi
+  rm -f -- "$permission_snapshot"
   migrate_legacy_backups || true
   cleanup_expired_rollbacks || true
   echo "已无损接管现有 Mihomo, 当前内核、配置和服务均未替换."
@@ -7232,8 +7278,8 @@ download_file() {
     else
       echo "正在重试: ${label} (${attempt}/3)"
     fi
-    run_cancellable_named "正在下载 ${label}" 185 \
-      curl -4 -fL -sS --show-error --connect-timeout 15 --max-time 180 \
+    run_cancellable_named "正在下载 ${label}" 605 \
+      curl -4 -fL -sS --show-error --connect-timeout 15 --max-time 600 \
       "$url" -o "$output_file"
     status=$?
     if (( status == 0 )); then
@@ -7289,7 +7335,7 @@ update_core_from_archive() {
   fi
 
   run_cancellable_named "正在用新内核验证现有配置" 45 \
-    sudo -n "$staged" -t -d "$CONFIG_DIR"
+    run_mihomo_validation sudo -n "$staged" -t -d "$CONFIG_DIR"
   status=$?
   if (( status != 0 )); then
     rm -f -- "$staged"
@@ -7339,7 +7385,7 @@ rules:
   - GEOIP,cn,DIRECT,no-resolve
   - MATCH,DIRECT
 EOF
-  sudo -n "$MIHOMO_BIN" -t -d "$validation_dir" -f "${validation_dir}/config.yaml"
+  run_mihomo_validation sudo -n "$MIHOMO_BIN" -t -d "$validation_dir" -f "${validation_dir}/config.yaml"
   local status=$?
   rm -rf -- "$validation_dir"
   return "$status"
@@ -7385,7 +7431,7 @@ update_geo_from_files() {
     return 1
   }
   if ! run_cancellable_named "正在验证更新后的地理数据" 45 \
-       sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" || \
+       run_mihomo_validation sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" || \
      ! restore_mihomo_runtime_state "$was_active"; then
     recover_geo_after_failed_update "$was_active" || true
     return 1
@@ -7484,7 +7530,11 @@ write_manager_install_marker() {
   local status=$?
   rm -f -- "$temporary"
   if (( status == 0 )); then
-    sync_mipilot_config_from_state || return 1
+    if mipilot_config_is_valid; then
+      update_mipilot_runtime "$runtime_mode" || return 1
+    else
+      sync_mipilot_config_from_state || return 1
+    fi
   fi
   return "$status"
 }
@@ -7694,7 +7744,7 @@ validate_combined_update() {
     sudo -n rm -rf -- "$validation_dir"
     return 1
   }
-  sudo -n "$staged_core" -t -d "$validation_dir"
+  run_mihomo_validation sudo -n "$staged_core" -t -d "$validation_dir"
   local status=$?
   sudo -n rm -rf -- "$validation_dir"
   return "$status"
@@ -7801,7 +7851,7 @@ update_all_from_files() {
   fi
   rm -f -- "$staged_core"
   if ! run_cancellable_named "正在验证组合更新配置" 45 \
-       sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" ||
+       run_mihomo_validation sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" ||
      ! restore_mihomo_runtime_state "$was_active" "$new_version"; then
     recover_combined_update "$core_changed" "$geo_changed" "$current_version" "$was_active" || true
     return 1
@@ -7838,9 +7888,9 @@ local_update_all() {
   if (( status != 0 )); then return "$status"; fi
   directory="$(trim_input_whitespace "$INPUT_LINE")"
   directory="${directory:-$PWD}"
-  if ! find_local_assets "$directory"; then
+  if ! find_local_assets "$directory" 0; then
     echo "目录中没有完整的3个更新文件: ${directory}"
-    show_required_local_assets
+    show_required_local_update_assets
     return 1
   fi
   update_all_from_files "$LOCAL_MIHOMO_SOURCE" "$LOCAL_COUNTRY_MMDB" "$LOCAL_GEOSITE_DAT" "本地文件"
@@ -7916,7 +7966,7 @@ manual_rollback_core() {
     fi
     return 1
   fi
-  if ! run_cancellable_named "正在验证回退内核" 45 sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" || \
+  if ! run_cancellable_named "正在验证回退内核" 45 run_mihomo_validation sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" || \
      ! restore_mihomo_runtime_state "$was_active"; then
     if atomic_install_file 755 "$current" "$MIHOMO_BIN" && restore_mihomo_runtime_state "$was_active" "$current_version"; then
       echo "回退内核未能运行, 已恢复回退前版本."
@@ -7969,7 +8019,7 @@ manual_rollback_geo() {
     fi
     return 1
   fi
-  if ! run_cancellable_named "正在验证回退地理数据" 45 sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" || \
+  if ! run_cancellable_named "正在验证回退地理数据" 45 run_mihomo_validation sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" || \
      ! restore_mihomo_runtime_state "$was_active" "$current_version"; then
     if atomic_install_file 644 "${current_dir}/Country.mmdb" "${CONFIG_DIR}/Country.mmdb" &&
        atomic_install_file 644 "${current_dir}/GeoSite.dat" "${CONFIG_DIR}/GeoSite.dat" &&
@@ -8219,7 +8269,7 @@ restore_config_backup_menu() {
     }
   fi
   run_cancellable_named "正在验证备份配置" 45 \
-    sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$selected_copy" || {
+    run_mihomo_validation sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$selected_copy" || {
     sudo rm -f -- "$selected_copy"
     echo "备份配置验证失败, 未执行恢复."
     return 1
@@ -8331,7 +8381,7 @@ switch_runtime_mode() {
   ensure_sudo_access || return 1
   current_mode="$(installed_runtime_mode)"
   current_version="$(current_core_version)"
-  run_blocking "正在验证 Mihomo 配置" 45 sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" || return 1
+  run_blocking "正在验证 Mihomo 配置" 45 run_mihomo_validation sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" || return 1
   save_component_rollback service || return 1
 
   if [[ $current_mode == manual ]]; then
@@ -8392,7 +8442,7 @@ generate_diagnostic_report() {
   local validation
 
   report="${USER_HOME}/mihomo-diagnostic-$(date +%Y%m%d-%H%M%S).txt"
-  validation="$(sudo "$MIHOMO_BIN" -t -d "$CONFIG_DIR" 2>&1 || true)"
+  validation="$(run_mihomo_validation sudo "$MIHOMO_BIN" -t -d "$CONFIG_DIR" || true)"
   {
     echo "mipilot Diagnostic"
     echo "generated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -8438,7 +8488,7 @@ repair_installation_menu() {
         echo "当前核心文件不完整, 请使用本地离线包修复."
         return 1
       fi
-      run_blocking "正在验证 Mihomo 配置" 45 sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" || return 1
+      run_blocking "正在验证 Mihomo 配置" 45 run_mihomo_validation sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" || return 1
       current_version="$(current_core_version)"
       runtime_mode="$(installed_runtime_mode)"
       runtime_is_active && was_active=1
@@ -8607,7 +8657,7 @@ test_and_restart() {
 
   ensure_sudo_access || return 1
   run_cancellable_named "正在验证 Mihomo 配置" 45 \
-    sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR"
+    run_mihomo_validation sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR"
   status=$?
   if (( status == 130 )); then return 130; fi
   if (( status != 0 )); then
