@@ -7499,17 +7499,23 @@ online_update_manager() {
     echo "MiPilot SHA-256 校验失败, 当前版本未改变."
     return 1
   fi
-  download_file "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_amd64" \
-    "$yq_candidate" "yq v${YQ_VERSION}" || {
-    rm -rf -- "$temporary_dir"
-    echo "无法下载结构化 YAML 处理组件, 当前版本未改变."
-    return 1
-  }
-  validate_yq_asset "$yq_candidate" || {
-    rm -rf -- "$temporary_dir"
-    echo "yq 校验失败, 当前版本未改变."
-    return 1
-  }
+  if sudo test -x "$YQ_BIN" && copy_privileged_file_to_temp "$YQ_BIN" "$yq_candidate" && \
+     validate_yq_asset "$yq_candidate"; then
+    echo "本机 yq v${YQ_VERSION} 校验通过, 无需重复下载."
+  else
+    rm -f -- "$yq_candidate"
+    download_file "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_amd64" \
+      "$yq_candidate" "yq v${YQ_VERSION}" || {
+      rm -rf -- "$temporary_dir"
+      echo "无法下载结构化 YAML 处理组件, 当前版本未改变."
+      return 1
+    }
+    validate_yq_asset "$yq_candidate" || {
+      rm -rf -- "$temporary_dir"
+      echo "yq 校验失败, 当前版本未改变."
+      return 1
+    }
+  fi
   if ! head -n 1 "$candidate" | grep -Fqx '#!/usr/bin/env bash' || \
      ! grep -Fq 'MANAGER_INSTALLED_SCRIPT=' "$candidate" || \
      ! run_cancellable_named "正在检查新管理脚本语法" 20 bash -n "$candidate"; then
