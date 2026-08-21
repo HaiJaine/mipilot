@@ -1326,6 +1326,16 @@ test_rule_mode_selects_managed_group() {
     'proxy-groups:' \
     '  - name: "🚀节点选择"' \
     '    type: select' \
+    '    proxies: ["自动选择"]' \
+    '  - name: "自动选择"' \
+    '    type: url-test' \
+    '    proxies: ["香港01", "日本01"]' \
+    '  - name: "AI网站"' \
+    '    type: select' \
+    '    proxies: ["🚀节点选择", "DIRECT"]' \
+    '  - name: "MiPilot-亚洲优选"' \
+    '    type: url-test' \
+    '    proxies: ["日本01", "新加坡01"]' \
     'rules:' \
     '  - MATCH,🚀节点选择' >"$CONFIG_FILE"
   printf '%s\n' '{"rule_selection":{"parent":"🚀节点选择","group":"🚀节点选择"}}' >"$MANAGER_CONFIG_FILE"
@@ -1372,6 +1382,76 @@ test_rule_mode_selects_managed_group() {
   grep -Fq '/proxies/MiPilot-%E8%A7%84%E5%88%99%E9%80%89%E6%8B%A9' "$api_calls" || fail "MiPilot rule selector API target was missing" || return 1
   grep -Fq 'MiPilot-亚洲优选' "$api_calls" || fail "custom strategy API selection was missing" || return 1
   assert_equal 'rule 🚀节点选择 MiPilot-亚洲优选' "$(cat "$saved_selection")" "persisted rule strategy selection"
+}
+
+test_rule_mode_discovers_config_groups_when_selector_stale() {
+  local root
+  local api_calls
+  local choices_file
+  local saved_selection
+  local api_response
+  local item
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  CONFIG_FILE="$root/config.yaml"
+  MANAGER_CONFIG_FILE="$root/config.json"
+  REGION_STATE_FILE="$root/region-groups.conf"
+  API='http://127.0.0.1:9090'
+  api_calls="$root/api-calls"
+  choices_file="$root/choices"
+  saved_selection="$root/saved-selection"
+  printf '%s\n' \
+    'proxy-groups:' \
+    '  - name: "良心云"' \
+    '    type: select' \
+    '    proxies: ["自动选择"]' \
+    '  - name: "自动选择"' \
+    '    type: url-test' \
+    '    proxies: ["日本01"]' \
+    '  - name: "MiPilot-规则选择"' \
+    '    type: select' \
+    '    proxies: ["DIRECT"]' \
+    'rules:' \
+    '  - MATCH,MiPilot-规则选择' >"$CONFIG_FILE"
+  api_response='{"proxies":{"MiPilot-规则选择":{"type":"Selector","all":["DIRECT"],"now":"DIRECT"},"良心云":{"type":"Selector","all":["自动选择"],"now":"自动选择"},"自动选择":{"type":"URLTest","all":["日本01"],"now":"日本01"},"日本01":{"type":"Vmess"},"DIRECT":{"type":"Direct"},"GLOBAL":{"type":"Selector","all":["日本01"],"now":"日本01"}}}'
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+  api() {
+    if (( $# == 1 )); then
+      printf '%s\n' "$api_response"
+    else
+      printf '%s\n' "$*" >>"$api_calls"
+    fi
+  }
+  choose_item() {
+    printf '%s\n' "$@" >"$choices_file"
+    for item in "$@"; do
+      if [[ $item == *'[推荐] 自动选择 ['* ]]; then
+        SELECTED="$item"
+        return 0
+      fi
+    done
+    return 1
+  }
+  reconcile_runtime_config_from_mipilot() {
+    api_response='{"proxies":{"MiPilot-规则选择":{"type":"Selector","all":["良心云","自动选择"],"now":"DIRECT"},"良心云":{"type":"Selector","all":["自动选择"],"now":"自动选择"},"自动选择":{"type":"URLTest","all":["日本01"],"now":"日本01"},"日本01":{"type":"Vmess"},"DIRECT":{"type":"Direct"},"GLOBAL":{"type":"Selector","all":["日本01"],"now":"日本01"}}}'
+  }
+  refresh_api_config() {
+    :
+  }
+  update_mipilot_selection() {
+    printf '%s\n' "$*" >"$saved_selection"
+  }
+
+  manage_rule_nodes >/dev/null || return 1
+  grep -Fq '良心云' "$choices_file" || fail "top-level subscription selector was not listed" || return 1
+  grep -Fq '自动选择' "$choices_file" || fail "subscription URLTest group outside the stale selector was not listed" || return 1
+  grep -Fq '自动选择' "$api_calls" || fail "repaired selector did not switch to the selected subscription group" || return 1
+  assert_equal 'rule MiPilot-规则选择 自动选择' "$(cat "$saved_selection")" "selection after stale selector repair"
 }
 
 test_direct_rule_strategy_rendering() {
@@ -3310,6 +3390,7 @@ run_test "selected-node persistence rendering" test_render_store_selected_config
 run_test "custom region group rendering" test_custom_region_group_rendering
 run_test "custom region selection input" test_custom_region_selection_input
 run_test "rule mode managed-group selection" test_rule_mode_selects_managed_group
+run_test "rule mode stale selector group discovery" test_rule_mode_discovers_config_groups_when_selector_stale
 run_test "MiPilot rule selector rendering" test_direct_rule_strategy_rendering
 run_test "empty inline proxy groups rule selector rendering" test_empty_inline_proxy_groups_rule_selector_rendering
 run_test "indentless proxy groups rule selector rendering" test_indentless_proxy_groups_rule_selector_rendering

@@ -3719,6 +3719,7 @@ manage_rule_nodes() {
   local record
   local record_name
   local managed_group
+  local config_group_names
   local groups=()
   local display_groups=()
   local group_levels=()
@@ -3732,17 +3733,17 @@ manage_rule_nodes() {
   fi
   current="$(jq -r --arg selector "$RULE_SELECTOR_GROUP" '.proxies[$selector].now // empty' <<<"$response")"
   current="${current%$'\r'}"
-  mapfile -t groups < <(
-    jq -r --arg selector "$RULE_SELECTOR_GROUP" '
-      . as $root
-      | $root.proxies[$selector].all[]?
-      | . as $name
-      | select($root.proxies[$name].all != null)
-    ' <<<"$response"
-  )
-  for index in "${!groups[@]}"; do
-    groups[index]="${groups[index]%$'\r'}"
-  done
+  config_group_names="$(list_config_group_names "$CONFIG_FILE")" || {
+    echo "无法读取当前配置中的策略组."
+    return 1
+  }
+  while IFS= read -r group; do
+    group="${group%$'\r'}"
+    [[ -n $group ]] || continue
+    [[ $group == "$RULE_SELECTOR_GROUP" || $group == "$REGION_MANAGED_PARENT" || $group == GLOBAL ]] && continue
+    jq -e --arg group "$group" '.proxies[$group].all != null' <<<"$response" >/dev/null || continue
+    groups+=("$group")
+  done <<<"$config_group_names"
   for group in "${groups[@]}"; do
     group_type="$(jq -r --arg group "$group" '.proxies[$group].type // "未知"' <<<"$response")"
     active_node="$(jq -r --arg group "$group" '.proxies[$group].now // "自动"' <<<"$response")"
@@ -3803,6 +3804,23 @@ manage_rule_nodes() {
     echo "${group} 是订阅的业务分流策略组, 可能只服务特定规则, 不一定适合作为全部规则流量的出口."
     read_yes_no_or_back "仍要设为规则模式入口? [y/N] (Enter=否, Esc返回): " no || return
     [[ $CONFIRM_RESULT == yes ]] || { echo "已取消切换."; return 130; }
+  fi
+  if ! jq -e --arg selector "$RULE_SELECTOR_GROUP" --arg group "$group" \
+       '(.proxies[$selector].all // []) | index($group) != null' <<<"$response" >/dev/null; then
+    echo "检测到规则选择器尚未同步该策略组, 正在修复运行配置..."
+    if ! reconcile_runtime_config_from_mipilot; then
+      echo "规则选择器同步失败, 当前选择未改变."
+      return 1
+    fi
+    refresh_api_config
+    response="$(api "${API}/proxies")" || return
+    if ! jq -e --arg selector "$RULE_SELECTOR_GROUP" --arg group "$group" \
+         '(.proxies[$selector].all // []) | index($group) != null' <<<"$response" >/dev/null; then
+      echo "规则选择器仍未包含策略组 ${group}, 请运行维护中的配置检查."
+      return 1
+    fi
+    current="$(jq -r --arg selector "$RULE_SELECTOR_GROUP" '.proxies[$selector].now // empty' <<<"$response")"
+    current="${current%$'\r'}"
   fi
   if [[ $group != "$current" ]]; then
     selector_url="$(urlencode "$RULE_SELECTOR_GROUP")"
