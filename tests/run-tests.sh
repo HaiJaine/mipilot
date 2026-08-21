@@ -811,6 +811,51 @@ test_install_runtime_choice_defaults_manual() {
   assert_equal "service" "$SELECTED" "explicit service install runtime"
 }
 
+test_runtime_mode_switch_persists_manager_config() {
+  local mock_mode="service"
+  local installed_mode=""
+  local persisted_mode=""
+
+  load_manager || return 1
+  installed_runtime_mode() { printf '%s\n' "$mock_mode"; }
+  current_core_version() { printf '1.0.0\n'; }
+  run_blocking() { return 0; }
+  save_component_rollback() { return 0; }
+  manual_stop() { return 0; }
+  write_service_unit() { return 0; }
+  wait_for_mihomo_stable() { return 0; }
+  restore_manual_runtime_permissions() { return 0; }
+  remove_managed_service_account() { return 0; }
+  restore_component_rollback() { return 0; }
+  ensure_service_account() { return 0; }
+  ensure_service_runtime_permissions() { return 0; }
+  install_manager_files() {
+    installed_mode="$1"
+    mock_mode="$1"
+  }
+  update_mipilot_runtime() {
+    persisted_mode="$1"
+  }
+  sudo() {
+    while [[ ${1:-} == -n ]]; do shift; done
+    [[ ${1:-} == -v ]] && return 0
+    case "${1:-} ${2:-}" in
+      systemctl\ *|rm\ *) return 0 ;;
+      *) "$@" ;;
+    esac
+  }
+
+  switch_runtime_mode >/dev/null || return 1
+  assert_equal "manual" "$installed_mode" "service-to-manual installed mode" || return 1
+  assert_equal "manual" "$persisted_mode" "service-to-manual persisted mode" || return 1
+
+  installed_mode=""
+  persisted_mode=""
+  switch_runtime_mode >/dev/null || return 1
+  assert_equal "service" "$installed_mode" "manual-to-service installed mode" || return 1
+  assert_equal "service" "$persisted_mode" "manual-to-service persisted mode"
+}
+
 test_service_unit_reconciles_tun_routing() {
   local root
 
@@ -1330,7 +1375,7 @@ test_custom_region_selection_input() {
     cp -- "$1" "$captured_state"
   }
 
-  for selection in '3,4' $'3， 4\r'; do
+  for selection in '3,4' ' 3 , 4 ' $'3， 4\r' '3,3,4'; do
     if ! output="$(create_custom_region_group '{"proxies":{}}' 2>&1)"; then
       fail "custom region selection was rejected for $(printf '%q' "$selection"): ${output}"
       return 1
@@ -1340,12 +1385,20 @@ test_custom_region_selection_input() {
     grep -Fq '新加坡' "$captured_state" || fail "Singapore region pattern was not selected" || return 1
   done
 
-  selection="1 0"
+  for selection in '1 0' ',3' '3,' '3,,4' '3;4' '3,a' '9999999999'; do
+    if output="$(create_custom_region_group '{"proxies":{}}' 2>&1)"; then
+      fail "invalid region selection was accepted for $(printf '%q' "$selection")"
+      return 1
+    fi
+    grep -Fq '地区编号格式无效' <<<"$output" || fail "invalid region selection did not fail during parsing" || return 1
+  done
+
+  selection='15'
   if output="$(create_custom_region_group '{"proxies":{}}' 2>&1)"; then
-    fail "region selection containing internal whitespace was accepted"
+    fail "out-of-range region selection was accepted"
     return 1
   fi
-  grep -Fq '地区编号格式无效' <<<"$output" || fail "invalid region selection did not fail during parsing"
+  grep -Fq '地区编号无效' <<<"$output" || fail "out-of-range region selection did not report its value"
 }
 
 test_rule_mode_selects_managed_group() {
@@ -4015,6 +4068,7 @@ run_test "TUN preserves non-TUN state" test_tun_render_preserves_non_tun_state
 run_test "runtime marker precedence" test_runtime_mode_marker_precedence
 run_test "runtime backend dispatch" test_runtime_backend_dispatch
 run_test "manual install default" test_install_runtime_choice_defaults_manual
+run_test "runtime mode switch persists manager config" test_runtime_mode_switch_persists_manager_config
 run_test "install rollback restores runtime state" test_install_rollback_restores_runtime_state
 run_test "existing config asset preflight failure" test_existing_config_asset_preflight_failure
 run_test "service TUN routing lifecycle" test_service_unit_reconciles_tun_routing

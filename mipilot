@@ -3732,7 +3732,7 @@ create_custom_region_group() {
   selections="${selections//，/,}"
   selections="$(trim_input_whitespace "$selections")"
   [[ -n $selections ]] || return 130
-  if [[ ! $selections =~ ^[0-9]+[[:space:]]*(,[[:space:]]*[0-9]+[[:space:]]*)*$ ]]; then
+  if [[ $selections == ,* || $selections == *, || $selections == *,,* ]]; then
     echo "地区编号格式无效, 请使用逗号分隔, 例如 3,4."
     return 1
   fi
@@ -3741,6 +3741,10 @@ create_custom_region_group() {
   IFS=',' read -ra entries <<<"$selections"
   for entry in "${entries[@]}"; do
     number="$(trim_input_whitespace "$entry")"
+    if [[ ! $number =~ ^[0-9]+$ || ${#number} -gt 9 ]]; then
+      echo "地区编号格式无效, 请使用逗号分隔, 例如 3,4."
+      return 1
+    fi
     number_value=$((10#$number))
     if (( number_value < 1 || number_value > ${#region_codes[@]} )); then
       echo "地区编号无效: ${entry}"
@@ -6887,6 +6891,7 @@ install_from_local_bundle() {
     echo "当前为手动模式, Mihomo 未启动. 请运行 mipilot 后在运行维护中启动."
   fi
   [[ -n $config_backup ]] && echo "原配置备份: ${config_backup}"
+  return 0
 }
 
 acquire_manager_lock() {
@@ -8310,6 +8315,7 @@ switch_runtime_mode() {
     }
     manual_stop || return 1
     if ! write_service_unit || ! sudo systemctl daemon-reload || \
+       ! update_mipilot_runtime service || \
        ! install_manager_files service || \
        ! sudo systemctl enable --now mihomo || \
        ! wait_for_mihomo_stable 3 "$current_version"; then
@@ -8319,6 +8325,7 @@ switch_runtime_mode() {
       restore_manual_runtime_permissions || true
       remove_managed_service_account || true
       install_manager_files manual || true
+      update_mipilot_runtime manual || true
       echo "切换系统服务失败, 已恢复手动模式."
       return 1
     fi
@@ -8329,6 +8336,7 @@ switch_runtime_mode() {
       return 1
     fi
     if ! sudo rm -f -- "$SERVICE_FILE" || ! sudo systemctl daemon-reload || \
+       ! update_mipilot_runtime manual || \
        ! install_manager_files manual || \
        ! restore_manual_runtime_permissions || \
        ! remove_managed_service_account; then
@@ -8338,6 +8346,7 @@ switch_runtime_mode() {
       ensure_service_runtime_permissions || true
       install_manager_files service || true
       sudo systemctl enable --now mihomo >/dev/null 2>&1 || true
+      update_mipilot_runtime service || true
       echo "切换手动模式失败, 已尝试恢复系统服务."
       return 1
     fi
