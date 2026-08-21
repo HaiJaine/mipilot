@@ -257,6 +257,11 @@ test_linux_input_normalization() {
     fail "legacy Enter-to-return prompt remains"
     return 1
   fi
+  if grep -Eq '^[[:space:]]*clear[[:space:]]*$' "$MANAGER_SCRIPT"; then
+    fail "unguarded clear command remains"
+    return 1
+  fi
+  assert_equal "" "$(TERM= clear_screen)" "non-TTY screen clear output" || return 1
 
   read_count=0
   read_line_or_back() {
@@ -2817,6 +2822,9 @@ test_subscription_labels() {
 
   update_mipilot_subscription_label "$second_url" "灾备线路" || return 1
   assert_equal "灾备线路" "$(jq -r --arg url "$second_url" '.subscription.labels[$url]' "$MANAGER_CONFIG_FILE")" "updated subscription label" || return 1
+  if grep -Eq -- '--arg label([[:space:]]|$)' "$MANAGER_SCRIPT"; then
+    fail "reserved jq label keyword was used as an argument name"
+  fi
   update_mipilot_subscription_label "$second_url" "" || return 1
   assert_equal "false" "$(jq -r --arg url "$second_url" '.subscription.labels | has($url)' "$MANAGER_CONFIG_FILE")" "removed subscription label" || return 1
   display_text_has_control_characters $'异常\t名称' || fail "subscription label control character was accepted" || return 1
