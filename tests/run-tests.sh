@@ -665,6 +665,31 @@ EOF
   cmp -s -- "$MANAGER_CONFIG_FILE" "${backup%.yaml}.mipilot.json" || fail "MiPilot settings backup differs"
 }
 
+test_privileged_temp_copy_uses_caller_owned_output() {
+  local root
+  local source_file
+  local temporary_file
+  local sudo_command=""
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  source_file="$root/protected-source"
+  temporary_file="$root/caller-temp"
+  printf '%s\n' 'protected state' >"$source_file"
+  : >"$temporary_file"
+
+  sudo() {
+    sudo_command="${1:-}"
+    run_as_mock_sudo "$@"
+  }
+
+  copy_privileged_file_to_temp "$source_file" "$temporary_file" || return 1
+  assert_equal 'cat' "$sudo_command" "privileged snapshot read command" || return 1
+  assert_equal 'protected state' "$(cat "$temporary_file")" "privileged snapshot content" || return 1
+  rm -f -- "$temporary_file" || fail "caller-owned privileged snapshot could not be removed"
+}
+
 test_tun_render_preserves_non_tun_state() {
   local root
   local input_file
@@ -801,8 +826,18 @@ test_service_unit_reconciles_tun_routing() {
     mkdir -p -- "$(dirname -- "$destination")"
     cp -- "$source_file" "$destination"
   }
+  ensure_service_account() { return 0; }
+  ensure_service_runtime_permissions() { return 0; }
 
   write_service_unit || return 1
+  assert_file_has_line "$SERVICE_FILE" "User=${SERVICE_USER}" "dedicated Mihomo service user" || return 1
+  assert_file_has_line "$SERVICE_FILE" "ProtectSystem=strict" "Mihomo service filesystem protection" || return 1
+  assert_file_has_line "$SERVICE_FILE" "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW" "minimal Mihomo capabilities" || return 1
+  assert_file_has_line "$SERVICE_FILE" "ReadOnlyPaths=${CONFIG_FILE}" "read-only Mihomo primary config" || return 1
+  if grep -Fq 'CAP_NET_BIND_SERVICE' "$SERVICE_FILE"; then
+    fail "unnecessary low-port capability remains"
+    return 1
+  fi
   assert_file_has_line "$SERVICE_FILE" "ExecStartPre=+${MANAGER_COMMAND} --reconcile-tun-routing" "privileged service TUN routing setup" || return 1
   assert_file_has_line "$SERVICE_FILE" "ExecStart=\"${MIHOMO_BIN}\" -d \"${CONFIG_DIR}\"" "restricted Mihomo service process" || return 1
   assert_file_has_line "$SERVICE_FILE" "ExecStopPost=+${MANAGER_COMMAND} --remove-tun-routing" "privileged service TUN routing cleanup"
@@ -2161,6 +2196,388 @@ test_progress_runner_non_tty() {
   [[ $output == *"测试耗时操作..."* ]] || fail "non-TTY progress start was missing"
   [[ $output == *"result"* ]] || fail "progress command output was missing"
   [[ $output != *"Done"* ]] || fail "background completion noise leaked into output"
+}
+
+test_progress_runner_preserves_output_streams() {
+  local root
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  progress_stream_fixture() {
+    printf 'standard-output\n'
+    printf 'standard-error\n' >&2
+  }
+
+  run_blocking "测试输出流" 3 progress_stream_fixture >"$root/stdout" 2>"$root/stderr" || return 1
+  assert_file_has_line "$root/stdout" 'standard-output' "progress stdout" || return 1
+  if grep -Fq 'standard-error' "$root/stdout"; then
+    fail "progress stderr leaked into stdout"
+    return 1
+  fi
+  assert_file_has_line "$root/stderr" 'standard-error' "progress stderr"
+}
+
+test_progress_timeout_stops_child_processes() {
+  local root
+  local child_pid_file
+  local child_pid
+  local status=0
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  child_pid_file="$root/child.pid"
+  progress_child_fixture() {
+    trap '' TERM
+    sleep 20 &
+    printf '%s\n' "$!" >"$child_pid_file"
+    wait
+  }
+
+  run_blocking "测试超时清理" 1 progress_child_fixture >/dev/null 2>&1 || status=$?
+  assert_equal '124' "$status" "progress timeout status" || return 1
+  child_pid="$(cat "$child_pid_file")" || return 1
+  sleep 0.2
+  if kill -0 "$child_pid" 2>/dev/null; then
+    kill "$child_pid" 2>/dev/null || true
+    fail "progress timeout left a child process running"
+  fi
+}
+
+test_interactive_menu_requires_tty() {
+  local root
+  local status=0
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  require_interactive_terminal </dev/null >"$root/stdout" 2>"$root/stderr" || status=$?
+  assert_equal '1' "$status" "non-TTY interactive guard status" || return 1
+  assert_equal '' "$(cat "$root/stdout")" "non-TTY interactive guard stdout" || return 1
+  grep -Fq '交互菜单需要连接终端' "$root/stderr" || fail "non-TTY interactive guard message was missing"
+}
+
+test_service_account_validation() {
+  load_manager || return 1
+
+  getent() {
+    case "$1:$2" in
+      passwd:mipilot) printf 'mipilot:x:1:998::/nonexistent:/usr/sbin/nologin\n' ;;
+      group:mipilot) printf 'mipilot:x:998:\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  ensure_service_account || fail "valid dedicated service account was rejected" || return 1
+
+  getent() {
+    case "$1:$2" in
+      passwd:mipilot) printf 'mipilot:x:1000:998::/home/mipilot:/bin/bash\n' ;;
+      group:mipilot) printf 'mipilot:x:998:\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  if ensure_service_account >/dev/null 2>&1; then
+    fail "interactive pre-existing account was accepted as the service account"
+    return 1
+  fi
+}
+
+test_config_permission_snapshot_restore() {
+  local root
+  local snapshot
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  CONFIG_DIR="$root/etc/mihomo"
+  CONFIG_FILE="$CONFIG_DIR/config.yaml"
+  SERVICE_USER="mipilot-test-account-does-not-exist"
+  # shellcheck disable=SC2034
+  SERVICE_ACCOUNT_MARKER="$root/state/service-account-created"
+  snapshot="$root/permissions"
+  mkdir -p -- "$CONFIG_DIR"
+  printf 'mode: direct\n' >"$CONFIG_FILE"
+  chmod 755 "$CONFIG_DIR"
+  chmod 644 "$CONFIG_FILE"
+  sudo() { run_as_mock_sudo "$@"; }
+
+  capture_config_permission_state "$snapshot" || return 1
+  chmod 700 "$CONFIG_DIR"
+  chmod 600 "$CONFIG_FILE"
+  restore_config_permission_state "$snapshot" || return 1
+  assert_equal '755' "$(stat -c '%a' "$CONFIG_DIR")" "restored config directory mode" || return 1
+  assert_equal '644' "$(stat -c '%a' "$CONFIG_FILE")" "restored config file mode"
+}
+
+test_service_runtime_permission_contract() {
+  local root
+  local calls
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  CONFIG_DIR="$root/etc/mihomo"
+  CONFIG_FILE="$CONFIG_DIR/config.yaml"
+  calls="$root/calls"
+  sudo() {
+    while [[ ${1:-} == -n ]]; do shift; done
+    if [[ ${1:-} == test ]]; then return 0; fi
+    printf '%s\n' "$*" >>"$calls"
+  }
+
+  ensure_service_runtime_permissions || return 1
+  assert_file_has_line "$calls" "chown root:${SERVICE_GROUP} ${CONFIG_DIR} ${CONFIG_FILE}" "service config ownership" || return 1
+  assert_file_has_line "$calls" "chmod 770 ${CONFIG_DIR}" "service config directory mode" || return 1
+  assert_file_has_line "$calls" "chmod 640 ${CONFIG_FILE}" "service config file mode"
+}
+
+test_terminal_output_sanitization() {
+  local root
+  local unsafe
+  local output
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  unsafe=$'节点\e[31m\t名称'
+  assert_equal '节点[31m名称' "$(terminal_safe_text "$unsafe")" "terminal-safe text" || return 1
+  assert_equal $'第一行[31m\n第二行' "$(printf '第一行\e[31m\r\n第二行' | terminal_safe_output)" "terminal-safe streamed output" || return 1
+  read_choice_or_back() {
+    MENU_CHOICE=1
+  }
+  choose_item '测试列表:' "$unsafe" >"$root/output" || return 1
+  output="$(cat "$root/output")"
+  [[ $output != *$'\e'* && $output != *$'\t'* ]] || fail "control characters leaked into selection output" || return 1
+  assert_equal "$unsafe" "$SELECTED" "unsanitized selected value"
+}
+
+test_custom_strategy_name_rejects_control_characters() {
+  local read_count=0
+  local output
+
+  load_manager || return 1
+  read_line_or_back() {
+    read_count=$((read_count + 1))
+    if (( read_count == 1 )); then
+      INPUT_LINE='3'
+    else
+      INPUT_LINE=$'日本\t自动'
+    fi
+  }
+
+  if output="$(create_custom_region_group '{}')"; then
+    fail "custom strategy name with a tab was accepted"
+    return 1
+  fi
+  [[ $output == *'策略组名称不能包含制表符或其他控制字符.'* ]] || fail "custom strategy control-character warning was missing"
+}
+
+test_utf8_input_locale_fallback() {
+  load_manager || return 1
+  LC_ALL=C
+  export LC_ALL
+  locale() {
+    [[ ${1:-} == charmap ]] || return 1
+    if [[ ${LC_ALL:-} == C.UTF-8 ]]; then
+      printf 'UTF-8\n'
+    else
+      printf 'ANSI_X3.4-1968\n'
+    fi
+  }
+
+  ensure_utf8_input_locale || return 1
+  assert_equal 'C.UTF-8' "${LC_ALL:-}" "deterministic UTF-8 locale fallback"
+}
+
+test_sudo_interactive_invocation_guard() {
+  load_manager || return 1
+  should_reject_sudo_invocation '' 0 alice || fail "sudo default invocation was accepted" || return 1
+  should_reject_sudo_invocation --install 0 alice || fail "sudo installer invocation was accepted" || return 1
+  should_reject_sudo_invocation --menu 0 alice || fail "sudo menu invocation was accepted" || return 1
+  should_reject_sudo_invocation --menu 0 '' || fail "direct-root menu invocation was accepted" || return 1
+  if should_reject_sudo_invocation --cleanup 0 alice; then
+    fail "system cleanup invocation was rejected"
+    return 1
+  fi
+  if should_reject_sudo_invocation --menu 1000 ''; then
+    fail "normal-user menu invocation was rejected"
+  fi
+}
+
+test_entrypoint_rejects_non_tty_before_sudo() {
+  local root
+  local status=0
+  local sudo_called=0
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  ensure_sudo_access() {
+    sudo_called=1
+  }
+
+  entrypoint --install </dev/null >"$root/stdout" 2>"$root/stderr" || status=$?
+  assert_equal '1' "$status" "non-TTY installer status" || return 1
+  assert_equal '0' "$sudo_called" "non-TTY installer sudo calls" || return 1
+  assert_equal '' "$(cat "$root/stdout")" "non-TTY installer stdout" || return 1
+  grep -Fq '交互菜单需要连接终端' "$root/stderr" || fail "non-TTY installer guard message was missing"
+}
+
+test_service_account_removal_verifies_identity() {
+  local root
+  local calls
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  SERVICE_ACCOUNT_MARKER="$root/service-account-created"
+  calls="$root/calls"
+  printf 'created_by=mipilot\nuid=998\ngid=998\n' >"$SERVICE_ACCOUNT_MARKER"
+  getent() {
+    case "$1:$2" in
+      passwd:mipilot) printf 'mipilot:x:999:998::/nonexistent:/usr/sbin/nologin\n' ;;
+      group:mipilot) printf 'mipilot:x:998:\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  sudo() {
+    while [[ ${1:-} == -n ]]; do shift; done
+    case "${1:-}" in
+      test) [[ -f ${3:-} ]] ;;
+      awk) command awk "${@:2}" ;;
+      userdel|groupdel) printf '%s\n' "$*" >>"$calls" ;;
+      *) "$@" ;;
+    esac
+  }
+
+  if remove_managed_service_account >/dev/null 2>&1; then
+    fail "mismatched service account identity was deleted"
+    return 1
+  fi
+  [[ ! -e $calls ]] || fail "service account deletion ran despite an identity mismatch"
+}
+
+test_run_action_refreshes_sudo_access() {
+  local checks=0
+  local actions=0
+
+  load_manager || return 1
+  ensure_sudo_access() {
+    checks=$((checks + 1))
+  }
+  pause() { return 0; }
+  action_fixture() {
+    actions=$((actions + 1))
+  }
+
+  run_action action_fixture || return 1
+  assert_equal '1' "$checks" "sudo refresh count" || return 1
+  assert_equal '1' "$actions" "action execution count"
+}
+
+test_existing_config_asset_preflight_failure() {
+  local root
+  local core_calls=0
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  CONFIG_DIR="$root/etc/mihomo"
+  CONFIG_FILE="$CONFIG_DIR/config.yaml"
+  LOCAL_COUNTRY_MMDB="$root/Country.mmdb"
+  LOCAL_GEOSITE_DAT="$root/GeoSite.dat"
+  STAGED_MIHOMO_BIN="$root/mihomo"
+  mkdir -p -- "$CONFIG_DIR"
+  printf 'mode: rule\n' >"$CONFIG_FILE"
+  : >"$LOCAL_COUNTRY_MMDB"
+  : >"$LOCAL_GEOSITE_DAT"
+  sudo() {
+    while [[ ${1:-} == -n ]]; do shift; done
+    if [[ ${1:-} == install && ${4:-} == "$LOCAL_GEOSITE_DAT" ]]; then
+      return 1
+    fi
+    if [[ ${1:-} == "$STAGED_MIHOMO_BIN" ]]; then
+      core_calls=$((core_calls + 1))
+      return 0
+    fi
+    run_as_mock_sudo "$@"
+  }
+
+  if validate_existing_config_with_staged_core; then
+    fail "asset preflight succeeded after GeoSite copy failure"
+    return 1
+  fi
+  assert_equal '0' "$core_calls" "staged core calls after asset copy failure"
+}
+
+test_install_rollback_restores_runtime_state() {
+  local root
+  local runtime_restores=0
+  local runtime_stops=0
+  local service_action=""
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  CONFIG_FILE="$root/config.yaml"
+  printf 'mode: rule\n' >"$CONFIG_FILE"
+  restore_component_rollback() { return 0; }
+  service_exists() { return 0; }
+  current_core_version() { printf '1.0.0\n'; }
+  restore_mihomo_runtime_state() {
+    runtime_restores=$((runtime_restores + 1))
+  }
+  runtime_is_active() { return 0; }
+  runtime_stop() { runtime_stops=$((runtime_stops + 1)); }
+  sudo() {
+    while [[ ${1:-} == -n ]]; do shift; done
+    if [[ ${1:-} == systemctl ]]; then
+      service_action="${2:-}"
+      return 0
+    fi
+    run_as_mock_sudo "$@"
+  }
+
+  rollback_local_install '' 1 0 0 >/dev/null || return 1
+  assert_equal '0' "$runtime_restores" "stopped runtime restore count" || return 1
+  assert_equal '1' "$runtime_stops" "unexpected runtime stop count" || return 1
+  assert_equal 'disable' "$service_action" "disabled service rollback state" || return 1
+
+  runtime_restores=0
+  runtime_stops=0
+  service_action=""
+  service_exists() { return 1; }
+  rollback_local_install '' 1 1 0 >/dev/null || return 1
+  assert_equal '1' "$runtime_restores" "active manual runtime restore count" || return 1
+  assert_equal '0' "$runtime_stops" "active runtime stop count"
+}
+
+test_subscription_activation_escape_keeps_saved_url() {
+  local read_count=0
+  local output
+
+  load_manager || return 1
+  SUBSCRIPTION_URLS=()
+  load_subscription_urls() { SUBSCRIPTION_URLS=(); }
+  append_subscription_url() { return 0; }
+  read_line_or_back() {
+    read_count=$((read_count + 1))
+    if (( read_count == 1 )); then
+      INPUT_LINE='https://example.test/sub/token'
+    else
+      INPUT_LINE=''
+    fi
+  }
+  read_yes_no_or_back() { return 130; }
+  sudo() {
+    while [[ ${1:-} == -n ]]; do shift; done
+    if [[ ${1:-} == test ]]; then return 1; fi
+    run_as_mock_sudo "$@"
+  }
+
+  output="$(add_managed_subscription)" || return 1
+  [[ $output == *'订阅已保存, 尚未激活.'* ]] || fail "saved subscription message was missing after Esc"
 }
 
 test_api_secret_not_in_arguments() {
@@ -3526,10 +3943,13 @@ run_test "installation state detection" test_detect_install_state
 run_test "MiPilot config migration and materialization" test_mipilot_config_migration_and_materialization
 run_test "startup skips semantic-only config changes" test_reconcile_skips_semantic_only_changes
 run_test "configuration backup includes MiPilot settings" test_config_backup_bundles_mipilot_settings
+run_test "privileged snapshot keeps caller ownership" test_privileged_temp_copy_uses_caller_owned_output
 run_test "TUN preserves non-TUN state" test_tun_render_preserves_non_tun_state
 run_test "runtime marker precedence" test_runtime_mode_marker_precedence
 run_test "runtime backend dispatch" test_runtime_backend_dispatch
 run_test "manual install default" test_install_runtime_choice_defaults_manual
+run_test "install rollback restores runtime state" test_install_rollback_restores_runtime_state
+run_test "existing config asset preflight failure" test_existing_config_asset_preflight_failure
 run_test "service TUN routing lifecycle" test_service_unit_reconciles_tun_routing
 run_test "TUN routing action lock" test_tun_routing_action_uses_independent_lock
 run_test "manager lock release" test_manager_lock_release
@@ -3566,6 +3986,7 @@ run_test "proxy environment restoration" test_proxy_state_restores_previous_envi
 run_test "subscription URL redaction" test_subscription_urls_are_redacted
 run_test "subscription labels" test_subscription_labels
 run_test "subscription label failure rollback" test_subscription_label_failure_rolls_back_add
+run_test "subscription activation Esc keeps saved URL" test_subscription_activation_escape_keeps_saved_url
 run_test "non-active subscription delete rollback" test_nonactive_subscription_delete_rolls_back_on_sync_failure
 run_test "runtime configuration preserves stopped state" test_runtime_config_apply_preserves_state
 run_test "runtime start restores saved selections" test_start_restores_saved_selections
@@ -3579,6 +4000,19 @@ run_test "same-version local hotfix" test_same_version_local_hotfix_is_offered
 run_test "unchanged subscription skips restart" test_unchanged_subscription_skips_restart
 run_test "manager version comparison" test_version_is_newer
 run_test "progress runner non-TTY behavior" test_progress_runner_non_tty
+run_test "progress runner output streams" test_progress_runner_preserves_output_streams
+run_test "progress timeout stops child processes" test_progress_timeout_stops_child_processes
+run_test "terminal output sanitization" test_terminal_output_sanitization
+run_test "interactive menu requires TTY" test_interactive_menu_requires_tty
+run_test "service account validation" test_service_account_validation
+run_test "config permission snapshot restore" test_config_permission_snapshot_restore
+run_test "service runtime permission contract" test_service_runtime_permission_contract
+run_test "custom strategy name control-character rejection" test_custom_strategy_name_rejects_control_characters
+run_test "UTF-8 input locale fallback" test_utf8_input_locale_fallback
+run_test "sudo interactive invocation guard" test_sudo_interactive_invocation_guard
+run_test "non-TTY installer guard ordering" test_entrypoint_rejects_non_tty_before_sudo
+run_test "service account removal identity guard" test_service_account_removal_verifies_identity
+run_test "run action refreshes sudo access" test_run_action_refreshes_sudo_access
 run_test "API secret argument protection" test_api_secret_not_in_arguments
 run_test "secure subscription curl config" test_secure_subscription_curl_config
 run_test "local API config rendering" test_local_api_config_rendering
