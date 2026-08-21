@@ -1565,6 +1565,7 @@ test_subscription_rule_parent_uses_match_target() {
   local input_file
   local output_file
   local parent
+  local selected_group
 
   root="$(make_temp_dir)" || return 1
   register_temp_dir_cleanup "$root"
@@ -1591,8 +1592,33 @@ test_subscription_rule_parent_uses_match_target() {
 
   parent="$(preferred_rule_parent_for_config "$input_file" '🚀节点选择')" || return 1
   assert_equal '🐟漏网之鱼' "$parent" "subscription MATCH strategy target" || return 1
+  selected_group="$(preferred_default_rule_group_for_config "$input_file" "$parent")" || return 1
+  assert_equal '🚀节点选择' "$selected_group" "initial subscription strategy selection" || return 1
   apply_rule_selector_to_config "$input_file" "$output_file" "$parent" || return 1
-  assert_yaml_equal "$output_file" '.rules[-1]' 'MATCH,MiPilot-规则选择' "subscription MATCH selector target"
+  assert_yaml_equal "$output_file" '.rules[-1]' 'MATCH,MiPilot-规则选择' "subscription MATCH selector target" || return 1
+
+  printf '%s\n' \
+    'proxy-groups:' \
+    '  - name: 🚀节点选择' \
+    '    type: select' \
+    '    proxies: [DIRECT]' \
+    'rules:' \
+    '  - MATCH,DIRECT' >"$input_file"
+  selected_group="$(preferred_default_rule_group_for_config "$input_file" DIRECT)" || return 1
+  assert_equal 'DIRECT' "$selected_group" "DIRECT subscription fallback" || return 1
+
+  printf '%s\n' \
+    'proxy-groups:' \
+    '  - name: 🚀节点选择' \
+    '    type: select' \
+    '    proxies: [DIRECT]' \
+    '  - name: 默认出口' \
+    '    type: select' \
+    '    proxies: [DIRECT]' \
+    'rules:' \
+    '  - MATCH,默认出口' >"$input_file"
+  selected_group="$(preferred_default_rule_group_for_config "$input_file" '默认出口')" || return 1
+  assert_equal '默认出口' "$selected_group" "unrelated subscription fallback group"
 }
 
 test_unreferenced_selector_uses_managed_rule_outlet() {
@@ -2185,6 +2211,10 @@ test_secure_subscription_curl_config() {
   assert_file_has_line "$config" 'url = "https://example.test/sub?token=abc"' "subscription curl config" || return 1
   if create_curl_url_config $'https://example.test/sub\nheader=x' "$config"; then
     fail "subscription URL containing a newline was accepted"
+    return 1
+  fi
+  if create_curl_url_config 'http://example.test/sub' "$config"; then
+    fail "unencrypted subscription URL was accepted"
     return 1
   fi
 }
@@ -2946,6 +2976,96 @@ test_subscription_labels() {
   if display_text_has_control_characters "正常名称"; then
     fail "normal subscription label was rejected"
   fi
+
+  printf '%s\n' "$second_url" "$first_url" "$second_url" >"$SUBSCRIPTION_LIST_FILE"
+  sync_mipilot_config_from_state || return 1
+  assert_equal "$second_url,$first_url" \
+    "$(jq -r '.subscription.items | join(",")' "$MANAGER_CONFIG_FILE")" \
+    "stable subscription order"
+}
+
+test_subscription_label_failure_rolls_back_add() {
+  local root
+  local first_url='https://example.test/sub/first'
+  local new_url='https://example.test/sub/new'
+  local read_count=0
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  CONFIG_DIR="$root/etc/mihomo"
+  CONFIG_FILE="$CONFIG_DIR/config.yaml"
+  MANAGER_CONFIG_DIR="$root/etc/mipilot"
+  MANAGER_CONFIG_FILE="$MANAGER_CONFIG_DIR/config.json"
+  SUBSCRIPTION_LIST_FILE="$CONFIG_DIR/subscriptions.list"
+  SUBSCRIPTION_FILE="$CONFIG_DIR/subscription.url"
+  REGION_STATE_FILE="$CONFIG_DIR/region-groups.conf"
+  REGION_PARENT_FILE="$CONFIG_DIR/region-parent.conf"
+  TUN_STATE_FILE="$CONFIG_DIR/tun.state"
+  mkdir -p -- "$CONFIG_DIR" "$MANAGER_CONFIG_DIR"
+  printf '%s\n' 'mode: rule' >"$CONFIG_FILE"
+  printf '%s\n' "$first_url" >"$SUBSCRIPTION_LIST_FILE"
+  printf '%s\n' "$first_url" >"$SUBSCRIPTION_FILE"
+  printf '%s\n' 'false' >"$TUN_STATE_FILE"
+
+  sudo() { run_as_mock_sudo "$@"; }
+  installed_runtime_mode() { printf '%s\n' manual; }
+  read_line_or_back() {
+    read_count=$((read_count + 1))
+    if (( read_count == 1 )); then INPUT_LINE="$new_url"; else INPUT_LINE='新订阅'; fi
+  }
+  update_mipilot_subscription_label() { return 1; }
+
+  if add_managed_subscription >/dev/null; then
+    fail "subscription add succeeded after label persistence failure"
+    return 1
+  fi
+  assert_equal "$first_url" "$(cat "$SUBSCRIPTION_LIST_FILE")" "subscription list rolled back after label failure" || return 1
+  assert_equal "$first_url" "$(jq -r '.subscription.items | join(",")' "$MANAGER_CONFIG_FILE")" "manager subscription list rolled back"
+}
+
+test_nonactive_subscription_delete_rolls_back_on_sync_failure() {
+  local root
+  local first_url='https://example.test/sub/first'
+  local second_url='https://example.test/sub/second'
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  CONFIG_DIR="$root/etc/mihomo"
+  CONFIG_FILE="$CONFIG_DIR/config.yaml"
+  MANAGER_CONFIG_DIR="$root/etc/mipilot"
+  MANAGER_CONFIG_FILE="$MANAGER_CONFIG_DIR/config.json"
+  SUBSCRIPTION_LIST_FILE="$CONFIG_DIR/subscriptions.list"
+  SUBSCRIPTION_FILE="$CONFIG_DIR/subscription.url"
+  REGION_STATE_FILE="$CONFIG_DIR/region-groups.conf"
+  REGION_PARENT_FILE="$CONFIG_DIR/region-parent.conf"
+  TUN_STATE_FILE="$CONFIG_DIR/tun.state"
+  INSTALL_MARKER="$root/install-mode"
+  PROXY_STATE_FILE="$root/proxy-state"
+  mkdir -p -- "$CONFIG_DIR" "$MANAGER_CONFIG_DIR"
+  printf '%s\n' 'mode: rule' >"$CONFIG_FILE"
+  printf '%s\n' "$first_url" "$second_url" >"$SUBSCRIPTION_LIST_FILE"
+  printf '%s\n' "$first_url" >"$SUBSCRIPTION_FILE"
+  printf '%s\n' 'false' >"$TUN_STATE_FILE"
+
+  sudo() { run_as_mock_sudo "$@"; }
+  installed_runtime_mode() { printf '%s\n' manual; }
+  sync_mipilot_config_from_state || return 1
+  select_subscription_url() { SELECTED="$second_url"; }
+  read_yes_no_or_back() { CONFIRM_RESULT=yes; }
+  runtime_is_active() { return 1; }
+  apply_proxy_state() { return 0; }
+  cleanup_legacy_tun_bypass() { return 0; }
+  sync_mipilot_config_from_state() { return 1; }
+
+  if delete_managed_subscription >/dev/null; then
+    fail "non-active subscription deletion succeeded after manager sync failure"
+    return 1
+  fi
+  assert_equal "$first_url,$second_url" \
+    "$(tr -d '\r' <"$SUBSCRIPTION_LIST_FILE" | paste -sd,)" \
+    "non-active subscription list rollback"
 }
 
 test_rollback_waits_for_stability() {
@@ -3445,6 +3565,8 @@ run_test "idempotent shell integration" test_shell_integration_idempotent
 run_test "proxy environment restoration" test_proxy_state_restores_previous_environment
 run_test "subscription URL redaction" test_subscription_urls_are_redacted
 run_test "subscription labels" test_subscription_labels
+run_test "subscription label failure rollback" test_subscription_label_failure_rolls_back_add
+run_test "non-active subscription delete rollback" test_nonactive_subscription_delete_rolls_back_on_sync_failure
 run_test "runtime configuration preserves stopped state" test_runtime_config_apply_preserves_state
 run_test "runtime start restores saved selections" test_start_restores_saved_selections
 run_test "selected strategy group delete transaction" test_delete_selected_group_updates_state_first

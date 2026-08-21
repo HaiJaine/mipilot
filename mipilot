@@ -811,7 +811,8 @@ sync_mipilot_config_from_state() {
       --rawfile groups "$groups_file" \
       --rawfile parent "$parent_file" '
         ($old | try fromjson catch {}) as $previous
-        | ($subscriptions | split("\n") | map(select(length > 0)) | unique) as $subscription_items
+        | (reduce ($subscriptions | split("\n")[] | select(length > 0)) as $url
+            ([]; if index($url) == null then . + [$url] else . end)) as $subscription_items
         | {
             schema_version: 1,
             runtime: {type: $runtime},
@@ -2907,6 +2908,26 @@ preferred_rule_parent_for_config() {
   fi
 }
 
+preferred_default_rule_group_for_config() {
+  local config_file="$1"
+  local fallback_group="$2"
+  local preferred
+
+  if [[ $fallback_group == DIRECT || $fallback_group == REJECT || $fallback_group == PASS ]]; then
+    printf '%s\n' "$fallback_group"
+    return 0
+  fi
+  config_has_group "$config_file" "$fallback_group" || return 1
+  for preferred in "🚀节点选择" "节点选择" "代理选择" "Proxy" "手动选择"; do
+    if [[ $fallback_group == "$preferred" ]] ||
+       parent_group_has_child "$config_file" "$fallback_group" "$preferred"; then
+      printf '%s\n' "$preferred"
+      return 0
+    fi
+  done
+  printf '%s\n' "$fallback_group"
+}
+
 ensure_region_parent() {
   local response="$1"
   local config_file="${2:-$CONFIG_FILE}"
@@ -3773,8 +3794,8 @@ manage_rule_nodes() {
     return 1
   fi
 
-  echo "* 表示规则模式当前使用的策略组."
-  choose_item "选择规则模式使用的策略组:" "${display_groups[@]}" || return
+  echo "* 表示 MATCH 未匹配流量当前使用的默认出口策略组."
+  choose_item "选择 MATCH 未匹配流量的默认出口策略组:" "${display_groups[@]}" || return
   selected_label="$SELECTED"
   group=""
   for index in "${!display_groups[@]}"; do
@@ -3789,8 +3810,8 @@ manage_rule_nodes() {
     return 1
   }
   if [[ ${group_levels[$index]} == 高级 && $group != "$current" ]]; then
-    echo "${group} 是订阅的业务分流策略组, 可能只服务特定规则, 不一定适合作为全部规则流量的出口."
-    read_yes_no_or_back "仍要设为规则模式入口? [y/N] (Enter=否, Esc返回): " no || return
+    echo "${group} 是订阅的业务分流策略组, 可能只服务特定规则, 不一定适合作为 MATCH 未匹配流量的默认出口."
+    read_yes_no_or_back "仍要设为默认出口? [y/N] (Enter=否, Esc返回): " no || return
     [[ $CONFIRM_RESULT == yes ]] || { echo "已取消切换."; return 130; }
   fi
   if ! jq -e --arg selector "$RULE_SELECTOR_GROUP" --arg group "$group" \
@@ -4286,7 +4307,7 @@ manage_nodes_by_mode() {
 
   case "$mode" in
     rule)
-      echo "当前为规则分流模式. 请选择订阅自带或 MiPilot 自定义策略组."
+      echo "当前为规则分流模式. 请选择 MATCH 未匹配流量使用的默认出口策略组."
       manage_rule_nodes
       ;;
     global)
@@ -4454,12 +4475,21 @@ rollback_config() {
   echo "旧配置已恢复, Mihomo 服务已稳定运行."
 }
 
+restore_mipilot_backup_state() {
+  local backup="$1"
+  local settings="${backup%.yaml}.mipilot.json"
+
+  sudo test -f "$settings" || return 1
+  atomic_install_file 600 "$settings" "$MANAGER_CONFIG_FILE" || return 1
+  materialize_mipilot_state
+}
+
 create_curl_url_config() {
   local url="$1"
   local target="$2"
   local escaped
 
-  [[ $url == http://* || $url == https://* ]] || return 1
+  [[ $url == https://* ]] || return 1
   [[ $url != *$'\n'* && $url != *$'\r'* ]] || return 1
   escaped="${url//\\/\\\\}"
   escaped="${escaped//\"/\\\"}"
@@ -4526,8 +4556,6 @@ download_and_apply_subscription() {
   local previous_group
   local selector_temporary
   local rule_selection_changed=0
-  local previous_parent
-  local had_parent=0
   local current_hash
   local candidate_hash
   local current_semantic_hash
@@ -4535,6 +4563,7 @@ download_and_apply_subscription() {
   local backup
   local status
   local was_active=0
+  local selection_restore_failed=0
 
   ensure_sudo_access || return 1
   runtime_is_active && was_active=1
@@ -4545,7 +4574,7 @@ download_and_apply_subscription() {
   }
   if ! create_curl_url_config "$url" "$curl_config"; then
     rm -f -- "$temporary" "$curl_config"
-    echo "订阅地址无效, 仅支持不含控制字符的 HTTP/HTTPS 地址."
+    echo "订阅地址无效, 仅支持不含控制字符的 HTTPS 地址."
     return 1
   fi
   backup=""
@@ -4614,8 +4643,13 @@ download_and_apply_subscription() {
 
   selected_group="$previous_group"
   if [[ -z $selected_group ]] || ! config_has_group "$temporary" "$selected_group"; then
-    selected_group="$region_parent"
+    selected_group="$(preferred_default_rule_group_for_config "$temporary" "$region_parent")"
   fi
+  [[ -n $selected_group ]] || {
+    rm -f -- "$temporary"
+    echo "新订阅没有可选择的默认策略组, 现有配置未改变."
+    return 1
+  }
   [[ $selected_group == "$previous_group" ]] || rule_selection_changed=1
   selector_temporary="$(mktemp /tmp/mihomo-rule-selector-override.XXXXXX.yaml)" || {
     rm -f -- "$temporary"
@@ -4707,63 +4741,51 @@ download_and_apply_subscription() {
     return 1
   }
 
-  if (( region_parent_migrated == 1 || rule_selection_changed == 1 )); then
-    previous_parent="$(mktemp /tmp/mihomo-subscription-parent-previous.XXXXXX)" || {
-      rm -f -- "$temporary"
-      return 1
-    }
-    if sudo test -f "$REGION_PARENT_FILE"; then
-      had_parent=1
-      sudo install -m 600 "$REGION_PARENT_FILE" "$previous_parent" || {
-        rm -f -- "$temporary"
-        sudo rm -f -- "$previous_parent"
-        return 1
-      }
-    fi
-    if ! save_region_parent "$region_parent" ||
-       ! update_mipilot_selection rule "$region_parent" "$selected_group"; then
-      rm -f -- "$temporary"
-      sudo rm -f -- "$previous_parent"
-      echo "无法保存新的规则入口, 现有配置未改变."
-      return 1
-    fi
-  fi
-
   atomic_install_file 600 "$temporary" "$CONFIG_FILE" || {
-    if (( region_parent_migrated == 1 || rule_selection_changed == 1 )); then
-      restore_optional_managed_file "$previous_parent" "$had_parent" "$REGION_PARENT_FILE" || true
-      sync_mipilot_config_from_state || true
-      update_mipilot_selection rule "$(managed_region_parent)" "$previous_group" || true
-      sudo rm -f -- "$previous_parent"
-    fi
     rm -f -- "$temporary"
     return 1
   }
   rm -f -- "$temporary"
 
-  if ! apply_runtime_config_if_active "$was_active" 2; then
-    if rollback_config "$backup" "$was_active"; then
-      if (( region_parent_migrated == 1 || rule_selection_changed == 1 )); then
-        restore_optional_managed_file "$previous_parent" "$had_parent" "$REGION_PARENT_FILE" || true
-        sync_mipilot_config_from_state || true
-        update_mipilot_selection rule "$(managed_region_parent)" "$previous_group" || true
+  if (( region_parent_migrated == 1 || rule_selection_changed == 1 )); then
+    if ! save_region_parent "$region_parent" ||
+       ! update_mipilot_selection rule "$region_parent" "$selected_group"; then
+      if atomic_install_file 600 "$backup" "$CONFIG_FILE" &&
+         restore_mipilot_backup_state "$backup"; then
+        echo "无法保存新的默认出口, 已恢复原配置和 MiPilot 状态."
+      else
+        echo "严重错误: 默认出口保存失败且原配置或 MiPilot 状态未能完整恢复."
       fi
+      return 1
+    fi
+  fi
+
+  if ! apply_runtime_config_if_active "$was_active" 2; then
+    status=0
+    rollback_config "$backup" "$was_active" || status=1
+    restore_mipilot_backup_state "$backup" || status=1
+    if (( status == 0 )); then
       echo "新配置未能稳定运行, 已自动回滚."
     else
-      echo "新配置未稳定运行且自动回滚未完成, 请立即检查 ${backup}."
+      echo "新配置未稳定运行且配置或 MiPilot 状态回滚未完成, 请立即检查 ${backup}."
     fi
-    if (( region_parent_migrated == 1 || rule_selection_changed == 1 )); then sudo rm -f -- "$previous_parent"; fi
     return 1
   fi
 
   refresh_api_config
   if (( was_active == 1 )); then
-    restore_mipilot_selections || true
+    if ! restore_mipilot_selections; then
+      refresh_api_config
+      restore_mipilot_selections || selection_restore_failed=1
+    fi
     sync_proxy_state
   fi
   warn_empty_managed_region_groups || true
-  if (( region_parent_migrated == 1 || rule_selection_changed == 1 )); then sudo rm -f -- "$previous_parent"; fi
-  echo "订阅更新成功."
+  if (( selection_restore_failed == 1 )); then
+    echo "订阅配置已更新, 但部分策略组或节点选择未能恢复; 请在节点管理中重新选择."
+  else
+    echo "订阅更新成功."
+  fi
   (( was_active == 0 )) && echo "Mihomo 当前未运行, 新配置将在下次启动时生效."
   echo "备份文件: ${backup}"
 }
@@ -5053,6 +5075,8 @@ add_managed_subscription() {
   local url
   local label
   local existing_url
+  local list_snapshot
+  local had_list=0
   local status
 
   echo "订阅链接仅在输入时显示, 保存后的列表会隐藏敏感路径, 且不会进入 shell 历史."
@@ -5070,8 +5094,8 @@ add_managed_subscription() {
     return 130
   fi
 
-  if [[ ! $url =~ ^https?:// ]]; then
-    echo "订阅链接必须以 http:// 或 https:// 开头."
+  if [[ $url != https://* ]]; then
+    echo "订阅链接必须以 https:// 开头."
     return 1
   fi
 
@@ -5096,14 +5120,30 @@ add_managed_subscription() {
     return 1
   fi
 
+  list_snapshot="$(mktemp /tmp/mihomo-subscriptions-before-add.XXXXXX)" || return 1
+  if sudo test -f "$SUBSCRIPTION_LIST_FILE"; then
+    had_list=1
+    sudo install -m 600 "$SUBSCRIPTION_LIST_FILE" "$list_snapshot" || {
+      rm -f -- "$list_snapshot"
+      return 1
+    }
+  fi
   append_subscription_url "$url" || {
+    rm -f -- "$list_snapshot"
     echo "保存订阅地址失败."
     return 1
   }
   if [[ -n $label ]] && ! update_mipilot_subscription_label "$url" "$label"; then
-    echo "订阅地址已保存, 但名称保存失败."
+    if restore_optional_managed_file "$list_snapshot" "$had_list" "$SUBSCRIPTION_LIST_FILE" &&
+       sync_mipilot_config_from_state; then
+      echo "订阅名称保存失败, 已撤销本次新增."
+    else
+      echo "严重错误: 订阅名称保存失败且订阅列表未能完整恢复."
+    fi
+    rm -f -- "$list_snapshot"
     return 1
   fi
+  rm -f -- "$list_snapshot"
   echo "订阅地址已添加."
 
   read_yes_no_or_back "是否立即激活并更新节点? [Y/n] (Enter=是, Esc返回): " yes
@@ -5266,17 +5306,15 @@ delete_managed_subscription() {
     rm -f -- "$temporary"
     return 1
   }
-  if [[ $url == "$active_url" ]]; then
-    state_snapshot="$(mktemp -d /tmp/mihomo-subscription-state.XXXXXX)" || {
-      rm -f -- "$temporary"
-      return 1
-    }
-    snapshot_manager_runtime_state "$state_snapshot" || {
-      sudo rm -rf -- "$state_snapshot"
-      rm -f -- "$temporary"
-      return 1
-    }
-  fi
+  state_snapshot="$(mktemp -d /tmp/mihomo-subscription-state.XXXXXX)" || {
+    rm -f -- "$temporary"
+    return 1
+  }
+  snapshot_manager_runtime_state "$state_snapshot" || {
+    sudo rm -rf -- "$state_snapshot"
+    rm -f -- "$temporary"
+    return 1
+  }
   if [[ $url == "$active_url" && $mode == clear ]]; then
     config_temporary="$(mktemp /tmp/mihomo-direct-config.XXXXXX.yaml)" || {
       sudo rm -rf -- "$state_snapshot"
@@ -5350,7 +5388,7 @@ delete_managed_subscription() {
   fi
 
   atomic_install_file 600 "$temporary" "$SUBSCRIPTION_LIST_FILE" || {
-    [[ -n ${state_snapshot:-} ]] && sudo rm -rf -- "$state_snapshot"
+    sudo rm -rf -- "$state_snapshot"
     rm -f -- "$temporary"
     return 1
   }
@@ -5369,12 +5407,16 @@ delete_managed_subscription() {
     echo "当前激活订阅已清除. 现有节点配置保持不变."
   fi
   sync_mipilot_config_from_state || {
-    [[ -n ${state_snapshot:-} ]] && restore_manager_runtime_state "$state_snapshot" || true
+    if restore_manager_runtime_state "$state_snapshot"; then
+      sudo rm -rf -- "$state_snapshot"
+    else
+      echo "严重错误: 原订阅状态恢复失败, 快照保留在 ${state_snapshot}."
+    fi
     rm -f -- "$temporary"
     echo "MiPilot 配置更新失败, 已尝试恢复订阅状态."
     return 1
   }
-  [[ -n ${state_snapshot:-} ]] && sudo rm -rf -- "$state_snapshot"
+  sudo rm -rf -- "$state_snapshot"
   rm -f -- "$temporary"
   echo "订阅地址已删除."
 }
