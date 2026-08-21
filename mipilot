@@ -331,7 +331,6 @@ run_with_progress() (
   local spinner_frames=('|' '/' '-' '\')
 
   shift 3
-  set -m
   umask 077
   temporary="$(mktemp /tmp/mipilot-command.XXXXXX)" || return 1
   error_temporary="$(mktemp /tmp/mipilot-command-error.XXXXXX)" || {
@@ -382,12 +381,15 @@ run_with_progress() (
   fi
 
   if declare -F "${1:-}" >/dev/null 2>&1; then
+    set -m
     "$@" >"$temporary" 2>"$error_temporary" &
+    process_id=$!
+    set +m
   else
+    set +m
     setsid "$@" >"$temporary" 2>"$error_temporary" &
+    process_id=$!
   fi
-  process_id=$!
-  set +m
 
   while kill -0 "$process_id" 2>/dev/null; do
     ((loop_count++)) || true

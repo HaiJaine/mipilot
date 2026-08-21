@@ -108,6 +108,8 @@ load_manager() {
   MIPILOT_TESTING=1
   # shellcheck source=/dev/null
   source "$MANAGER_SCRIPT"
+  SERVICE_USER="mipilot-test-account-does-not-exist"
+  SERVICE_GROUP="mipilot-test-account-does-not-exist"
   if [[ -n ${TEST_TEMP_DIR:-} ]]; then
     MANAGER_CONFIG_DIR="${TEST_TEMP_DIR}/etc/mipilot"
     MANAGER_CONFIG_FILE="${MANAGER_CONFIG_DIR}/config.json"
@@ -2263,6 +2265,21 @@ test_progress_runner_preserves_output_streams() {
   assert_file_has_line "$root/stderr" 'standard-error' "progress stderr"
 }
 
+test_progress_runner_waits_for_external_command() {
+  local root
+  local output_file
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  output_file="$root/external-output"
+
+  run_blocking "测试外部命令等待" 3 \
+    sh -c 'sleep 0.2; printf "%s\n" complete >"$1"' sh "$output_file" \
+    >/dev/null 2>&1 || return 1
+  assert_file_has_line "$output_file" 'complete' "progress runner external command completion"
+}
+
 test_progress_timeout_stops_child_processes() {
   local root
   local child_pid_file
@@ -2305,6 +2322,8 @@ test_interactive_menu_requires_tty() {
 
 test_service_account_validation() {
   load_manager || return 1
+  SERVICE_USER="mipilot"
+  SERVICE_GROUP="mipilot"
 
   getent() {
     case "$1:$2" in
@@ -2476,6 +2495,8 @@ test_service_account_removal_verifies_identity() {
   root="$(make_temp_dir)" || return 1
   register_temp_dir_cleanup "$root"
   load_manager || return 1
+  SERVICE_USER="mipilot"
+  SERVICE_GROUP="mipilot"
   SERVICE_ACCOUNT_MARKER="$root/service-account-created"
   calls="$root/calls"
   printf 'created_by=mipilot\nuid=998\ngid=998\n' >"$SERVICE_ACCOUNT_MARKER"
@@ -2787,6 +2808,7 @@ test_online_manager_update_and_rollback() {
   YQ_BIN="$MANAGER_LIB_DIR/yq"
   INSTALL_MARKER="$root/var/lib/mipilot/install-marker"
   ROLLBACK_DIR="$root/var/lib/mipilot/rollback"
+  SERVICE_FILE="$root/etc/systemd/system/mihomo.service"
   mkdir -p -- "$MANAGER_LIB_DIR" "$(dirname -- "$INSTALL_MARKER")"
   printf '#!/usr/bin/env bash\nMANAGER_VERSION="1.0.0-dev"\n' >"$MANAGER_INSTALLED_SCRIPT"
   chmod 755 "$MANAGER_INSTALLED_SCRIPT"
@@ -4046,6 +4068,7 @@ run_test "unchanged subscription skips restart" test_unchanged_subscription_skip
 run_test "manager version comparison" test_version_is_newer
 run_test "progress runner non-TTY behavior" test_progress_runner_non_tty
 run_test "progress runner output streams" test_progress_runner_preserves_output_streams
+run_test "progress runner waits for external command" test_progress_runner_waits_for_external_command
 run_test "progress timeout stops child processes" test_progress_timeout_stops_child_processes
 run_test "terminal output sanitization" test_terminal_output_sanitization
 run_test "interactive menu requires TTY" test_interactive_menu_requires_tty
