@@ -3012,10 +3012,33 @@ save_region_parent() {
   return "$status"
 }
 
+list_rule_parent_candidates() {
+  local config_file="$1"
+  local candidate
+  local candidates=()
+  local all_candidates=()
+
+  mapfile -t candidates < <(list_rule_selector_names "$config_file")
+  if (( ${#candidates[@]} == 0 )); then
+    mapfile -t candidates < <(list_config_selector_names "$config_file")
+  fi
+  if (( ${#candidates[@]} == 0 )); then
+    mapfile -t all_candidates < <(list_config_group_names "$config_file")
+    for candidate in "${all_candidates[@]}"; do
+      [[ $candidate == "$RULE_SELECTOR_GROUP" || $candidate == "$REGION_MANAGED_PARENT" ]] && continue
+      candidates+=("$candidate")
+    done
+  fi
+  (( ${#candidates[@]} > 0 )) && printf '%s\n' "${candidates[@]}"
+}
+
 preferred_rule_parent_for_config() {
   local config_file="$1"
   local saved_parent="${2:-}"
   local match_policy
+  local candidate
+  local preferred
+  local candidates=()
 
   match_policy="$(config_match_policy "$config_file")"
   if [[ -n $match_policy && $match_policy != "$RULE_SELECTOR_GROUP" ]]; then
@@ -3025,6 +3048,25 @@ preferred_rule_parent_for_config() {
   if [[ $match_policy == "$RULE_SELECTOR_GROUP" && -n $saved_parent ]] &&
      config_has_group "$config_file" "$saved_parent"; then
     printf '%s\n' "$saved_parent"
+    return 0
+  fi
+  mapfile -t candidates < <(list_rule_parent_candidates "$config_file")
+  for candidate in "${candidates[@]}"; do
+    if [[ -n $saved_parent && $candidate == "$saved_parent" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  for preferred in "🚀节点选择" "节点选择" "代理选择" "Proxy" "手动选择"; do
+    for candidate in "${candidates[@]}"; do
+      if [[ $candidate == "$preferred" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    done
+  done
+  if (( ${#candidates[@]} == 1 )); then
+    printf '%s\n' "${candidates[0]}"
   fi
 }
 
@@ -3540,8 +3582,12 @@ apply_rule_selector_to_config() {
     if [[ $current_policy == "$RULE_SELECTOR_GROUP" ]]; then
       mv -f -- "$with_selector" "$output_file" || status=$?
     elif [[ -z $current_policy ]]; then
-      echo "当前配置没有可识别的规则策略目标." >&2
-      status=1
+      # The input needs sudo; the caller-owned output path intentionally does not.
+      # shellcheck disable=SC2024
+      sudo env MIPILOT_RULE_OUTLET="$RULE_SELECTOR_GROUP" \
+        "$YQ_BIN" --yaml-fix-merge-anchor-to-spec eval '
+          .rules = ((.rules // []) + ["MATCH," + strenv(MIPILOT_RULE_OUTLET)])
+        ' "$with_selector" >"$output_file" || status=$?
     else
       render_rule_strategy_selection "$with_selector" "$output_file" "$current_policy" "$RULE_SELECTOR_GROUP" || status=$?
     fi
@@ -4706,6 +4752,7 @@ download_and_apply_subscription() {
   local status
   local was_active=0
   local selection_restore_failed=0
+  local rule_parent_candidates=()
 
   ensure_sudo_access || return 1
   runtime_is_active && was_active=1
@@ -4760,6 +4807,17 @@ download_and_apply_subscription() {
 
   previous_group="$(sudo jq -r '.rule_selection.group // empty' "$MANAGER_CONFIG_FILE" 2>/dev/null || true)"
   region_parent="$(preferred_rule_parent_for_config "$temporary" "$(managed_region_parent)")"
+  if [[ -z $region_parent ]]; then
+    mapfile -t rule_parent_candidates < <(list_rule_parent_candidates "$temporary")
+    if (( ${#rule_parent_candidates[@]} > 1 )); then
+      echo "新订阅包含多个策略组, 请选择接收主要规则流量的策略组."
+      if ! choose_item "选择订阅的主要规则出口:" "${rule_parent_candidates[@]}"; then
+        rm -f -- "$temporary"
+        return 130
+      fi
+      region_parent="$SELECTED"
+    fi
+  fi
   [[ -n $region_parent ]] || {
     rm -f -- "$temporary"
     echo "新订阅没有可识别的规则策略目标, 现有配置未改变."

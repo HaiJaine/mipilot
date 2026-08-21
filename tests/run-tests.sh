@@ -1610,6 +1610,7 @@ test_subscription_rule_parent_uses_match_target() {
   local output_file
   local parent
   local selected_group
+  local candidates=()
 
   root="$(make_temp_dir)" || return 1
   register_temp_dir_cleanup "$root"
@@ -1662,7 +1663,42 @@ test_subscription_rule_parent_uses_match_target() {
     'rules:' \
     '  - MATCH,默认出口' >"$input_file"
   selected_group="$(preferred_default_rule_group_for_config "$input_file" '默认出口')" || return 1
-  assert_equal '默认出口' "$selected_group" "unrelated subscription fallback group"
+  assert_equal '默认出口' "$selected_group" "unrelated subscription fallback group" || return 1
+
+  printf '%s\n' \
+    'proxy-groups:' \
+    '  - name: 节点选择' \
+    '    type: select' \
+    '    proxies: [DIRECT]' \
+    'rules: []' >"$input_file"
+  parent="$(preferred_rule_parent_for_config "$input_file" '')" || return 1
+  assert_equal '节点选择' "$parent" "subscription selector fallback without MATCH" || return 1
+  apply_rule_selector_to_config "$input_file" "$output_file" "$parent" || return 1
+  assert_yaml_equal "$output_file" '.rules[-1]' 'MATCH,MiPilot-规则选择' "managed MATCH rule for subscription without rules" || return 1
+  assert_yaml_equal "$output_file" '."proxy-groups"[] | select(.name == "MiPilot-规则选择") | .proxies[] | select(. == "节点选择")' '节点选择' "subscription selector retained as managed default" || return 1
+
+  printf '%s\n' \
+    'proxy-groups:' \
+    '  - name: 自动测速' \
+    '    type: url-test' \
+    '    proxies: [DIRECT]' \
+    'rules: []' >"$input_file"
+  parent="$(preferred_rule_parent_for_config "$input_file" '')" || return 1
+  assert_equal '自动测速' "$parent" "sole non-selector strategy fallback" || return 1
+
+  printf '%s\n' \
+    'proxy-groups:' \
+    '  - name: 高速线路' \
+    '    type: url-test' \
+    '    proxies: [DIRECT]' \
+    '  - name: 稳定线路' \
+    '    type: fallback' \
+    '    proxies: [DIRECT]' \
+    'rules: []' >"$input_file"
+  parent="$(preferred_rule_parent_for_config "$input_file" '')"
+  assert_equal '' "$parent" "ambiguous subscription strategies require selection" || return 1
+  mapfile -t candidates < <(list_rule_parent_candidates "$input_file")
+  assert_equal '高速线路,稳定线路' "$(IFS=,; echo "${candidates[*]}")" "ambiguous subscription strategy candidates"
 }
 
 test_unreferenced_selector_uses_managed_rule_outlet() {
