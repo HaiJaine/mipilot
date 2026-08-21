@@ -6135,6 +6135,7 @@ stage_mihomo_source() {
 validate_local_assets() {
   local validation_dir
   local validation_config
+  local version_output
 
   [[ -s $LOCAL_MIHOMO_SOURCE && -s $LOCAL_COUNTRY_MMDB && -s $LOCAL_GEOSITE_DAT && -s $LOCAL_YQ_SOURCE ]] || return 1
   validate_yq_asset "$LOCAL_YQ_SOURCE" || return 1
@@ -6145,12 +6146,13 @@ validate_local_assets() {
     STAGED_MIHOMO_BIN=""
     return 1
   }
-  "$STAGED_MIHOMO_BIN" -v | grep -Fq 'Mihomo Meta' || {
+  if ! version_output="$("$STAGED_MIHOMO_BIN" -v 2>&1)" ||
+     [[ $version_output != *'Mihomo Meta'* ]]; then
     echo "提供的程序不是有效的 Mihomo 内核."
     rm -f -- "$STAGED_MIHOMO_BIN"
     STAGED_MIHOMO_BIN=""
     return 1
-  }
+  fi
 
   validation_dir="$(mktemp -d /tmp/mipilot-validation.XXXXXX)" || return 1
   validation_config="${validation_dir}/config.yaml"

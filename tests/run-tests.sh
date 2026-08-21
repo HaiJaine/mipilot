@@ -406,6 +406,13 @@ test_find_local_assets() {
   assert_equal "" "$LOCAL_MIHOMO_SOURCE" "rejected archive selection" || return 1
 }
 
+test_mihomo_version_check_avoids_sigpipe() {
+  if grep -Fq '"$STAGED_MIHOMO_BIN" -v | grep -Fq' "$MANAGER_SCRIPT"; then
+    fail "Mihomo version validation can fail with SIGPIPE under pipefail"
+    return 1
+  fi
+}
+
 test_prune_config_backups() {
   local root
   local index
@@ -4137,6 +4144,7 @@ run_test "source preserves enabled shell options" test_source_preserves_enabled_
 run_test "Linux input normalization" test_linux_input_normalization
 run_test "dependency install survives partial APT update failure" test_dependency_install_continues_after_partial_apt_update
 run_test "local asset discovery" test_find_local_assets
+run_test "Mihomo version check avoids SIGPIPE" test_mihomo_version_check_avoids_sigpipe
 run_test "configuration backup pruning" test_prune_config_backups
 run_test "rollback expiration" test_cleanup_expired_rollbacks
 run_test "installation state detection" test_detect_install_state
