@@ -3336,6 +3336,8 @@ test_tun_change_does_not_start_stopped_runtime() {
 }
 
 test_tun_runtime_api_mismatch_fails() {
+  local output
+
   load_manager || return 1
   # shellcheck disable=SC2034
   API='http://127.0.0.1:9090'
@@ -3347,10 +3349,34 @@ test_tun_runtime_api_mismatch_fails() {
     printf '%s\n' '{"tun":{"enable":false}}'
   }
 
-  if verify_tun_runtime_network >/dev/null 2>&1; then
+  if output="$(verify_tun_runtime_network 2>&1)"; then
     fail "TUN runtime check accepted disabled API state"
     return 1
   fi
+  [[ $output == *'Mihomo API 显示 TUN 未启用'* ]] || fail "TUN API mismatch reason was not shown"
+}
+
+test_tun_runtime_route_failure_is_explained() {
+  local output
+
+  load_manager || return 1
+  API='http://127.0.0.1:9090'
+
+  refresh_api_config() {
+    API='http://127.0.0.1:9090'
+  }
+  api_quick() {
+    printf '%s\n' '{"tun":{"enable":true}}'
+  }
+  ip() {
+    return 1
+  }
+
+  if output="$(verify_tun_runtime_network 2>&1)"; then
+    fail "TUN runtime check accepted missing IPv4 route"
+    return 1
+  fi
+  [[ $output == *'系统无法解析 IPv4 出站路由'* ]] || fail "TUN route failure reason was not shown"
 }
 
 test_tun_runtime_uses_mihomo_native_routing() {
@@ -4153,6 +4179,7 @@ run_test "TUN state failure preserves config" test_tun_state_failure_preserves_c
 run_test "TUN restart failure restores state" test_tun_restart_failure_restores_state
 run_test "TUN change preserves stopped runtime" test_tun_change_does_not_start_stopped_runtime
 run_test "TUN API mismatch fails health check" test_tun_runtime_api_mismatch_fails
+run_test "TUN route failure explains cause" test_tun_runtime_route_failure_is_explained
 run_test "Mihomo native TUN routing health check" test_tun_runtime_uses_mihomo_native_routing
 run_test "TUN public probe failure warns" test_tun_public_probe_failure_is_warning
 run_test "TUN SSH return route failure" test_tun_ssh_return_route_failure

@@ -1833,11 +1833,22 @@ verify_tun_runtime_network() {
   local tun_device=""
   local default_route_count
 
-  refresh_api_config
-  [[ -n $API ]] || return 1
-  config_response="$(api_quick "${API}/configs")" || return 1
-  jq -e '.tun.enable == true' <<<"$config_response" >/dev/null || return 1
-  ip route get 1.1.1.1 >/dev/null 2>&1 || return 1
+  if ! refresh_api_config || [[ -z $API ]]; then
+    echo "TUN 检查失败: 当前配置没有可用的本机 Mihomo API 地址."
+    return 1
+  fi
+  if ! config_response="$(api_quick "${API}/configs")"; then
+    echo "TUN 检查失败: 无法读取 Mihomo 运行配置."
+    return 1
+  fi
+  if ! jq -e '.tun.enable == true' <<<"$config_response" >/dev/null; then
+    echo "TUN 检查失败: Mihomo API 显示 TUN 未启用."
+    return 1
+  fi
+  if ! ip route get 1.1.1.1 >/dev/null 2>&1; then
+    echo "TUN 检查失败: 系统无法解析 IPv4 出站路由."
+    return 1
+  fi
 
   default_route_count="$(ip -4 route show default 2>/dev/null | awk 'NF { count++ } END { print count + 0 }')"
   if (( default_route_count > 1 )); then
@@ -1900,7 +1911,8 @@ apply_tun_setting() {
 
   echo "[2/5] 验证配置"
   run_cancellable_named "正在验证 TUN 配置" 35 \
-    sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$temporary"
+    sudo -n "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$temporary" 2>&1 \
+    | awk '!/level=info/ && !/INFO\[/'
   status=$?
   if (( status == 130 )); then
     rm -f -- "$temporary"
@@ -1982,7 +1994,7 @@ apply_tun_setting() {
     if rollback_config "$backup"; then
       restore_optional_managed_file "$previous_state" "$had_state" "$TUN_STATE_FILE" || true
       sync_mipilot_config_from_state || true
-      echo "TUN 路由或当前 SSH 回程检查失败, 已自动回滚."
+      echo "TUN 运行检查失败, 已自动回滚."
     else
       echo "TUN 网络检查失败且自动回滚未完成, 请立即检查 ${backup}."
     fi
