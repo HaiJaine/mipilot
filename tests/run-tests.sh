@@ -1560,6 +1560,41 @@ test_dynamic_region_parent_selection() {
   assert_equal 'Proxy' "$REGION_PARENT" "automatically selected sole non-GLOBAL parent"
 }
 
+test_subscription_rule_parent_uses_match_target() {
+  local root
+  local input_file
+  local output_file
+  local parent
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  MANAGER_CONFIG_FILE="$root/config.json"
+  input_file="$root/input.yaml"
+  output_file="$root/output.yaml"
+  printf '%s\n' '{"rule_selection":{"parent":"🚀节点选择","group":""}}' >"$MANAGER_CONFIG_FILE"
+  printf '%s\n' \
+    'proxy-groups:' \
+    '  - name: 🚀节点选择' \
+    '    type: select' \
+    '    proxies: [DIRECT]' \
+    '  - name: 🐟漏网之鱼' \
+    '    type: select' \
+    '    proxies: [🚀节点选择, DIRECT]' \
+    'rules:' \
+    '  - DOMAIN-SUFFIX,example.com,🚀节点选择' \
+    '  - MATCH,🐟漏网之鱼' >"$input_file"
+
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+
+  parent="$(preferred_rule_parent_for_config "$input_file" '🚀节点选择')" || return 1
+  assert_equal '🐟漏网之鱼' "$parent" "subscription MATCH strategy target" || return 1
+  apply_rule_selector_to_config "$input_file" "$output_file" "$parent" || return 1
+  assert_yaml_equal "$output_file" '.rules[-1]' 'MATCH,MiPilot-规则选择' "subscription MATCH selector target"
+}
+
 test_unreferenced_selector_uses_managed_rule_outlet() {
   local root
   local response
@@ -3397,6 +3432,7 @@ run_test "indentless proxy groups rule selector rendering" test_indentless_proxy
 run_test "structured YAML subscription variants" test_structured_yaml_subscription_variants
 run_test "MiPilot rule selector selection restore" test_rule_selector_selection_restore
 run_test "dynamic region parent selection" test_dynamic_region_parent_selection
+run_test "subscription rule parent uses MATCH target" test_subscription_rule_parent_uses_match_target
 run_test "unreferenced selector falls back to managed outlet" test_unreferenced_selector_uses_managed_rule_outlet
 run_test "custom region group without subscription groups" test_custom_region_group_without_subscription_groups
 run_test "managed region strategy refresh" test_region_group_strategy_refresh

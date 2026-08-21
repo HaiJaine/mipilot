@@ -2894,28 +2894,16 @@ save_region_parent() {
 preferred_rule_parent_for_config() {
   local config_file="$1"
   local saved_parent="${2:-}"
-  local preferred
-  local candidate
-  local candidates=()
+  local match_policy
 
-  if [[ -n $saved_parent ]] && config_rules_reference_policy "$config_file" "$saved_parent"; then
-    printf '%s\n' "$saved_parent"
+  match_policy="$(config_match_policy "$config_file")"
+  if [[ -n $match_policy && $match_policy != "$RULE_SELECTOR_GROUP" ]]; then
+    printf '%s\n' "$match_policy"
     return 0
   fi
-  mapfile -t candidates < <(list_rule_selector_names "$config_file")
-  for preferred in "🚀节点选择" "节点选择" "代理选择" "Proxy" "手动选择"; do
-    for candidate in "${candidates[@]}"; do
-      if [[ $candidate == "$preferred" ]]; then
-        printf '%s\n' "$candidate"
-        return 0
-      fi
-    done
-  done
-  if (( ${#candidates[@]} == 1 )); then
-    printf '%s\n' "${candidates[0]}"
-  else
-    candidate="$(config_match_policy "$config_file")"
-    [[ -n $candidate ]] && printf '%s\n' "$candidate"
+  if [[ $match_policy == "$RULE_SELECTOR_GROUP" && -n $saved_parent ]] &&
+     config_has_group "$config_file" "$saved_parent"; then
+    printf '%s\n' "$saved_parent"
   fi
 }
 
