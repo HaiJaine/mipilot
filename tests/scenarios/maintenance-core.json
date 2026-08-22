@@ -1,0 +1,30 @@
+{
+  "command": ["/usr/local/bin/mipilot"],
+  "timeout": 300,
+  "steps": [
+    {"expect": "MiPilot 代理管理器", "sendline": "8"},
+    {"expect": "================ 运行维护 ================", "sendline": "1"},
+    {"expect_exact": "当前状态: 运行中(systemd服务)", "timeout": 300},
+    {"expect": "按 Enter 或 Esc 返回菜单", "sendline": ""},
+    {"expect": "================ 运行维护 ================", "sendline": "2"},
+    {"expect_exact": "当前状态: 已停止(systemd服务)", "timeout": 300},
+    {"expect": "按 Enter 或 Esc 返回菜单", "sendline": ""},
+    {"expect": "================ 运行维护 ================", "sendline": "2"},
+    {"expect_exact": "当前状态: 运行中(systemd服务)", "timeout": 300},
+    {"expect": "按 Enter 或 Esc 返回菜单", "sendline": ""},
+    {"expect": "================ 运行维护 ================", "sendline": "3"},
+    {"expect": "按 Enter 或 Esc 返回菜单", "sendline": ""},
+    {"expect": "================ 运行维护 ================", "sendline": "4"},
+    {"expect_exact": "mipilot 版本: 1.0.2"},
+    {"expect": "按 Enter 或 Esc 返回菜单", "sendline": ""},
+    {"expect": "================ 运行维护 ================", "sendline": "11"},
+    {"expect_exact": "TUN 回程保护: 已就绪"},
+    {"expect": "按 Enter 或 Esc 返回菜单", "sendline": ""},
+    {"expect": "================ 运行维护 ================", "sendline": "7"},
+    {"expect": "脱敏诊断报告已保存:", "timeout": 120},
+    {"expect": "按 Enter 或 Esc 返回菜单", "sendline": ""},
+    {"expect": "================ 运行维护 ================", "sendline": "0"},
+    {"expect": "MiPilot 代理管理器", "sendline": "0"},
+    {"expect_eof": true}
+  ]
+}

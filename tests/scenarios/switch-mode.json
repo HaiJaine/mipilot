@@ -1,0 +1,29 @@
+{
+  "command": ["/usr/local/bin/mipilot"],
+  "timeout": 300,
+  "steps": [
+    {
+      "expect": "MiPilot 代理管理器",
+      "sendline": "5"
+    },
+    {
+      "expect": "选择运行模式",
+      "sendline_env": "MIPILOT_TEST_MODE_CHOICE"
+    },
+    {
+      "expect": "运行模式已切换为:",
+      "timeout": 300
+    },
+    {
+      "expect": "按 Enter 或 Esc 返回菜单",
+      "sendline": ""
+    },
+    {
+      "expect": "MiPilot 代理管理器",
+      "sendline": "0"
+    },
+    {
+      "expect_eof": true
+    }
+  ]
+}

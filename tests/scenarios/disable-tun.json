@@ -1,0 +1,29 @@
+{
+  "command": ["/usr/local/bin/mipilot"],
+  "timeout": 300,
+  "steps": [
+    {
+      "expect": "MiPilot 代理管理器",
+      "sendline": "7"
+    },
+    {
+      "expect_exact": "确认关闭 TUN? [y/N] (Enter=否, Esc返回): ",
+      "sendline": "y"
+    },
+    {
+      "expect_exact": "TUN 模式已关闭.",
+      "timeout": 300
+    },
+    {
+      "expect": "按 Enter 或 Esc 返回菜单",
+      "sendline": ""
+    },
+    {
+      "expect": "MiPilot 代理管理器",
+      "sendline": "0"
+    },
+    {
+      "expect_eof": true
+    }
+  ]
+}

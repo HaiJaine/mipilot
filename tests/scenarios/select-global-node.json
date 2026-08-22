@@ -1,0 +1,36 @@
+{
+  "command": ["/usr/local/bin/mipilot"],
+  "timeout": 300,
+  "steps": [
+    {
+      "expect": "MiPilot 代理管理器",
+      "sendline": "3"
+    },
+    {
+      "expect": "输入节点关键词筛选",
+      "sendline": ""
+    },
+    {
+      "expect_exact": "是否测速并按延迟排序? [y/N] (Enter=否, Esc返回): ",
+      "sendline": "n"
+    },
+    {
+      "expect": "选择全局代理使用的具体节点",
+      "sendline": "1"
+    },
+    {
+      "expect": "全局代理节点已切换到:"
+    },
+    {
+      "expect": "按 Enter 或 Esc 返回菜单",
+      "sendline": ""
+    },
+    {
+      "expect": "MiPilot 代理管理器",
+      "sendline": "0"
+    },
+    {
+      "expect_eof": true
+    }
+  ]
+}

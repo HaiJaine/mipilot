@@ -150,13 +150,13 @@ mipilot
 
 ### TUN与公网服务兼容
 
-开启TUN时, MiPilot使用Mihomo原生的 `auto-route: true` 和 `auto-detect-interface: true`, 并关闭可能与服务器现有netlink或nftables规则冲突的 `auto-redirect`, 网络接管和Linux路由由Mihomo维护。MiPilot不扫描监听端口, 不排除Docker网卡, 也不根据Docker是否已安装生成静态规则; 容器访问公网时仍可进入TUN并由Mihomo规则决定 `DIRECT` 或代理。因此开启TUN后再安装Docker、创建网络或发布新端口不需要重新配置MiPilot。显式代理监听在订阅未配置时默认限制为本机; 如果订阅明确设置 `allow-lan: true` 和对应的 `bind-address`、认证或允许网段, MiPilot会保留这些设置, 供受控的局域网或Docker容器使用。
+开启TUN时, MiPilot使用Mihomo原生的 `auto-route: true` 和 `auto-detect-interface: true`, 并关闭可能与服务器现有netlink或nftables规则冲突的 `auto-redirect`。MiPilot在独立的 `inet mipilot_tun` nftables表中按conntrack连接方向标记DNAT入站连接, 再通过优先于Mihomo的受管 `ip rule` 让对应回包查询main表。Docker或Podman容器主动访问互联网仍然进入TUN; 外部访问标准bridge端口发布产生的回包保持原物理网络路径。该机制不扫描监听端口, 不依赖Docker是否已安装、容器网段、网桥名称或服务启动顺序, 因此开启TUN后再安装Docker、创建网络或发布新端口不需要重新配置MiPilot。显式代理监听在订阅未配置时默认限制为本机; 如果订阅明确设置 `allow-lan: true` 和对应的 `bind-address`、认证或允许网段, MiPilot会保留这些设置, 供受控的局域网或Docker容器使用。
 
-TUN开启时, MiPilot会通过 `route-exclude-address` 排除本机、RFC1918局域网、CGNAT、链路本地和组播地址, 并在规则列表顶部加入对应的 `DIRECT` 规则; TUN关闭状态下合并新订阅时不会额外插入这些规则。Docker bridge内部通信直接访问私有地址, 容器访问公网则继续交给TUN。`strict-route`默认关闭, 避免强制接管本机服务和远程管理链路。订阅没有DNS配置时, MiPilot会生成可用的 `redir-host` DNS配置并启用53端口劫持; 订阅已有DNS配置时保留其设置, 仅在DNS已启用时补齐标准劫持项, 关闭TUN也不会删除订阅自定义的 `dns-hijack`。启用后会检查Mihomo API、IPv4路由和当前SSH客户端回程; 多默认路由、无法解析SSH回程或回程经过TUN只告警, 不阻止TUN开启。运行维护中的“网络兼容性检查”或 `sudo mipilot --doctor` 可以只读查看默认路由、相关虚拟接口、旧版规则残留和本地DNS监听。
+TUN开启时, MiPilot会通过 `route-exclude-address` 排除本机、RFC1918局域网、CGNAT、链路本地和组播地址, 并在规则列表顶部加入对应的 `DIRECT` 规则; TUN关闭状态下合并新订阅时不会额外插入这些规则。Docker bridge内部通信直接访问私有地址, 容器访问公网则继续交给TUN。`strict-route`默认关闭, 避免强制接管本机服务和远程管理链路。订阅没有DNS配置时, MiPilot会生成可用的 `redir-host` DNS配置并启用53端口劫持; 订阅已有DNS配置时保留其设置, 仅在DNS已启用时补齐标准劫持项, 关闭TUN也不会删除订阅自定义的 `dns-hijack`。启用后会检查Mihomo API、API报告的TUN网卡、受管回程规则、IPv4路由和当前SSH客户端回程; 多默认路由、无法解析SSH回程或回程经过TUN只告警, 不阻止TUN开启。运行维护中的“网络兼容性检查”或 `sudo mipilot --doctor` 可以只读查看默认路由、相关虚拟接口、受管规则、nftables表和本地DNS监听。
 
 首版自动兼容范围是Ubuntu上的标准Docker/Podman bridge与DNAT端口发布。`macvlan`、`ipvlan`、Kubernetes CNI/IPVS/eBPF、Docker IPv6 direct-routing、多个全局VPN和多公网出口不会被假定为已兼容; MiPilot只提示已发现的隧道和多默认路由, 这些环境仍需按实际链路验证。
 
-升级会清理旧版 `tun-bypass-ports.conf`、`mipilot-tun-bypass.service`、`/var/lib/mipilot/tun-routing.state` 及其明确记录的MiPilot规则。旧状态文件已经丢失时不会盲目删除系统策略路由或同名nftables表, 需要管理员结合实际规则手动确认。
+MiPilot会在 `/var/lib/mipilot/tun-routing.state` 保存自己分配的规则优先级和连接标记, 启停时只操作该状态对应的规则。已占用的候选优先级和连接标记会被跳过; 若同名nftables表没有受管状态或全部候选资源均不可用, TUN启动会失败并保留原配置。升级仍会清理旧版 `tun-bypass-ports.conf`、`mipilot-tun-bypass.service` 以及状态文件明确记录的旧规则; 状态文件已经丢失时不会盲目删除系统策略路由或同名nftables表。
 
 ### 订阅与节点
 
@@ -268,12 +268,19 @@ bash -n mipilot
 bash tests/run-tests.sh
 ```
 
-模拟测试不会写入真实系统目录。涉及TUN、Docker公网端口、Mihomo自动路由和systemd的行为应在受支持的Ubuntu amd64环境中验证。MiPilot不再因自己的回程规则要求额外安装 `nftables`。实机验证前后可以执行只读网络检查:
+模拟测试不会写入真实系统目录。涉及TUN、Docker公网端口、nftables和systemd的行为应在受支持的Ubuntu amd64环境中验证。TUN入站回程保护需要 `nft` 命令, 首次安装缺失时会通过APT安装 `nftables`。实机验证前后可以执行只读网络检查:
 
 ```bash
 sudo bash tests/run-network-checks.sh off
 # 通过mipilot开启TUN后
 sudo bash tests/run-network-checks.sh on
+```
+
+Docker公网映射端口必须从独立公网Linux客户端验证, 不能用宿主机本地访问代替。端点URL通过环境变量传入且不会输出:
+
+```bash
+MIPILOT_PUBLIC_ENDPOINTS=$'docker-8080\t200\tstrict\thttp://203.0.113.10:8080/admin/dashboard\nhost-5222\t200\tinsecure\thttps://203.0.113.10:5222/session' \
+  bash tests/run-public-endpoint-checks.sh
 ```
 
 单网卡、多网卡、SSH、Docker、IPv6、防火墙和断网恢复场景见 `tests/NETWORK_TEST_MATRIX.md`。

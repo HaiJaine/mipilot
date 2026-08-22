@@ -34,7 +34,7 @@ diff -u /tmp/mipilot-network-before.txt /tmp/mipilot-network-after.txt || true
 | N06 | nftables防火墙 | 启用默认拒绝出站规则 | TUN检查给出公网失败;放行Mihomo TUN网卡后恢复 |
 | N07 | iptables防火墙 | 使用iptables后端重复N06 | 行为与nftables场景一致 |
 | N08 | Docker bridge | TUN前启动现有容器, 测试容器出站 | 宿主机和容器均可出站; 容器公网流量由Mihomo处理 |
-| N09 | Docker端口映射 | 从另一台机器访问容器映射端口, 同时抓取物理网卡与bridge | 开关TUN前后端口均可访问; 回包走原物理网卡; 不依赖按端口旁路 |
+| N09 | Docker端口映射 | 从另一台机器运行公网端点探测, 同时抓取物理网卡与bridge | 开关TUN前后端口均可访问; 回包走原物理网卡; 不依赖按端口旁路 |
 | N10 | 宿主机公网监听端口 | 测试SSH和一个临时HTTP服务 | 新连接和已有连接均正常回程 |
 | N11 | IPv4/IPv6双栈 | 分别访问IPv4、IPv6测试地址 | IPv4正常; 系统有IPv6默认路由时IPv6正常或明确禁用 |
 | N12 | 仅IPv4系统 | 没有IPv6地址时开启TUN | 不因缺少IPv6导致整体失败 |
@@ -46,16 +46,16 @@ diff -u /tmp/mipilot-network-before.txt /tmp/mipilot-network-after.txt || true
 | N18 | 订阅更新期间TUN开启 | 更新为节点名称变化的订阅 | TUN保持开启; 空自定义策略组明确告警; 原运行模式不变化 |
 | N19 | DHCP地址和网关变化 | TUN运行时续租或切换网关 | 自动出口重新识别;新旧路由没有残留冲突 |
 | N20 | VPN与TUN叠加 | 先连接WireGuard/OpenVPN再开启TUN | 明确验证出口、内网网段和DNS; 不出现路由环路 |
-| N21 | 系统重启 | TUN开启状态重启服务器 | Mihomo启动并恢复原生TUN路由; 不存在旧版`inet mipilot_tun`和MiPilot受管ip rule; TUN状态和规则模式保持 |
+| N21 | 系统重启 | TUN开启状态重启服务器 | Mihomo启动并恢复原生TUN路由及`inet mipilot_tun`回程保护; TUN状态和规则模式保持 |
 | N22 | 快速连续启停 | 连续执行5次启用/关闭 | 配置始终可验证; 状态文件与API一致; 路由无累积残留 |
 | N23 | 全局模式启停TUN | 选择全局节点, 连续启停TUN | `mode`仍为global; 全局节点选择保持; MiPilot配置未丢字段 |
 | N24 | 规则模式更新订阅 | 选择自定义策略组后更新订阅 | 当前模式、自定义策略组类型及仍存在的节点选择自动恢复 |
 | N25 | 内核和管理器升级 | 升级前配置订阅、TUN、分组和节点 | `/etc/mipilot/config.json`内容保持; 生成配置与持久设置一致 |
 | N26 | 配置包恢复 | 修改多项设置后恢复历史备份 | Mihomo配置与配套MiPilot配置同时恢复, 不出现状态错位 |
 | N27 | TUN后安装Docker | 无Docker时开启TUN, 再安装Docker并启动端口发布服务 | 不重启TUN即可访问发布端口; 容器主动出站仍经过Mihomo |
-| N28 | TUN后更新容器网络 | TUN运行时新增端口、删除并重建Compose bridge | Mihomo `auto-redirect`自动接管新连接; 无需更新MiPilot端口或网段配置 |
+| N28 | TUN后更新容器网络 | TUN运行时新增端口、删除并重建Compose bridge | 新DNAT连接自动受回程保护; 无需更新MiPilot端口或网段配置 |
 | N29 | Podman bridge | 创建managed bridge并发布端口 | 容器出站经过Mihomo; 外部入站回包保持原路径 |
-| N30 | Mihomo路由资源冲突 | 预占Mihomo配置使用的iproute2表或规则索引后开启TUN | Mihomo正常选择已配置资源或明确启动失败; MiPilot回滚配置; 不创建额外fwmark规则 |
+| N30 | MiPilot回程资源冲突 | 预占8990优先级和一个候选fwmark后开启TUN | 自动选择空闲资源并写入状态; 不删除预存规则 |
 | N31 | 规则策略无重启切换 | 在订阅策略组与自定义策略组之间连续切换 | `MiPilot-规则选择`通过API更新; Mihomo进程PID不变; TUN和现有连接不因服务重启中断 |
 | N32 | 管理API与代理监听范围 | 激活包含公网API监听、空密钥、`allow-lan: true`的订阅 | 合并后API和代理端口仅监听127.0.0.1; API密钥非空且后续订阅更新保持稳定 |
 | N33 | 无DNS配置的订阅 | 激活不包含`dns`的订阅并开启TUN | 自动生成`redir-host` DNS和标准`dns-hijack`; 域名与IP访问均正常 |

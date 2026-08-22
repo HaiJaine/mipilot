@@ -1010,7 +1010,7 @@ materialize_mipilot_state() {
   atomic_install_file 600 "$temporary" "$SUBSCRIPTION_LIST_FILE" || return 1
   # shellcheck disable=SC2024
   sudo jq -r '.subscription.active // empty' "$MANAGER_CONFIG_FILE" >"$temporary" || return 1
-  if [[ -s $temporary ]]; then
+  if grep -q '[^[:space:]]' "$temporary"; then
     atomic_install_file 600 "$temporary" "$SUBSCRIPTION_FILE" || return 1
   else
     sudo rm -f -- "$SUBSCRIPTION_FILE" || return 1
@@ -1725,13 +1725,88 @@ write_tun_routing_state() {
 }
 
 setup_tun_routing_rules() {
+  local priority
+  local mark
+  local rules_file
+  local family
+  local cleanup_family
+  local families=(-4)
+
+  ip -6 rule show >/dev/null 2>&1 && families+=(-6)
+
+  command -v nft >/dev/null 2>&1 || {
+    echo "缺少 nft 命令, 无法建立 TUN 入站连接回程保护."
+    return 1
+  }
+  tun_routing_rules_ready && return 0
+
   if sudo -n test -f "$TUN_ROUTING_STATE_FILE"; then
-    command -v nft >/dev/null 2>&1 || {
-      echo "检测到旧版 MiPilot TUN 路由状态, 但系统缺少 nft, 无法完成迁移清理."
+    priority="$(tun_routing_state_value priority)"
+    mark="$(tun_routing_state_value mark)"
+    tun_routing_state_is_valid || {
+      echo "MiPilot TUN 路由状态文件格式异常, 未自动删除未知网络规则."
       return 1
     }
-    echo "正在清理旧版 MiPilot TUN 回程规则, 后续路由由 Mihomo 管理..."
-    remove_tun_routing_rules
+    remove_tun_routing_rules || return 1
+    if tun_routing_priority_in_use "$priority"; then
+      priority="$(select_tun_routing_priority)" || {
+        echo "无法重新分配 TUN 回程规则优先级."
+        return 1
+      }
+    fi
+    if tun_routing_mark_in_use "$mark"; then
+      mark="$(select_tun_routing_mark)" || {
+        echo "无法重新分配 TUN 回程连接标记."
+        return 1
+      }
+    fi
+  else
+    if sudo -n nft list table inet "$TUN_ROUTING_TABLE" >/dev/null 2>&1; then
+      echo "nftables 表 inet ${TUN_ROUTING_TABLE} 已存在但不属于当前 MiPilot 状态."
+      return 1
+    fi
+    priority="$(select_tun_routing_priority)" || {
+      echo "无法在 ${TUN_ROUTING_PRIORITY_MIN}-${TUN_ROUTING_PRIORITY_MAX} 中分配 TUN 回程规则优先级."
+      return 1
+    }
+    mark="$(select_tun_routing_mark)" || {
+      echo "无法分配不冲突的 TUN 回程连接标记."
+      return 1
+    }
+  fi
+
+  rules_file="$(mktemp /tmp/mipilot-tun-routing.XXXXXX.nft)" || return 1
+  cat >"$rules_file" <<EOF
+table inet ${TUN_ROUTING_TABLE} {
+  chain prerouting {
+    type filter hook prerouting priority -90; policy accept;
+    ct direction original ct status dnat ct mark set ct mark | ${mark}
+    ct direction reply ct mark & ${mark} == ${mark} meta mark set meta mark | ${mark}
+  }
+}
+EOF
+  if ! sudo -n nft -f "$rules_file"; then
+    rm -f -- "$rules_file"
+    return 1
+  fi
+  rm -f -- "$rules_file"
+
+  for family in "${families[@]}"; do
+    if ! sudo -n ip "$family" rule add priority "$priority" fwmark "${mark}/${mark}" lookup main; then
+      for cleanup_family in "${families[@]}"; do
+        sudo -n ip "$cleanup_family" rule del priority "$priority" fwmark "${mark}/${mark}" lookup main >/dev/null 2>&1 || true
+      done
+      sudo -n nft delete table inet "$TUN_ROUTING_TABLE" >/dev/null 2>&1 || true
+      return 1
+    fi
+  done
+
+  if ! write_tun_routing_state "$priority" "$mark"; then
+    for family in "${families[@]}"; do
+      sudo -n ip "$family" rule del priority "$priority" fwmark "${mark}/${mark}" lookup main >/dev/null 2>&1 || true
+    done
+    sudo -n nft delete table inet "$TUN_ROUTING_TABLE" >/dev/null 2>&1 || true
+    return 1
   fi
 }
 
@@ -1763,10 +1838,12 @@ tun_routing_status_label() {
   case "$(tun_config_value)" in
     false) printf '未启用' ;;
     true)
-      if sudo -n test -f "$TUN_ROUTING_STATE_FILE"; then
-        printf '存在待清理旧规则'
+      if tun_routing_rules_ready; then
+        printf '已就绪'
+      elif sudo -n test -f "$TUN_ROUTING_STATE_FILE"; then
+        printf '规则不完整'
       else
-        printf '由 Mihomo 管理'
+        printf '未建立'
       fi
       ;;
     *) printf '状态未知' ;;
@@ -1776,7 +1853,7 @@ tun_routing_status_label() {
 list_network_interfaces_by_role() {
   ip -o link show 2>/dev/null \
     | awk -F': ' '{ name = $2; sub(/@.*/, "", name); print name }' \
-    | grep -E '^(tun|tap|wg|tailscale|zt|docker|podman|br-|virbr|lxdbr|cni|flannel|veth)' \
+    | grep -E '^(Meta$|tun|tap|wg|tailscale|zt|docker|podman|br-|virbr|lxdbr|cni|flannel|veth)' \
     | sort -u
 }
 
@@ -1798,16 +1875,22 @@ show_tun_network_warnings() {
 show_network_compatibility_report() {
   local priority
   local mark
+  local mark_display
   local interfaces
 
   echo "MiPilot 网络兼容性检查"
   echo "TUN 配置: $(tun_status_label)"
-  echo "TUN 路由管理: $(tun_routing_status_label)"
+  echo "TUN 回程保护: $(tun_routing_status_label)"
   if sudo -n test -f "$TUN_ROUTING_STATE_FILE"; then
     priority="$(tun_routing_state_value priority)"
     mark="$(tun_routing_state_value mark)"
-    echo "旧版路由优先级: ${priority:-读取失败}"
-    echo "旧版连接标记: ${mark:-读取失败}"
+    if [[ $mark =~ ^0x[0-9A-Fa-f]{8}$ ]]; then
+      mark_display="${mark:0:4}xxxxxx"
+    else
+      mark_display="读取失败"
+    fi
+    echo "受管路由优先级: ${priority:-读取失败}"
+    echo "受管连接标记: ${mark_display}"
   fi
   echo
   echo "IPv4 默认路由:"
@@ -1824,17 +1907,31 @@ show_network_compatibility_report() {
     echo "未检测到常见容器、虚拟机或隧道接口."
   fi
   echo
-  echo "旧版 MiPilot 路由规则:"
+  echo "MiPilot 受管路由规则:"
   if sudo -n test -f "$TUN_ROUTING_STATE_FILE"; then
-    ip -4 rule show 2>/dev/null | grep -E "^[[:space:]]*${priority}:" || true
-    ip -6 rule show 2>/dev/null | grep -E "^[[:space:]]*${priority}:" || true
+    if tun_routing_rule_exists -4 "$priority" "$mark"; then
+      echo "IPv4: 已安装"
+    else
+      echo "IPv4: 缺失"
+    fi
+    if ip -6 rule show >/dev/null 2>&1; then
+      if tun_routing_rule_exists -6 "$priority" "$mark"; then
+        echo "IPv6: 已安装"
+      else
+        echo "IPv6: 缺失"
+      fi
+    fi
   else
-    echo "无旧版受管规则."
+    echo "无受管规则."
   fi
   echo
-  echo "旧版 MiPilot nftables 表:"
+  echo "MiPilot 受管 nftables 表:"
   if command -v nft >/dev/null 2>&1; then
-    sudo -n nft list table inet "$TUN_ROUTING_TABLE" 2>/dev/null || echo "未建立."
+    if sudo -n nft list table inet "$TUN_ROUTING_TABLE" >/dev/null 2>&1; then
+      echo "已建立."
+    else
+      echo "未建立."
+    fi
   else
     echo "系统未安装 nft 命令."
   fi
@@ -1868,6 +1965,15 @@ verify_tun_runtime_network() {
     echo "TUN 检查失败: Mihomo API 显示 TUN 未启用."
     return 1
   fi
+  if ! tun_routing_rules_ready; then
+    echo "TUN 检查失败: MiPilot 入站连接回程保护规则未就绪."
+    return 1
+  fi
+  tun_device="$(jq -r '.tun.device // empty' <<<"$config_response")"
+  if [[ -z $tun_device ]] || ! ip link show "$tun_device" >/dev/null 2>&1; then
+    echo "TUN 检查失败: Mihomo TUN 网卡 ${tun_device:-未报告} 不存在."
+    return 1
+  fi
   if ! ip route get 1.1.1.1 >/dev/null 2>&1; then
     echo "TUN 检查失败: 系统无法解析 IPv4 出站路由."
     return 1
@@ -1891,7 +1997,6 @@ verify_tun_runtime_network() {
       echo "TUN 已保持开启, 请通过当前会话或备用管理通道确认连接正常."
     else
       ssh_route_device="$(awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }' <<<"$ssh_route")"
-      tun_device="$(jq -r '.tun.device // empty' <<<"$config_response")"
       if [[ -n $tun_device && $ssh_route_device == "$tun_device" ]]; then
         echo "警告: 当前 SSH 客户端 ${ssh_client} 的回程指向 TUN 网卡: ${ssh_route}"
         echo "TUN 已保持开启, 请确认当前 SSH 会话和实际服务访问正常."
@@ -4355,12 +4460,18 @@ manage_global_nodes() {
   local selectable_nodes=()
 
   response="$(api "${API}/proxies")" || return
+  if ! jq -e '.proxies.GLOBAL != null and .proxies.GLOBAL.all != null' <<<"$response" >/dev/null; then
+    echo "当前配置缺少全局代理出口(GLOBAL), 无法选择全局节点."
+    return 1
+  fi
   nodes_json="$(
     jq -c '
-      [
+      (.proxies.GLOBAL.all // []) as $global_allowed
+      | [
         .proxies
         | to_entries[]
         | select(.value.all == null)
+        | select(.key as $name | $global_allowed | index($name) != null)
         | select(.key != "DIRECT" and .key != "REJECT" and .key != "PASS")
         | select(
             (.value.type // "") != "Direct"
@@ -4399,11 +4510,6 @@ manage_global_nodes() {
       fi
       echo "筛选后找到 ${node_count} 个实际代理节点."
     fi
-  fi
-
-  if ! jq -e '.proxies.GLOBAL != null and .proxies.GLOBAL.all != null' <<<"$response" >/dev/null; then
-    echo "当前配置缺少全局代理出口(GLOBAL), 无法选择全局节点."
-    return 1
   fi
 
   if resolve_main_proxy_response "$response" global; then
@@ -5988,7 +6094,7 @@ missing_runtime_commands() {
   local command_name
   local missing=()
 
-  for command_name in awk curl cut find flock getent groupdel gzip grep ip jq sed setsid sha256sum sort stat sudo systemctl timeout tr useradd userdel; do
+  for command_name in awk curl cut find flock getent groupdel gzip grep ip jq nft sed setsid sha256sum sort stat sudo systemctl timeout tr useradd userdel; do
     command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
   done
   printf '%s\n' "${missing[*]}"
@@ -6014,7 +6120,7 @@ ensure_install_dependencies() {
   if ! sudo apt-get update; then
     echo "警告: APT 软件源更新未完全成功, 将尝试使用已更新或现有的软件包索引继续安装."
   fi
-  sudo apt-get install -y ca-certificates coreutils curl findutils gzip iproute2 jq passwd util-linux || return 1
+  sudo apt-get install -y ca-certificates coreutils curl findutils gzip iproute2 jq nftables passwd util-linux || return 1
   missing="$(missing_runtime_commands)"
   if [[ -n $missing ]]; then
     echo "依赖安装后仍缺少命令: ${missing}"
@@ -8738,7 +8844,7 @@ check_dependencies() {
   local missing=()
   local command_name
 
-  for command_name in awk curl cut find flock getent groupdel gzip grep ip jq locale sed setsid sha256sum sort stat sudo systemctl timeout tr useradd userdel; do
+  for command_name in awk curl cut find flock getent groupdel gzip grep ip jq locale nft sed setsid sha256sum sort stat sudo systemctl timeout tr useradd userdel; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
       missing+=("$command_name")
     fi

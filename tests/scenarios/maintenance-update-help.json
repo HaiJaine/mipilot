@@ -1,0 +1,15 @@
+{
+  "command": ["/usr/local/bin/mipilot"],
+  "timeout": 120,
+  "steps": [
+    {"expect": "MiPilot 代理管理器", "sendline": "8"},
+    {"expect": "================ 运行维护 ================", "sendline": "5"},
+    {"expect": "================ 更新与版本回退 ================", "sendline": "7"},
+    {"expect_exact": "无法自动访问GitHub时, 请手动下载:"},
+    {"expect": "按 Enter 或 Esc 返回菜单", "sendline": ""},
+    {"expect": "================ 更新与版本回退 ================", "sendline": "0"},
+    {"expect": "================ 运行维护 ================", "sendline": "0"},
+    {"expect": "MiPilot 代理管理器", "sendline": "0"},
+    {"expect_eof": true}
+  ]
+}

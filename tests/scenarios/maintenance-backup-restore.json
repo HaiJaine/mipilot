@@ -1,0 +1,28 @@
+{
+  "command": ["/usr/local/bin/mipilot"],
+  "timeout": 300,
+  "steps": [
+    {"expect": "MiPilot 代理管理器", "sendline": "8"},
+    {"expect": "================ 运行维护 ================", "sendline": "6"},
+    {"expect": "================ 配置备份与恢复 ================", "sendline": "1"},
+    {"expect": "备份已创建:"},
+    {"expect": "按 Enter 或 Esc 返回菜单", "sendline": ""},
+    {"expect": "================ 配置备份与恢复 ================", "sendline": "1"},
+    {"expect": "备份已创建:"},
+    {"expect": "按 Enter 或 Esc 返回菜单", "sendline": ""},
+    {"expect": "================ 配置备份与恢复 ================", "sendline": "1"},
+    {"expect": "备份已创建:"},
+    {"expect": "按 Enter 或 Esc 返回菜单", "sendline": ""},
+    {"expect": "================ 配置备份与恢复 ================", "sendline": "1"},
+    {"expect": "备份已创建:"},
+    {"expect": "按 Enter 或 Esc 返回菜单", "sendline": ""},
+    {"expect": "================ 配置备份与恢复 ================", "sendline": "2"},
+    {"expect": "选择要恢复的配置备份:", "sendline": "1"},
+    {"expect_exact": "配置备份已恢复.", "timeout": 300},
+    {"expect": "按 Enter 或 Esc 返回菜单", "sendline": ""},
+    {"expect": "================ 配置备份与恢复 ================", "sendline": "0"},
+    {"expect": "================ 运行维护 ================", "sendline": "0"},
+    {"expect": "MiPilot 代理管理器", "sendline": "0"},
+    {"expect_eof": true}
+  ]
+}

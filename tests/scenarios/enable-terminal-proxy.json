@@ -1,0 +1,32 @@
+{
+  "command": [
+    "bash",
+    "-ic",
+    "mipilot; printf 'POST_PROXY enabled=%s http=%s no_proxy_has_local=%s\\n' \"${MIHOMO_PROXY_ENABLED:-0}\" \"${http_proxy:-unset}\" \"$([[ ${no_proxy:-} == *127.0.0.1* ]] && echo yes || echo no)\""
+  ],
+  "timeout": 300,
+  "steps": [
+    {
+      "expect": "MiPilot 代理管理器",
+      "sendline": "6"
+    },
+    {
+      "expect_exact": "代理已开启.",
+      "timeout": 300
+    },
+    {
+      "expect": "按 Enter 或 Esc 返回菜单",
+      "sendline": ""
+    },
+    {
+      "expect": "MiPilot 代理管理器",
+      "sendline": "0"
+    },
+    {
+      "expect_exact": "POST_PROXY enabled=1 http=http://127.0.0.1:7890 no_proxy_has_local=yes"
+    },
+    {
+      "expect_eof": true
+    }
+  ]
+}

@@ -1,0 +1,167 @@
+{
+  "command": ["/usr/local/bin/mipilot"],
+  "timeout": 300,
+  "steps": [
+    {
+      "expect": "MiPilot 代理管理器",
+      "sendline": "4"
+    },
+    {
+      "expect": "================ 策略组管理 ==================",
+      "sendline": "2"
+    },
+    {
+      "expect": "输入地区编号",
+      "sendline": "3,4"
+    },
+    {
+      "expect": "自定义策略组名称",
+      "sendline": "生命周期-日本狮城"
+    },
+    {
+      "expect": "选择策略类型",
+      "sendline": "1"
+    },
+    {
+      "expect": "确认创建策略组",
+      "sendline": "y"
+    },
+    {
+      "expect": "自定义策略组已创建",
+      "timeout": 300
+    },
+    {
+      "expect": "按 Enter 或 Esc 返回菜单",
+      "sendline": ""
+    },
+    {
+      "expect": "================ 策略组管理 ==================",
+      "sendline": "3"
+    },
+    {
+      "expect": "选择要查看的 MiPilot 策略组",
+      "sendline": "1"
+    },
+    {
+      "expect_exact": "策略组: MiPilot-生命周期-日本狮城"
+    },
+    {
+      "expect": "匹配节点:"
+    },
+    {
+      "expect": "按 Enter 或 Esc 返回菜单",
+      "sendline": ""
+    },
+    {
+      "expect": "================ 策略组管理 ==================",
+      "sendline": "4"
+    },
+    {
+      "expect": "选择要修改类型的 MiPilot 策略组",
+      "sendline": "1"
+    },
+    {
+      "expect": "选择新的策略类型",
+      "sendline": "2"
+    },
+    {
+      "expect": "策略组类型已更新",
+      "timeout": 300
+    },
+    {
+      "expect": "按 Enter 或 Esc 返回菜单",
+      "sendline": ""
+    },
+    {
+      "expect": "================ 策略组管理 ==================",
+      "sendline": "4"
+    },
+    {
+      "expect": "选择要修改类型的 MiPilot 策略组",
+      "sendline": "1"
+    },
+    {
+      "expect": "选择新的策略类型",
+      "sendline": "3"
+    },
+    {
+      "expect": "策略组类型已更新",
+      "timeout": 300
+    },
+    {
+      "expect": "按 Enter 或 Esc 返回菜单",
+      "sendline": ""
+    },
+    {
+      "expect": "================ 策略组管理 ==================",
+      "sendline": "4"
+    },
+    {
+      "expect": "选择要修改类型的 MiPilot 策略组",
+      "sendline": "1"
+    },
+    {
+      "expect": "选择新的策略类型",
+      "sendline": "4"
+    },
+    {
+      "expect": "策略组类型已更新",
+      "timeout": 300
+    },
+    {
+      "expect": "按 Enter 或 Esc 返回菜单",
+      "sendline": ""
+    },
+    {
+      "expect": "================ 策略组管理 ==================",
+      "sendline": "4"
+    },
+    {
+      "expect": "选择要修改类型的 MiPilot 策略组",
+      "sendline": "1"
+    },
+    {
+      "expect": "选择新的策略类型",
+      "sendline": "1"
+    },
+    {
+      "expect": "策略组类型已更新",
+      "timeout": 300
+    },
+    {
+      "expect": "按 Enter 或 Esc 返回菜单",
+      "sendline": ""
+    },
+    {
+      "expect": "================ 策略组管理 ==================",
+      "sendline": "5"
+    },
+    {
+      "expect": "选择要删除的 MiPilot 策略组",
+      "sendline": "1"
+    },
+    {
+      "expect": "确认删除策略组",
+      "sendline": "y"
+    },
+    {
+      "expect": "策略组已删除",
+      "timeout": 300
+    },
+    {
+      "expect": "按 Enter 或 Esc 返回菜单",
+      "sendline": ""
+    },
+    {
+      "expect": "================ 策略组管理 ==================",
+      "sendline": "0"
+    },
+    {
+      "expect": "MiPilot 代理管理器",
+      "sendline": "0"
+    },
+    {
+      "expect_eof": true
+    }
+  ]
+}

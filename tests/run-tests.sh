@@ -7,6 +7,7 @@ TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_DIR="$(cd -- "${TEST_DIR}/.." && pwd -P)"
 MANAGER_SCRIPT="${PROJECT_DIR}/mipilot"
 NETWORK_CHECK_SCRIPT="${TEST_DIR}/run-network-checks.sh"
+PUBLIC_ENDPOINT_CHECK_SCRIPT="${TEST_DIR}/run-public-endpoint-checks.sh"
 
 PASSED=0
 FAILED=0
@@ -117,7 +118,7 @@ load_manager() {
 }
 
 test_bash_syntax() {
-  bash -n "$MANAGER_SCRIPT" && bash -n "$NETWORK_CHECK_SCRIPT"
+  bash -n "$MANAGER_SCRIPT" && bash -n "$NETWORK_CHECK_SCRIPT" && bash -n "$PUBLIC_ENDPOINT_CHECK_SCRIPT"
 }
 
 test_manager_release_version() {
@@ -320,6 +321,44 @@ test_dependency_install_continues_after_partial_apt_update() {
   fi
   assert_equal $'update\ninstall' "$(cat "$root/apt-calls")" "APT update and install calls" || return 1
   grep -Fq 'APT 软件源更新未完全成功' <<<"$output" || fail "partial APT update warning was not shown"
+  grep -Eq 'apt-get install .*nftables' "$MANAGER_SCRIPT" || fail "nftables package was not part of installation dependencies"
+}
+
+test_public_endpoint_probe_redacts_urls() {
+  local root
+  local output
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  mkdir -p -- "$root/bin"
+  cat >"$root/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >>"${MIPILOT_TEST_CURL_ARGUMENTS:?}"
+printf '200\t0.125'
+EOF
+  chmod 755 "$root/bin/curl"
+
+  output="$(
+    PATH="$root/bin:$PATH" \
+    MIPILOT_TEST_CURL_ARGUMENTS="$root/curl-arguments" \
+    MIPILOT_PUBLIC_ENDPOINTS=$'docker-8080\t200\tstrict\thttp://203.0.113.10:8080/private\nhost-5222\t200\tinsecure\thttps://203.0.113.10:5222/session' \
+      bash "$PUBLIC_ENDPOINT_CHECK_SCRIPT"
+  )" || return 1
+  [[ $output == *'[PASS] docker-8080: HTTP 200'* ]] || return 1
+  [[ $output == *'[PASS] host-5222: HTTP 200'* ]] || return 1
+  [[ $output != *'203.0.113.10'* && $output != *'/private'* ]] || fail "public endpoint probe exposed a URL"
+  assert_equal '1' "$(grep -Fxc -- '-k' "$root/curl-arguments")" "insecure TLS probe option count" || return 1
+
+  if MIPILOT_PUBLIC_ENDPOINTS=$'invalid\t20\tstrict\thttp://203.0.113.10/' \
+       bash "$PUBLIC_ENDPOINT_CHECK_SCRIPT" >/dev/null 2>&1; then
+    fail "public endpoint probe accepted an invalid expected status"
+    return 1
+  fi
+  if MIPILOT_PUBLIC_ENDPOINTS=$'bad\e[31m\t200\tstrict\thttp://203.0.113.10/' \
+       bash "$PUBLIC_ENDPOINT_CHECK_SCRIPT" >/dev/null 2>&1; then
+    fail "public endpoint probe accepted a control character in the label"
+    return 1
+  fi
 }
 
 test_find_local_assets() {
@@ -595,6 +634,11 @@ EOF
   assert_file_has_line "$REGION_STATE_FILE" 'custom-1;MiPilot-日本;Japan;url-test' "materialized custom group" || return 1
   assert_equal "Proxy" "$(cat "$REGION_PARENT_FILE")" "materialized rule parent" || return 1
   assert_equal "true" "$(cat "$TUN_STATE_FILE")" "materialized TUN state" || return 1
+
+  jq '.subscription.active = ""' "$MANAGER_CONFIG_FILE" >"$root/config-without-active.json" || return 1
+  mv -- "$root/config-without-active.json" "$MANAGER_CONFIG_FILE"
+  materialize_mipilot_state || return 1
+  assert_not_exists "$SUBSCRIPTION_FILE" || return 1
 
   installed_runtime_mode() {
     printf 'service\n'
@@ -1122,6 +1166,7 @@ test_tun_routing_rules_are_connection_based() {
   local root
   local ip_rules_file
   local table_file
+  local generated_rules
   local remaining
 
   root="$(make_temp_dir)" || return 1
@@ -1131,20 +1176,23 @@ test_tun_routing_rules_are_connection_based() {
   TUN_ROUTING_STATE_FILE="$STATE_DIR/tun-routing.state"
   ip_rules_file="$root/ip-rules"
   table_file="$root/nft-table"
-  mkdir -p -- "$STATE_DIR"
-  printf '%s\n' \
-    'version=1' \
-    'table=mipilot_tun' \
-    'priority=8989' \
-    'mark=0x40000000' >"$TUN_ROUTING_STATE_FILE"
-  printf '%s\n' \
-    '8989: from all fwmark 0x40000000/0x40000000 lookup main' \
-    '8990: from all lookup 100' >"$ip_rules_file"
-  : >"$table_file"
+  generated_rules="$root/generated.nft"
+  printf '%s\n' '8990: from all lookup 100' >"$ip_rules_file"
 
   sudo() {
     while [[ ${1:-} == -n ]]; do shift; done
+    if [[ ${1:-} == install && ${2:-} == -d ]]; then
+      mkdir -p -- "${@: -1}"
+      return
+    fi
     run_as_mock_sudo "$@"
+  }
+  atomic_install_file() {
+    local source_file="$2"
+    local destination="$3"
+
+    mkdir -p -- "$(dirname -- "$destination")"
+    cp -- "$source_file" "$destination"
   }
   ip() {
     local family="$1"
@@ -1152,6 +1200,8 @@ test_tun_routing_rules_are_connection_based() {
     [[ $family == -4 ]] || return 1
     if [[ ${1:-} == rule && ${2:-} == show ]]; then
       cat "$ip_rules_file"
+    elif [[ ${1:-} == rule && ${2:-} == add ]]; then
+      printf '%s: from all fwmark %s lookup main\n' "$4" "$6" >>"$ip_rules_file"
     elif [[ ${1:-} == rule && ${2:-} == del ]]; then
       awk -F: -v priority="$4" '$1 + 0 != priority' "$ip_rules_file" >"${ip_rules_file}.next"
       mv -- "${ip_rules_file}.next" "$ip_rules_file"
@@ -1160,19 +1210,172 @@ test_tun_routing_rules_are_connection_based() {
     fi
   }
   nft() {
-    if [[ ${1:-} == list && ${2:-} == table ]]; then
+    if [[ ${1:-} == list && ${2:-} == ruleset ]]; then
+      return 0
+    elif [[ ${1:-} == list && ${2:-} == chain ]]; then
+      [[ -f $table_file ]] && cat "$generated_rules"
+    elif [[ ${1:-} == list && ${2:-} == table ]]; then
       [[ -f $table_file ]]
+    elif [[ ${1:-} == -f ]]; then
+      cp -- "$2" "$generated_rules"
+      : >"$table_file"
     elif [[ ${1:-} == delete && ${2:-} == table ]]; then
       rm -f -- "$table_file"
     else
       return 1
     fi
   }
+  tun_routing_priority_in_use() {
+    [[ $1 == 8990 ]]
+  }
+  tun_routing_mark_in_use() {
+    [[ $1 == 0x40000000 ]]
+  }
+
   setup_tun_routing_rules || return 1
+  assert_file_has_line "$TUN_ROUTING_STATE_FILE" 'priority=8989' "selected free rule priority" || return 1
+  assert_file_has_line "$TUN_ROUTING_STATE_FILE" 'mark=0x20000000' "selected connection mark" || return 1
+  grep -Fq 'ct direction original ct status dnat' "$generated_rules" || return 1
+  grep -Fq 'ct direction reply ct mark & 0x20000000' "$generated_rules" || return 1
+  if grep -Eq 'dport|sport|8080' "$generated_rules"; then
+    fail "TUN routing rules depend on a port"
+    return 1
+  fi
+
+  setup_tun_routing_rules || return 1
+  assert_equal '1' "$(grep -c 'fwmark' "$ip_rules_file")" "idempotent TUN route rule" || return 1
+
+  sed -i 's/0x20000000/0x10000000/g' "$generated_rules"
+  if tun_routing_rules_ready; then
+    fail "mismatched managed nft mark was accepted"
+    return 1
+  fi
+  setup_tun_routing_rules || return 1
+  grep -Fq 'ct direction original ct status dnat ct mark set ct mark | 0x20000000' "$generated_rules" || return 1
+
+  printf 'table inet mipilot_tun { chain prerouting { } }\n' >"$generated_rules"
+  if tun_routing_rules_ready; then
+    fail "empty managed nft chain was accepted"
+    return 1
+  fi
+  setup_tun_routing_rules || return 1
+  grep -Fq 'ct direction original ct status dnat' "$generated_rules" || return 1
+  grep -Fq 'ct direction reply ct mark & 0x20000000' "$generated_rules" || return 1
+
+  remove_tun_routing_rules || return 1
   assert_not_exists "$TUN_ROUTING_STATE_FILE" || return 1
   assert_not_exists "$table_file" || return 1
   remaining="$(cat "$ip_rules_file")"
-  assert_equal '8990: from all lookup 100' "$remaining" "removed legacy MiPilot route only"
+  assert_equal '8990: from all lookup 100' "$remaining" "preserved unrelated route rule"
+}
+
+test_tun_routing_setup_failure_is_transactional() {
+  local root
+  local table_file
+  local ipv4_rule_file
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  STATE_DIR="$root/state"
+  TUN_ROUTING_STATE_FILE="$STATE_DIR/tun-routing.state"
+  table_file="$root/nft-table"
+  ipv4_rule_file="$root/ipv4-rule"
+
+  sudo() {
+    while [[ ${1:-} == -n ]]; do shift; done
+    run_as_mock_sudo "$@"
+  }
+  ip() {
+    if [[ ${2:-} == rule && ${3:-} == show ]]; then
+      if [[ ${1:-} == -4 && -f $ipv4_rule_file ]]; then
+        printf '%s\n' '8990: from all fwmark 0x40000000/0x40000000 lookup main'
+      fi
+      return 0
+    fi
+    if [[ ${1:-} == -4 && ${2:-} == rule && ${3:-} == add ]]; then
+      : >"$ipv4_rule_file"
+      return 0
+    fi
+    if [[ ${1:-} == -6 && ${2:-} == rule && ${3:-} == add ]]; then return 75; fi
+    if [[ ${1:-} == -4 && ${2:-} == rule && ${3:-} == del ]]; then
+      rm -f -- "$ipv4_rule_file"
+      return 0
+    fi
+    if [[ ${1:-} == -6 && ${2:-} == rule && ${3:-} == del ]]; then return 0; fi
+    return 1
+  }
+  nft() {
+    if [[ ${1:-} == list && ${2:-} == ruleset ]]; then
+      return 0
+    elif [[ ${1:-} == list && ${2:-} == table ]]; then
+      [[ -f $table_file ]]
+    elif [[ ${1:-} == -f ]]; then
+      : >"$table_file"
+    elif [[ ${1:-} == delete && ${2:-} == table ]]; then
+      rm -f -- "$table_file"
+    else
+      return 1
+    fi
+  }
+
+  if setup_tun_routing_rules >/dev/null 2>&1; then
+    fail "TUN routing setup accepted a failed ip rule creation"
+    return 1
+  fi
+  assert_not_exists "$TUN_ROUTING_STATE_FILE" || return 1
+  assert_not_exists "$table_file" || return 1
+  assert_not_exists "$ipv4_rule_file"
+}
+
+test_tun_routing_rejects_unmanaged_or_invalid_state() {
+  local root
+  local table_file
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  STATE_DIR="$root/state"
+  TUN_ROUTING_STATE_FILE="$STATE_DIR/tun-routing.state"
+  table_file="$root/nft-table"
+  mkdir -p -- "$STATE_DIR"
+  : >"$table_file"
+
+  sudo() {
+    while [[ ${1:-} == -n ]]; do shift; done
+    run_as_mock_sudo "$@"
+  }
+  ip() {
+    [[ ${1:-} == -6 ]] && return 1
+    [[ ${1:-} == -4 && ${2:-} == rule && ${3:-} == show ]]
+  }
+  nft() {
+    if [[ ${1:-} == list && ${2:-} == ruleset ]]; then
+      return 0
+    elif [[ ${1:-} == list && ${2:-} == table ]]; then
+      [[ -f $table_file ]]
+    elif [[ ${1:-} == list && ${2:-} == chain ]]; then
+      return 1
+    elif [[ ${1:-} == delete && ${2:-} == table ]]; then
+      rm -f -- "$table_file"
+    else
+      return 1
+    fi
+  }
+
+  if setup_tun_routing_rules >/dev/null 2>&1; then
+    fail "unmanaged nftables table was accepted"
+    return 1
+  fi
+  assert_exists "$table_file" || return 1
+
+  printf '%s\n' 'version=invalid' 'table=mipilot_tun' >"$TUN_ROUTING_STATE_FILE"
+  if setup_tun_routing_rules >/dev/null 2>&1; then
+    fail "invalid TUN routing state was accepted"
+    return 1
+  fi
+  assert_exists "$TUN_ROUTING_STATE_FILE" || return 1
+  assert_exists "$table_file"
 }
 
 test_reconcile_tun_runtime_state() {
@@ -3427,9 +3630,13 @@ test_tun_runtime_route_failure_is_explained() {
     API='http://127.0.0.1:9090'
   }
   api_quick() {
-    printf '%s\n' '{"tun":{"enable":true}}'
+    printf '%s\n' '{"tun":{"enable":true,"device":"Meta"}}'
+  }
+  tun_routing_rules_ready() {
+    return 0
   }
   ip() {
+    if [[ ${1:-} == link && ${2:-} == show && ${3:-} == Meta ]]; then return 0; fi
     return 1
   }
 
@@ -3440,7 +3647,9 @@ test_tun_runtime_route_failure_is_explained() {
   [[ $output == *'系统无法解析 IPv4 出站路由'* ]] || fail "TUN route failure reason was not shown"
 }
 
-test_tun_runtime_uses_mihomo_native_routing() {
+test_tun_runtime_requires_return_protection() {
+  local output
+
   load_manager || return 1
   API='http://127.0.0.1:9090'
 
@@ -3449,6 +3658,56 @@ test_tun_runtime_uses_mihomo_native_routing() {
   }
   api_quick() {
     printf '%s\n' '{"tun":{"enable":true}}'
+  }
+  tun_routing_rules_ready() {
+    return 1
+  }
+
+  if output="$(verify_tun_runtime_network 2>&1)"; then
+    fail "TUN runtime accepted missing return protection"
+    return 1
+  fi
+  [[ $output == *'入站连接回程保护规则未就绪'* ]] || fail "missing return protection reason was not shown"
+}
+
+test_tun_runtime_requires_device() {
+  local output
+
+  load_manager || return 1
+  API='http://127.0.0.1:9090'
+
+  refresh_api_config() {
+    API='http://127.0.0.1:9090'
+  }
+  api_quick() {
+    printf '%s\n' '{"tun":{"enable":true,"device":"Meta"}}'
+  }
+  tun_routing_rules_ready() {
+    return 0
+  }
+  ip() {
+    return 1
+  }
+
+  if output="$(verify_tun_runtime_network 2>&1)"; then
+    fail "TUN runtime accepted a missing TUN device"
+    return 1
+  fi
+  [[ $output == *'Mihomo TUN 网卡 Meta 不存在'* ]] || fail "missing TUN device reason was not shown"
+}
+
+test_tun_runtime_uses_managed_return_routing() {
+  load_manager || return 1
+  API='http://127.0.0.1:9090'
+
+  refresh_api_config() {
+    API='http://127.0.0.1:9090'
+  }
+  api_quick() {
+    printf '%s\n' '{"tun":{"enable":true,"device":"Meta"}}'
+  }
+  tun_routing_rules_ready() {
+    return 0
   }
   ip() {
     if [[ ${1:-} == -4 ]]; then
@@ -3460,7 +3719,7 @@ test_tun_runtime_uses_mihomo_native_routing() {
     return 0
   }
 
-  verify_tun_runtime_network >/dev/null 2>&1 || fail "TUN runtime still required MiPilot return routing rules"
+  verify_tun_runtime_network >/dev/null 2>&1 || fail "TUN runtime rejected ready MiPilot return routing rules"
 }
 
 test_tun_public_probe_failure_is_warning() {
@@ -3475,7 +3734,7 @@ test_tun_public_probe_failure_is_warning() {
     API='http://127.0.0.1:9090'
   }
   api_quick() {
-    printf '%s\n' '{"tun":{"enable":true}}'
+    printf '%s\n' '{"tun":{"enable":true,"device":"Meta"}}'
   }
   tun_routing_rules_ready() {
     return 0
@@ -3510,7 +3769,7 @@ test_tun_ssh_return_route_failure() {
     API='http://127.0.0.1:9090'
   }
   api_quick() {
-    printf '%s\n' '{"tun":{"enable":true}}'
+    printf '%s\n' '{"tun":{"enable":true,"device":"Meta"}}'
   }
   tun_routing_rules_ready() {
     return 0
@@ -3899,7 +4158,7 @@ test_global_node_delay_is_opt_in() {
   load_manager || return 1
   api_calls="$root/api-calls"
   API='http://127.0.0.1:9090'
-  mock_response='{"proxies":{"GLOBAL":{"type":"Selector","all":["节点A","节点B"],"now":"节点A"},"节点A":{"type":"Vmess"},"节点B":{"type":"Vmess"}}}'
+  mock_response='{"proxies":{"GLOBAL":{"type":"Selector","all":["节点A","节点B"],"now":"节点A"},"节点A":{"type":"Vmess"},"节点B":{"type":"Vmess"},"不可选节点":{"type":"Vmess"}}}'
   api() {
     if (( $# == 1 )); then
       printf '%s\n' "$mock_response"
@@ -3919,6 +4178,14 @@ test_global_node_delay_is_opt_in() {
     return 0
   }
   choose_item() {
+    local option
+
+    for option in "$@"; do
+      [[ $option != *'不可选节点'* ]] || {
+        fail "global node menu included a leaf proxy absent from GLOBAL.all"
+        return 1
+      }
+    done
     SELECTED="$2"
     return 0
   }
@@ -4143,6 +4410,7 @@ run_test "testing source guard" test_source_testing_guard
 run_test "source preserves enabled shell options" test_source_preserves_enabled_shell_options
 run_test "Linux input normalization" test_linux_input_normalization
 run_test "dependency install survives partial APT update failure" test_dependency_install_continues_after_partial_apt_update
+run_test "public endpoint probe redacts URLs" test_public_endpoint_probe_redacts_urls
 run_test "local asset discovery" test_find_local_assets
 run_test "Mihomo version check avoids SIGPIPE" test_mihomo_version_check_avoids_sigpipe
 run_test "configuration backup pruning" test_prune_config_backups
@@ -4168,7 +4436,9 @@ run_test "restored TUN state reconciliation" test_reconcile_tun_runtime_state
 run_test "TUN state sync failure restores sidecar" test_tun_state_sync_failure_restores_sidecar
 run_test "native Mihomo TUN routing" test_render_tun_native_routing
 run_test "legacy TUN bypass cleanup" test_cleanup_legacy_tun_bypass
-run_test "legacy MiPilot TUN routing cleanup" test_tun_routing_rules_are_connection_based
+run_test "connection-based TUN return routing" test_tun_routing_rules_are_connection_based
+run_test "TUN return routing setup rollback" test_tun_routing_setup_failure_is_transactional
+run_test "TUN routing state ownership guard" test_tun_routing_rejects_unmanaged_or_invalid_state
 run_test "mode switch persistence" test_mode_switch_persists_config
 run_test "selected-node persistence rendering" test_render_store_selected_config
 run_test "custom region group rendering" test_custom_region_group_rendering
@@ -4246,7 +4516,9 @@ run_test "TUN restart failure restores state" test_tun_restart_failure_restores_
 run_test "TUN change preserves stopped runtime" test_tun_change_does_not_start_stopped_runtime
 run_test "TUN API mismatch fails health check" test_tun_runtime_api_mismatch_fails
 run_test "TUN route failure explains cause" test_tun_runtime_route_failure_is_explained
-run_test "Mihomo native TUN routing health check" test_tun_runtime_uses_mihomo_native_routing
+run_test "TUN return routing health check failure" test_tun_runtime_requires_return_protection
+run_test "TUN device health check failure" test_tun_runtime_requires_device
+run_test "managed TUN return routing health check" test_tun_runtime_uses_managed_return_routing
 run_test "TUN public probe failure warns" test_tun_public_probe_failure_is_warning
 run_test "TUN SSH return route failure" test_tun_ssh_return_route_failure
 run_test "TUN SSH tunnel route warns without blocking" test_tun_ssh_route_through_tun_is_warning

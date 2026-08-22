@@ -1,0 +1,31 @@
+{
+  "command": [
+    "bash",
+    "-ic",
+    "mipilot; printf 'POST_PROXY enabled=%s http=%s\\n' \"${MIHOMO_PROXY_ENABLED:-0}\" \"${http_proxy:-unset}\""
+  ],
+  "timeout": 300,
+  "steps": [
+    {
+      "expect": "MiPilot 代理管理器",
+      "sendline": "6"
+    },
+    {
+      "expect_exact": "代理已关闭, 后续终端默认直连."
+    },
+    {
+      "expect": "按 Enter 或 Esc 返回菜单",
+      "sendline": ""
+    },
+    {
+      "expect": "MiPilot 代理管理器",
+      "sendline": "0"
+    },
+    {
+      "expect_exact": "POST_PROXY enabled=0 http=unset"
+    },
+    {
+      "expect_eof": true
+    }
+  ]
+}

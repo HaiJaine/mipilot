@@ -1,0 +1,17 @@
+{
+  "command": ["/usr/local/bin/mipilot"],
+  "timeout": 600,
+  "steps": [
+    {"expect": "MiPilot 代理管理器", "sendline": "8"},
+    {"expect": "================ 运行维护 ================", "sendline": "8"},
+    {"expect": "使用本地离线包重新安装", "sendline": "2"},
+    {"expect_exact": "离线包目录(回车使用当前目录, Esc返回): ", "sendline_env": "MIPILOT_LOCAL_BUNDLE_DIR"},
+    {"expect": "请选择离线重装时的配置处理方式:", "sendline": "2"},
+    {"expect_exact": "是否安装为 systemd 系统服务? [y/N] (Enter=手动模式, Esc返回): ", "sendline": "y"},
+    {"expect_exact": "Mihomo 和 mipilot 已安装完成.", "timeout": 600},
+    {"expect": "按 Enter 或 Esc 返回菜单", "sendline": ""},
+    {"expect": "================ 运行维护 ================", "sendline": "0"},
+    {"expect": "MiPilot 代理管理器", "sendline": "0"},
+    {"expect_eof": true}
+  ]
+}

@@ -8,6 +8,8 @@ MIHOMO_BIN="${MIPILOT_MIHOMO_BIN:-/usr/local/bin/mihomo}"
 YQ_BIN="${MIPILOT_YQ_BIN:-/usr/local/lib/mipilot/yq}"
 TUN_ROUTING_STATE_FILE="${MIPILOT_TUN_ROUTING_STATE_FILE:-/var/lib/mipilot/tun-routing.state}"
 TUN_ROUTING_TABLE="mipilot_tun"
+TUN_ROUTING_PRIORITY_MIN=8950
+TUN_ROUTING_PRIORITY_MAX=8990
 EXPECTED_TUN="${1:-any}"
 PASSED=0
 WARNED=0
@@ -15,6 +17,7 @@ FAILED=0
 API=""
 API_SECRET=""
 HEADER_CONFIG=""
+RUNNING_TUN_DEVICE=""
 
 pass() {
   printf '[PASS] %s\n' "$*"
@@ -64,6 +67,64 @@ api_get() {
   curl "${arguments[@]}" "${API}${path}"
 }
 
+tun_routing_state_value() {
+  local key="$1"
+
+  awk -F= -v key="$key" '$1 == key { print $2; exit }' "$TUN_ROUTING_STATE_FILE" 2>/dev/null
+}
+
+tun_routing_state_is_valid() {
+  local version
+  local table
+  local priority
+  local mark
+
+  [[ -f $TUN_ROUTING_STATE_FILE ]] || return 1
+  version="$(tun_routing_state_value version)"
+  table="$(tun_routing_state_value table)"
+  priority="$(tun_routing_state_value priority)"
+  mark="$(tun_routing_state_value mark)"
+  [[ $version == 1 && $table == "$TUN_ROUTING_TABLE" && $priority =~ ^[0-9]+$ ]] || return 1
+  (( priority >= TUN_ROUTING_PRIORITY_MIN && priority <= TUN_ROUTING_PRIORITY_MAX )) || return 1
+  [[ $mark == 0x40000000 || $mark == 0x20000000 || $mark == 0x10000000 || $mark == 0x08000000 ]]
+}
+
+tun_routing_rule_exists() {
+  local family="$1"
+  local priority="$2"
+  local mark="$3"
+
+  ip "$family" rule show 2>/dev/null \
+    | grep -Eq "^[[:space:]]*${priority}:[[:space:]].*fwmark ${mark}/${mark}.*lookup main([[:space:]]|$)"
+}
+
+tun_routing_rules_ready() {
+  local priority
+  local mark
+  local decimal
+  local chain
+  local original_rule
+  local reply_rule
+  local family
+  local families=(-4)
+
+  command -v nft >/dev/null 2>&1 || return 1
+  tun_routing_state_is_valid || return 1
+  priority="$(tun_routing_state_value priority)"
+  mark="$(tun_routing_state_value mark)"
+  decimal=$((mark))
+  chain="$(nft list chain inet "$TUN_ROUTING_TABLE" prerouting 2>/dev/null)" || return 1
+  original_rule="$(grep -F 'ct direction original' <<<"$chain" | grep -F 'ct status dnat' | grep -F 'ct mark set' || true)"
+  reply_rule="$(grep -F 'ct direction reply' <<<"$chain" | grep -F 'meta mark set' || true)"
+  [[ -n $original_rule && -n $reply_rule ]] || return 1
+  grep -Eiq "(^|[^[:alnum:]_])((${mark})|(${decimal}))([^[:alnum:]_]|$)" <<<"$original_rule" || return 1
+  grep -Eiq "(^|[^[:alnum:]_])((${mark})|(${decimal}))([^[:alnum:]_]|$)" <<<"$reply_rule" || return 1
+  ip -6 rule show >/dev/null 2>&1 && families+=(-6)
+  for family in "${families[@]}"; do
+    tun_routing_rule_exists "$family" "$priority" "$mark" || return 1
+  done
+}
+
 if [[ $EXPECTED_TUN != any && $EXPECTED_TUN != on && $EXPECTED_TUN != off ]]; then
   printf '用法: %s [any|on|off]\n' "$0" >&2
   exit 2
@@ -109,6 +170,7 @@ if [[ $controller =~ ^(127\.0\.0\.1|localhost):([0-9]+)$ ]]; then
   if config_response="$(api_get /configs 2>/dev/null)"; then
     pass "Mihomo API 可访问: ${API}"
     running_tun="$(jq -r '.tun.enable // false' <<<"$config_response")"
+    RUNNING_TUN_DEVICE="$(jq -r '.tun.device // empty' <<<"$config_response")"
     printf '       API报告TUN=%s\n' "$running_tun"
     case "$EXPECTED_TUN:$running_tun" in
       on:true|off:false|any:true|any:false) pass "TUN运行状态符合预期" ;;
@@ -125,8 +187,8 @@ if [[ -n $API_SECRET ]]; then
 else
   fail "Mihomo API 未配置访问密钥"
 fi
-if [[ $allow_lan == false && $bind_address == 127.0.0.1 ]]; then
-  pass "显式代理端口仅监听本机"
+if [[ $allow_lan == false ]]; then
+  pass "显式代理已禁止局域网访问: bind-address=${bind_address:-未配置}"
 elif [[ $allow_lan == true ]]; then
   warn "显式代理允许局域网或容器访问: bind-address=${bind_address:-未配置}; 请确认认证和允许网段符合预期"
 else
@@ -141,11 +203,16 @@ else
 fi
 
 if [[ $EXPECTED_TUN == on ]]; then
+  if [[ -n $RUNNING_TUN_DEVICE ]] && ip link show "$RUNNING_TUN_DEVICE" >/dev/null 2>&1; then
+    pass "Mihomo TUN 网卡已建立: ${RUNNING_TUN_DEVICE}"
+  else
+    fail "Mihomo TUN 网卡未建立: ${RUNNING_TUN_DEVICE:-API未报告}"
+  fi
   if [[ -x $YQ_BIN ]] &&
      "$YQ_BIN" eval -e '
        .tun.enable == true and
        .tun."auto-route" == true and
-       .tun."auto-redirect" == true and
+       .tun."auto-redirect" == false and
        .tun."strict-route" == false and
        (.tun."route-exclude-address" | any_c(. == "192.168.0.0/16")) and
        (.tun."route-exclude-address" | any_c(. == "100.64.0.0/10")) and
@@ -158,11 +225,10 @@ if [[ $EXPECTED_TUN == on ]]; then
   else
     fail "Mihomo原生TUN接管或局域网绕过配置不完整"
   fi
-  if [[ ! -e $TUN_ROUTING_STATE_FILE ]] &&
-     { ! command -v nft >/dev/null 2>&1 || ! nft list table inet "$TUN_ROUTING_TABLE" >/dev/null 2>&1; }; then
-    pass "没有旧版MiPilot回程规则残留"
+  if tun_routing_rules_ready; then
+    pass "MiPilot DNAT入站连接回程保护已就绪"
   else
-    fail "仍存在旧版MiPilot回程状态或nftables表"
+    fail "MiPilot DNAT入站连接回程保护不完整"
   fi
 elif [[ $EXPECTED_TUN == off ]]; then
   if [[ ! -e $TUN_ROUTING_STATE_FILE ]] &&
@@ -235,6 +301,7 @@ if command -v docker >/dev/null 2>&1; then
     docker_networks="$(docker network ls --format '{{.Name}}' 2>/dev/null | tr '\n' ' ')"
     pass "Docker服务可访问"
     printf '       网络: %s\n' "${docker_networks:-无}"
+    warn "本机Docker检查不代表公网映射端口可访问; 必须从独立公网客户端运行端点探测"
   else
     warn "已安装Docker但当前用户无法访问Docker服务"
   fi

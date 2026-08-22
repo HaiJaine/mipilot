@@ -1,0 +1,46 @@
+{
+  "command": ["/usr/local/bin/mipilot"],
+  "timeout": 300,
+  "secret_env": ["MIPILOT_TEST_SUBSCRIPTION_URL"],
+  "steps": [
+    {
+      "expect": "MiPilot 代理管理器",
+      "sendline": "2"
+    },
+    {
+      "expect": "订阅管理",
+      "sendline": "1"
+    },
+    {
+      "expect": "粘贴新订阅链接",
+      "sendline_env": "MIPILOT_TEST_SUBSCRIPTION_URL"
+    },
+    {
+      "expect": "订阅名称",
+      "sendline_env": "MIPILOT_TEST_SUBSCRIPTION_NAME"
+    },
+    {
+      "expect": "是否立即激活并更新节点",
+      "sendline": "y"
+    },
+    {
+      "expect_exact": "已设为当前激活订阅.",
+      "timeout": 300
+    },
+    {
+      "expect": "按 Enter 或 Esc 返回菜单",
+      "sendline": ""
+    },
+    {
+      "expect": "订阅管理",
+      "sendline": "0"
+    },
+    {
+      "expect": "MiPilot 代理管理器",
+      "sendline": "0"
+    },
+    {
+      "expect_eof": true
+    }
+  ]
+}

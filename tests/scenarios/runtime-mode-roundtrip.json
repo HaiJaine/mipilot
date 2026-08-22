@@ -1,0 +1,57 @@
+{
+  "command": ["/usr/local/bin/mipilot"],
+  "timeout": 300,
+  "steps": [
+    {
+      "expect": "MiPilot 代理管理器",
+      "sendline": "8"
+    },
+    {
+      "expect": "================ 运行维护 ================",
+      "sendline": "9"
+    },
+    {
+      "expect_exact": "已切换为手动模式. Mihomo 当前保持停止, 不会开机自启.",
+      "timeout": 300
+    },
+    {
+      "expect": "按 Enter 或 Esc 返回菜单",
+      "sendline": ""
+    },
+    {
+      "expect": "================ 运行维护 ================",
+      "sendline": "2"
+    },
+    {
+      "expect_exact": "当前状态: 运行中(手动模式)",
+      "timeout": 300
+    },
+    {
+      "expect": "按 Enter 或 Esc 返回菜单",
+      "sendline": ""
+    },
+    {
+      "expect": "================ 运行维护 ================",
+      "sendline": "9"
+    },
+    {
+      "expect_exact": "已切换为 systemd 服务模式并设置开机启动.",
+      "timeout": 300
+    },
+    {
+      "expect": "按 Enter 或 Esc 返回菜单",
+      "sendline": ""
+    },
+    {
+      "expect": "================ 运行维护 ================",
+      "sendline": "0"
+    },
+    {
+      "expect": "MiPilot 代理管理器",
+      "sendline": "0"
+    },
+    {
+      "expect_eof": true
+    }
+  ]
+}

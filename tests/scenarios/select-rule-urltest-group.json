@@ -1,0 +1,28 @@
+{
+  "command": ["/usr/local/bin/mipilot"],
+  "timeout": 300,
+  "steps": [
+    {
+      "expect": "MiPilot 代理管理器",
+      "sendline": "3"
+    },
+    {
+      "expect": "选择 MATCH 未匹配流量的默认出口策略组",
+      "sendline_env": "MIPILOT_TEST_RULE_GROUP_INDEX"
+    },
+    {
+      "expect_exact": "该组会自动测速并选择合适节点."
+    },
+    {
+      "expect": "按 Enter 或 Esc 返回菜单",
+      "sendline": ""
+    },
+    {
+      "expect": "MiPilot 代理管理器",
+      "sendline": "0"
+    },
+    {
+      "expect_eof": true
+    }
+  ]
+}

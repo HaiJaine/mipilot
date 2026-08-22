@@ -1,0 +1,18 @@
+{
+  "command": ["./mipilot"],
+  "timeout": 300,
+  "steps": [
+    {
+      "expect_exact": "是否安装为 systemd 系统服务? [y/N] (Enter=手动模式, Esc返回): ",
+      "sendline": "y"
+    },
+    {
+      "expect_exact": "是否现在添加订阅? [y/N] (Enter=否, Esc跳过): ",
+      "sendline": "n",
+      "timeout": 300
+    },
+    {
+      "expect_eof": true
+    }
+  ]
+}

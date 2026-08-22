@@ -1,0 +1,61 @@
+{
+  "command": ["/usr/local/bin/mipilot"],
+  "timeout": 300,
+  "steps": [
+    {
+      "expect": "MiPilot 代理管理器",
+      "sendline": "5"
+    },
+    {
+      "expect": "选择运行模式",
+      "sendline": "2"
+    },
+    {
+      "expect_exact": "运行模式已切换为: global",
+      "timeout": 300
+    },
+    {
+      "expect": "按 Enter 或 Esc 返回菜单",
+      "sendline": ""
+    },
+    {
+      "expect": "MiPilot 代理管理器",
+      "sendline": "5"
+    },
+    {
+      "expect": "选择运行模式",
+      "sendline": "3"
+    },
+    {
+      "expect_exact": "运行模式已切换为: direct",
+      "timeout": 300
+    },
+    {
+      "expect": "按 Enter 或 Esc 返回菜单",
+      "sendline": ""
+    },
+    {
+      "expect": "MiPilot 代理管理器",
+      "sendline": "5"
+    },
+    {
+      "expect": "选择运行模式",
+      "sendline": "1"
+    },
+    {
+      "expect_exact": "运行模式已切换为: rule",
+      "timeout": 300
+    },
+    {
+      "expect": "按 Enter 或 Esc 返回菜单",
+      "sendline": ""
+    },
+    {
+      "expect": "MiPilot 代理管理器",
+      "sendline": "0"
+    },
+    {
+      "expect_eof": true
+    }
+  ]
+}

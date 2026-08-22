@@ -1,0 +1,14 @@
+{
+  "command": ["/usr/local/bin/mipilot"],
+  "timeout": 300,
+  "steps": [
+    {"expect": "MiPilot 代理管理器", "sendline": "8"},
+    {"expect": "================ 运行维护 ================", "sendline": "8"},
+    {"expect": "使用当前内核和配置修复当前运行模式及 mipilot", "sendline": "1"},
+    {"expect_exact": "运行环境和 mipilot 已修复.", "timeout": 300},
+    {"expect": "按 Enter 或 Esc 返回菜单", "sendline": ""},
+    {"expect": "================ 运行维护 ================", "sendline": "0"},
+    {"expect": "MiPilot 代理管理器", "sendline": "0"},
+    {"expect_eof": true}
+  ]
+}

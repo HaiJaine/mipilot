@@ -1,0 +1,25 @@
+{
+  "command": ["/usr/local/bin/mipilot"],
+  "timeout": 600,
+  "steps": [
+    {"expect": "MiPilot 代理管理器", "sendline": "8"},
+    {"expect": "================ 运行维护 ================", "sendline": "5"},
+    {"expect": "================ 更新与版本回退 ================", "sendline": "3"},
+    {"expect": "(无法自动访问GitHub时|内核版本相同, 无需更新|Mihomo 内核已更新到)", "timeout": 600},
+    {"expect": "按 Enter 或 Esc 返回菜单", "sendline": ""},
+    {"expect": "================ 更新与版本回退 ================", "sendline": "4"},
+    {"expect": "(地理数据与当前版本相同, 无需更新|Country.mmdb 和 GeoSite.dat 已更新|无法自动访问GitHub时)", "timeout": 600},
+    {"expect": "按 Enter 或 Esc 返回菜单", "sendline": ""},
+    {"expect": "================ 更新与版本回退 ================", "sendline": "1"},
+    {"expect": "(全部组件下载或校验失败|内核和地理数据均与当前版本相同|内核和地理数据已完成组合更新)", "timeout": 600},
+    {"expect": "按 Enter 或 Esc 返回菜单", "sendline": ""},
+    {"expect": "================ 更新与版本回退 ================", "sendline": "2"},
+    {"expect_exact": "检测到同版本修复构建, 脚本内容已更新.", "timeout": 600},
+    {"expect_exact": "确认安装 MiPilot 1.0.2 及 YAML 组件? [y/N] (Enter=否, Esc返回): ", "sendline": "n"},
+    {"expect_exact": "已取消管理器更新."},
+    {"expect": "================ 更新与版本回退 ================", "sendline": "0"},
+    {"expect": "================ 运行维护 ================", "sendline": "0"},
+    {"expect": "MiPilot 代理管理器", "sendline": "0"},
+    {"expect_eof": true}
+  ]
+}

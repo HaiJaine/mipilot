@@ -1,0 +1,33 @@
+{
+  "command": ["/usr/local/bin/mipilot"],
+  "timeout": 180,
+  "steps": [
+    {
+      "expect": "MiPilot 代理管理器",
+      "sendline": "2"
+    },
+    {
+      "expect": "================ 订阅管理 ================",
+      "sendline": "4"
+    },
+    {
+      "expect_exact": "订阅更新成功.",
+      "timeout": 180
+    },
+    {
+      "expect": "按 Enter 或 Esc 返回菜单",
+      "sendline": ""
+    },
+    {
+      "expect": "================ 订阅管理 ================",
+      "sendline": "0"
+    },
+    {
+      "expect": "MiPilot 代理管理器",
+      "sendline": "0"
+    },
+    {
+      "expect_eof": true
+    }
+  ]
+}

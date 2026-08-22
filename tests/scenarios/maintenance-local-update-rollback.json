@@ -1,0 +1,25 @@
+{
+  "command": ["/usr/local/bin/mipilot"],
+  "timeout": 600,
+  "steps": [
+    {"expect": "MiPilot 代理管理器", "sendline": "8"},
+    {"expect": "================ 运行维护 ================", "sendline": "5"},
+    {"expect": "================ 更新与版本回退 ================", "sendline": "5"},
+    {"expect_exact": "本地包目录(回车使用当前目录, Esc返回): ", "sendline_env": "MIPILOT_LOCAL_UPDATE_DIR", "timeout": 60},
+    {"expect": "组合更新包含内核降级", "sendline": "y", "timeout": 120},
+    {"expect_exact": "内核和地理数据已完成组合更新.", "timeout": 600},
+    {"expect": "按 Enter 或 Esc 返回菜单", "sendline": ""},
+    {"expect": "================ 更新与版本回退 ================", "sendline": "6"},
+    {"expect": "选择要回退的组件:", "sendline": "1"},
+    {"expect_exact": "内核已回退到最近一次保留版本.", "timeout": 600},
+    {"expect": "按 Enter 或 Esc 返回菜单", "sendline": ""},
+    {"expect": "================ 更新与版本回退 ================", "sendline": "6"},
+    {"expect": "选择要回退的组件:", "sendline": "1"},
+    {"expect_exact": "地理数据已回退到最近一次保留版本.", "timeout": 600},
+    {"expect": "按 Enter 或 Esc 返回菜单", "sendline": ""},
+    {"expect": "================ 更新与版本回退 ================", "sendline": "0"},
+    {"expect": "================ 运行维护 ================", "sendline": "0"},
+    {"expect": "MiPilot 代理管理器", "sendline": "0"},
+    {"expect_eof": true}
+  ]
+}
