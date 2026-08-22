@@ -8732,6 +8732,9 @@ remove_managed_installation() {
   if [[ $LOCK_FILE == /run/lock/mipilot.lock ]]; then
     sudo rm -f -- "$LOCK_FILE" || true
   fi
+  if [[ $TUN_ROUTING_LOCK_FILE == /run/lock/mipilot-tun-routing.lock ]]; then
+    sudo rm -f -- "$TUN_ROUTING_LOCK_FILE" || true
+  fi
   MANAGER_SHOULD_EXIT=1
   unset -f mipilot mihomoctl mihomo_menu 2>/dev/null || true
 }

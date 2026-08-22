@@ -3363,6 +3363,21 @@ test_uninstall_stops_before_delete() {
   assert_equal "0" "$delete_attempted" "no deletion after failed service stop" || return 1
 }
 
+test_uninstall_cleans_managed_lock_files() {
+  local body
+
+  load_manager || return 1
+  body="$(declare -f remove_managed_installation)"
+  grep -Fq 'if [[ $LOCK_FILE == /run/lock/mipilot.lock ]]' <<<"$body" ||
+    fail "uninstall does not guard main lock cleanup" || return 1
+  grep -Fq 'sudo rm -f -- "$LOCK_FILE"' <<<"$body" ||
+    fail "uninstall does not remove the main lock" || return 1
+  grep -Fq 'if [[ $TUN_ROUTING_LOCK_FILE == /run/lock/mipilot-tun-routing.lock ]]' <<<"$body" ||
+    fail "uninstall does not guard TUN routing lock cleanup" || return 1
+  grep -Fq 'sudo rm -f -- "$TUN_ROUTING_LOCK_FILE"' <<<"$body" ||
+    fail "uninstall does not remove the TUN routing lock"
+}
+
 test_rule_policy_parsing_edges() {
   local root
   local config_file
@@ -4567,6 +4582,7 @@ run_test "online manager update and rollback" test_online_manager_update_and_rol
 run_test "subscription activation marker rollback" test_subscription_activation_marker_rollback
 run_test "reset runtime state" test_reset_runtime_state
 run_test "uninstall stop-before-delete guard" test_uninstall_stops_before_delete
+run_test "uninstall managed lock cleanup" test_uninstall_cleans_managed_lock_files
 run_test "rule policy parsing edge cases" test_rule_policy_parsing_edges
 run_test "multiple rule selectors require explicit choice" test_multiple_rule_selectors_require_choice
 run_test "stale saved rule parent ignored" test_stale_saved_parent_is_ignored
