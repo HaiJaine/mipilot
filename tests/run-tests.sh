@@ -2623,6 +2623,65 @@ test_service_account_validation() {
   fi
 }
 
+test_created_service_account_marker_permissions() {
+  local root
+  local account_created=0
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  SERVICE_USER="mipilot"
+  SERVICE_GROUP="mipilot"
+  STATE_DIR="$root/state"
+  SERVICE_ACCOUNT_MARKER="$STATE_DIR/service-account-created"
+  getent() {
+    (( account_created == 1 )) || return 1
+    case "$1:$2" in
+      passwd:mipilot) printf 'mipilot:x:998:998::/nonexistent:/usr/sbin/nologin\n' ;;
+      group:mipilot) printf 'mipilot:x:998:\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  sudo() {
+    while [[ ${1:-} == -n ]]; do shift; done
+    case "${1:-}" in
+      useradd) account_created=1 ;;
+      userdel|groupdel) account_created=0 ;;
+      *) run_as_mock_sudo "$@" ;;
+    esac
+  }
+
+  ensure_service_account || return 1
+  assert_equal '600' "$(stat -c '%a' "$SERVICE_ACCOUNT_MARKER")" "service account marker mode" || return 1
+  assert_file_has_line "$SERVICE_ACCOUNT_MARKER" 'created_by=mipilot' "service account marker owner" || return 1
+  assert_file_has_line "$SERVICE_ACCOUNT_MARKER" 'uid=998' "service account marker uid" || return 1
+  assert_file_has_line "$SERVICE_ACCOUNT_MARKER" 'gid=998' "service account marker gid"
+}
+
+test_existing_service_account_marker_permissions() {
+  local root
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  SERVICE_USER="mipilot"
+  SERVICE_GROUP="mipilot"
+  SERVICE_ACCOUNT_MARKER="$root/service-account-created"
+  printf 'created_by=mipilot\nuid=998\ngid=998\n' >"$SERVICE_ACCOUNT_MARKER"
+  chmod 644 "$SERVICE_ACCOUNT_MARKER"
+  getent() {
+    case "$1:$2" in
+      passwd:mipilot) printf 'mipilot:x:998:998::/nonexistent:/usr/sbin/nologin\n' ;;
+      group:mipilot) printf 'mipilot:x:998:\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  sudo() { run_as_mock_sudo "$@"; }
+
+  ensure_service_account || return 1
+  assert_equal '600' "$(stat -c '%a' "$SERVICE_ACCOUNT_MARKER")" "existing service account marker mode"
+}
+
 test_config_permission_snapshot_restore() {
   local root
   local snapshot
@@ -4489,6 +4548,8 @@ run_test "install marker persistent runtime sync" test_install_marker_updates_pe
 run_test "existing adoption service permissions" test_existing_adoption_prepares_service_permissions
 run_test "interactive menu requires TTY" test_interactive_menu_requires_tty
 run_test "service account validation" test_service_account_validation
+run_test "created service account marker permissions" test_created_service_account_marker_permissions
+run_test "existing service account marker permissions" test_existing_service_account_marker_permissions
 run_test "config permission snapshot restore" test_config_permission_snapshot_restore
 run_test "service runtime permission contract" test_service_runtime_permission_contract
 run_test "custom strategy name control-character rejection" test_custom_strategy_name_rejects_control_characters

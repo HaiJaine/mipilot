@@ -6514,6 +6514,7 @@ ensure_service_account() {
   local account_home
   local account_shell
   local system_uid_max
+  local marker_temporary
 
   if getent passwd "$SERVICE_USER" >/dev/null 2>&1; then
     account_record="$(getent passwd "$SERVICE_USER")" || return 1
@@ -6526,6 +6527,9 @@ ensure_service_account() {
           ( $account_shell != /usr/sbin/nologin && $account_shell != /sbin/nologin && $account_shell != /bin/false ) ]]; then
       echo "现有账号 ${SERVICE_USER} 不符合MiPilot服务账号约束, 已中止操作."
       return 1
+    fi
+    if sudo test -f "$SERVICE_ACCOUNT_MARKER"; then
+      sudo chmod 600 "$SERVICE_ACCOUNT_MARKER" || return 1
     fi
     return 0
   fi
@@ -6544,12 +6548,19 @@ ensure_service_account() {
     return 1
   }
   IFS=: read -r _ _ account_uid account_gid _ _ _ <<<"$account_record"
-  if ! printf 'created_by=mipilot\nuid=%s\ngid=%s\n' "$account_uid" "$account_gid" | \
-       sudo tee "$SERVICE_ACCOUNT_MARKER" >/dev/null; then
+  marker_temporary="$(mktemp /tmp/mipilot-service-account.XXXXXX)" || {
+    sudo userdel "$SERVICE_USER" >/dev/null 2>&1 || true
+    sudo groupdel "$SERVICE_GROUP" >/dev/null 2>&1 || true
+    return 1
+  }
+  printf 'created_by=mipilot\nuid=%s\ngid=%s\n' "$account_uid" "$account_gid" >"$marker_temporary"
+  if ! atomic_install_file 600 "$marker_temporary" "$SERVICE_ACCOUNT_MARKER"; then
+    rm -f -- "$marker_temporary"
     sudo userdel "$SERVICE_USER" >/dev/null 2>&1 || true
     sudo groupdel "$SERVICE_GROUP" >/dev/null 2>&1 || true
     return 1
   fi
+  rm -f -- "$marker_temporary"
 }
 
 ensure_service_runtime_permissions() {
