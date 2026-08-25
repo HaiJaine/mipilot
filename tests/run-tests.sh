@@ -3080,9 +3080,12 @@ test_secure_subscription_curl_config() {
 
 test_subscription_download_tls_fallback() {
   local call_count=0
+  local current_code
   local output
   local output_file
+  local return_status
   local statuses=()
+  local http_codes=()
   local arguments_file
   local root
 
@@ -3092,12 +3095,29 @@ test_subscription_download_tls_fallback() {
   arguments_file="$root/arguments"
   output_file="$root/output"
   run_cancellable_named() {
+    local headers_file=""
+    local target_file=""
+    local previous=""
+
     call_count=$((call_count + 1))
     printf '%s\n' "CALL=$call_count" "$@" >>"$arguments_file"
+    for argument in "$@"; do
+      [[ $previous == -D ]] && headers_file="$argument"
+      [[ $previous == -o ]] && target_file="$argument"
+      previous="$argument"
+    done
+    current_code="${http_codes[$((call_count - 1))]:-}"
+    if [[ -n $headers_file && -n $current_code ]]; then
+      printf 'HTTP/1.1 %s Test\r\n\r\n' "$current_code" >"$headers_file"
+    fi
+    if [[ -n $target_file ]]; then
+      printf 'proxies: []\n' >"$target_file"
+    fi
     return "${statuses[$((call_count - 1))]}"
   }
 
   statuses=(0)
+  http_codes=(200)
   download_subscription_with_tls_fallback "$root/curl.conf" "$root/subscription.yaml" >/dev/null || return 1
   assert_equal '1' "$call_count" "successful subscription download call count" || return 1
   if grep -Fq -- '--tls-max' "$arguments_file"; then
@@ -3108,6 +3128,7 @@ test_subscription_download_tls_fallback() {
   : >"$arguments_file"
   call_count=0
   statuses=(35 0)
+  http_codes=('' 200)
   download_subscription_with_tls_fallback "$root/curl.conf" "$root/subscription.yaml" >"$output_file" || return 1
   output="$(cat "$output_file")"
   assert_equal '2' "$call_count" "TLS failure retry call count" || return 1
@@ -3117,7 +3138,19 @@ test_subscription_download_tls_fallback() {
 
   : >"$arguments_file"
   call_count=0
+  statuses=(0)
+  http_codes=(400)
+  download_subscription_with_tls_fallback "$root/curl.conf" "$root/subscription.yaml" >"$output_file"
+  return_status=$?
+  assert_equal '22' "$return_status" "HTTP 400 subscription status" || return 1
+  assert_equal '1' "$call_count" "HTTP 400 retry count" || return 1
+  output="$(cat "$output_file")"
+  [[ $output == *'地址无效、已过期或不包含有效节点'* ]] || fail "HTTP 400 diagnosis was missing"
+
+  : >"$arguments_file"
+  call_count=0
   statuses=(28)
+  http_codes=('')
   if download_subscription_with_tls_fallback "$root/curl.conf" "$root/subscription.yaml" >/dev/null; then
     fail "non-TLS subscription download failure unexpectedly succeeded"
     return 1
@@ -3127,11 +3160,41 @@ test_subscription_download_tls_fallback() {
   : >"$arguments_file"
   call_count=0
   statuses=(130)
+  http_codes=('')
   if download_subscription_with_tls_fallback "$root/curl.conf" "$root/subscription.yaml" >/dev/null; then
     fail "cancelled subscription download unexpectedly succeeded"
     return 1
   fi
   assert_equal '1' "$call_count" "cancelled download retry count"
+}
+
+test_duplicate_subscription_is_not_added() {
+  local output
+  local output_file
+  local read_count=0
+  local root
+  local duplicate_url='https://example.test/sub/existing-token'
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  output_file="$root/output"
+  load_subscription_urls() {
+    SUBSCRIPTION_URLS=("$duplicate_url")
+  }
+  subscription_label_for_url() {
+    printf '%s\n' '现有订阅'
+  }
+  read_line_or_back() {
+    read_count=$((read_count + 1))
+    INPUT_LINE="$duplicate_url"
+  }
+
+  add_managed_subscription >"$output_file" 2>&1
+  output="$(cat "$output_file")"
+  [[ $output == *'该订阅地址已经存在: 现有订阅.'* ]] || fail "duplicate subscription label was missing" || return 1
+  [[ $output == *'未重复添加'* ]] || fail "duplicate subscription action was unclear" || return 1
+  assert_equal '1' "$read_count" "duplicate subscription prompt count"
 }
 
 test_local_api_config_rendering() {
@@ -4436,14 +4499,17 @@ test_unchanged_subscription_skips_restart() {
   }
   run_cancellable_named() {
     local label="$1"
+    local headers_file=""
     local previous=""
     local output_file=""
     shift 2
     if [[ $label == '正在下载订阅' ]]; then
       for argument in "$@"; do
+        [[ $previous == -D ]] && headers_file="$argument"
         [[ $previous == -o ]] && output_file="$argument"
         previous="$argument"
       done
+      [[ -n $headers_file ]] && printf 'HTTP/1.1 200 OK\r\n\r\n' >"$headers_file"
       cp -- "$CONFIG_FILE" "$output_file"
     fi
     return 0
@@ -4632,6 +4698,7 @@ run_test "run action refreshes sudo access" test_run_action_refreshes_sudo_acces
 run_test "API secret argument protection" test_api_secret_not_in_arguments
 run_test "secure subscription curl config" test_secure_subscription_curl_config
 run_test "subscription download TLS fallback" test_subscription_download_tls_fallback
+run_test "duplicate subscription is not added" test_duplicate_subscription_is_not_added
 run_test "local API config rendering" test_local_api_config_rendering
 run_test "local proxy config rendering" test_local_proxy_config_rendering
 run_test "manager candidate validation helpers" test_manager_candidate_validation_helpers
