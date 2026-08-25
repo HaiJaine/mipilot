@@ -16,7 +16,7 @@ if (( EUID == 0 )) && ! command -v sudo >/dev/null 2>&1; then
   }
 fi
 
-MANAGER_VERSION="1.0.2"
+MANAGER_VERSION="1.0.3"
 SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname -- "$SCRIPT_PATH")"
 USER_HOME="${HOME:-/root}"
@@ -4832,6 +4832,43 @@ create_curl_url_config() {
   chmod 600 "$target"
 }
 
+download_subscription_with_tls_fallback() {
+  local curl_config="$1"
+  local target="$2"
+  local status
+
+  run_cancellable_named "正在下载订阅" 125 curl \
+    -fL \
+    -sS \
+    --show-error \
+    --connect-timeout 20 \
+    --max-time 120 \
+    -H 'User-Agent: clash.meta' \
+    --config "$curl_config" \
+    -o "$target"
+  status=$?
+  if (( status != 35 )); then
+    return "$status"
+  fi
+
+  echo "默认 TLS 下载失败, 正在使用 TLS 1.2 重试..."
+  run_cancellable_named "正在使用 TLS 1.2 重新下载订阅" 125 curl \
+    -fL \
+    -sS \
+    --show-error \
+    --tls-max 1.2 \
+    --connect-timeout 20 \
+    --max-time 120 \
+    -H 'User-Agent: clash.meta' \
+    --config "$curl_config" \
+    -o "$target"
+  status=$?
+  if (( status == 0 )); then
+    echo "TLS 1.2 兼容下载成功, 当前网络路径可能存在 TLS 1.3 兼容问题."
+  fi
+  return "$status"
+}
+
 render_local_api_config() {
   local input_file="$1"
   local output_file="$2"
@@ -4914,15 +4951,7 @@ download_and_apply_subscription() {
   fi
   backup=""
 
-  run_cancellable_named "正在下载订阅" 125 curl \
-    -fL \
-    -sS \
-    --show-error \
-    --connect-timeout 20 \
-    --max-time 120 \
-    -H 'User-Agent: clash.meta' \
-    --config "$curl_config" \
-    -o "$temporary"
+  download_subscription_with_tls_fallback "$curl_config" "$temporary"
   status=$?
   rm -f -- "$curl_config"
   if (( status == 130 )); then

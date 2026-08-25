@@ -1,6 +1,6 @@
 # MiPilot
 
-当前版本: `1.0.2`, 配置持久化、TUN和规则分组修复版本。
+当前版本: `1.0.3`, TUN环境订阅下载兼容性修复版本。
 
 MiPilot 取意于“Mihomo + Pilot”, 是面向 Ubuntu 的 Mihomo 一键安装与维护工具。首次执行时可完全使用本地的 Mihomo 内核和地理数据完成安装; 安装完成后通过 `mipilot` 管理订阅、节点、TUN、终端代理、服务、更新、备份和卸载。
 
@@ -8,10 +8,10 @@ MiPilot 取意于“Mihomo + Pilot”, 是面向 Ubuntu 的 Mihomo 一键安装�
 
 ### 使用完整离线包
 
-从 [MiPilot v1.0.2 Release](https://github.com/HaiJaine/mipilot/releases/tag/v1.0.2) 下载:
+从 [MiPilot v1.0.3 Release](https://github.com/HaiJaine/mipilot/releases/tag/v1.0.3) 下载:
 
 ```text
-mipilot-v1.0.2-linux-amd64-offline.tar.gz
+mipilot-v1.0.3-linux-amd64-offline.tar.gz
 SHA256SUMS
 ```
 
@@ -19,8 +19,8 @@ SHA256SUMS
 
 ```bash
 sha256sum -c SHA256SUMS --ignore-missing
-tar -xzf mipilot-v1.0.2-linux-amd64-offline.tar.gz
-cd mipilot-v1.0.2
+tar -xzf mipilot-v1.0.3-linux-amd64-offline.tar.gz
+cd mipilot-v1.0.3
 bash ./mipilot
 ```
 
@@ -161,6 +161,7 @@ MiPilot会在 `/var/lib/mipilot/tun-routing.state` 保存自己分配的规则�
 ### 订阅与节点
 
 - 切换并更新订阅会整体替换旧订阅节点, 同时重新合并已明确保存的本机设置.
+- 订阅下载遇到 TLS 握手错误时会自动使用 TLS 1.2 重试, 避免当前TUN线路的TLS 1.3兼容问题阻止新增、更新或切换订阅.
 - 每个订阅可以设置最长40个字符的本地名称; 列表仍隐藏完整URL, 同域名订阅可以通过名称区分.
 - 删除非当前订阅时, 只删除该订阅地址.
 - 删除当前订阅时, 可以保留现有节点并冻结当前配置, 也可以清理所有节点并恢复安全的直连配置.

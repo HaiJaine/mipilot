@@ -123,7 +123,7 @@ test_bash_syntax() {
 
 test_manager_release_version() {
   load_manager || return 1
-  assert_equal "1.0.2" "$MANAGER_VERSION" "manager release version"
+  assert_equal "1.0.3" "$MANAGER_VERSION" "manager release version"
 }
 
 test_strategy_group_ui_labels() {
@@ -3078,6 +3078,62 @@ test_secure_subscription_curl_config() {
   fi
 }
 
+test_subscription_download_tls_fallback() {
+  local call_count=0
+  local output
+  local output_file
+  local statuses=()
+  local arguments_file
+  local root
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  arguments_file="$root/arguments"
+  output_file="$root/output"
+  run_cancellable_named() {
+    call_count=$((call_count + 1))
+    printf '%s\n' "CALL=$call_count" "$@" >>"$arguments_file"
+    return "${statuses[$((call_count - 1))]}"
+  }
+
+  statuses=(0)
+  download_subscription_with_tls_fallback "$root/curl.conf" "$root/subscription.yaml" >/dev/null || return 1
+  assert_equal '1' "$call_count" "successful subscription download call count" || return 1
+  if grep -Fq -- '--tls-max' "$arguments_file"; then
+    fail "successful subscription download unexpectedly forced TLS 1.2"
+    return 1
+  fi
+
+  : >"$arguments_file"
+  call_count=0
+  statuses=(35 0)
+  download_subscription_with_tls_fallback "$root/curl.conf" "$root/subscription.yaml" >"$output_file" || return 1
+  output="$(cat "$output_file")"
+  assert_equal '2' "$call_count" "TLS failure retry call count" || return 1
+  assert_file_has_line "$arguments_file" '--tls-max' "TLS retry option" || return 1
+  assert_file_has_line "$arguments_file" '1.2' "TLS retry version" || return 1
+  [[ $output == *'TLS 1.2 兼容下载成功'* ]] || fail "TLS fallback success message was missing"
+
+  : >"$arguments_file"
+  call_count=0
+  statuses=(28)
+  if download_subscription_with_tls_fallback "$root/curl.conf" "$root/subscription.yaml" >/dev/null; then
+    fail "non-TLS subscription download failure unexpectedly succeeded"
+    return 1
+  fi
+  assert_equal '1' "$call_count" "non-TLS failure retry count" || return 1
+
+  : >"$arguments_file"
+  call_count=0
+  statuses=(130)
+  if download_subscription_with_tls_fallback "$root/curl.conf" "$root/subscription.yaml" >/dev/null; then
+    fail "cancelled subscription download unexpectedly succeeded"
+    return 1
+  fi
+  assert_equal '1' "$call_count" "cancelled download retry count"
+}
+
 test_local_api_config_rendering() {
   local root
   local input_file
@@ -4334,12 +4390,12 @@ test_same_version_local_hotfix_is_offered() {
   root="$(make_temp_dir)" || return 1
   register_temp_dir_cleanup "$root"
   load_manager || return 1
-  MANAGER_VERSION='1.0.2'
+  MANAGER_VERSION='1.0.3'
   SCRIPT_PATH="$MANAGER_SCRIPT"
   MANAGER_INSTALLED_SCRIPT="$root/installed-mipilot"
   INSTALL_MARKER="$root/install-marker"
-  printf '%s\n' '#!/usr/bin/env bash' 'MANAGER_VERSION="1.0.2"' '# older build' >"$MANAGER_INSTALLED_SCRIPT"
-  printf '%s\n' 'version=1.0.2' >"$INSTALL_MARKER"
+  printf '%s\n' '#!/usr/bin/env bash' 'MANAGER_VERSION="1.0.3"' '# older build' >"$MANAGER_INSTALLED_SCRIPT"
+  printf '%s\n' 'version=1.0.3' >"$INSTALL_MARKER"
   sudo() {
     run_as_mock_sudo "$@"
   }
@@ -4575,6 +4631,7 @@ run_test "service account removal identity guard" test_service_account_removal_v
 run_test "run action refreshes sudo access" test_run_action_refreshes_sudo_access
 run_test "API secret argument protection" test_api_secret_not_in_arguments
 run_test "secure subscription curl config" test_secure_subscription_curl_config
+run_test "subscription download TLS fallback" test_subscription_download_tls_fallback
 run_test "local API config rendering" test_local_api_config_rendering
 run_test "local proxy config rendering" test_local_proxy_config_rendering
 run_test "manager candidate validation helpers" test_manager_candidate_validation_helpers

@@ -15,7 +15,7 @@
     {"expect": "================ 运行维护 ================", "sendline": "3"},
     {"expect": "按 Enter 或 Esc 返回菜单", "sendline": ""},
     {"expect": "================ 运行维护 ================", "sendline": "4"},
-    {"expect_exact": "mipilot 版本: 1.0.2"},
+    {"expect_exact": "mipilot 版本: 1.0.3"},
     {"expect": "按 Enter 或 Esc 返回菜单", "sendline": ""},
     {"expect": "================ 运行维护 ================", "sendline": "11"},
     {"expect_exact": "TUN 回程保护: 已就绪"},

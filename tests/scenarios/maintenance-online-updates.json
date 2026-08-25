@@ -15,7 +15,7 @@
     {"expect": "按 Enter 或 Esc 返回菜单", "sendline": ""},
     {"expect": "================ 更新与版本回退 ================", "sendline": "2"},
     {"expect_exact": "检测到同版本修复构建, 脚本内容已更新.", "timeout": 600},
-    {"expect_exact": "确认安装 MiPilot 1.0.2 及 YAML 组件? [y/N] (Enter=否, Esc返回): ", "sendline": "n"},
+    {"expect_exact": "确认安装 MiPilot 1.0.3 及 YAML 组件? [y/N] (Enter=否, Esc返回): ", "sendline": "n"},
     {"expect_exact": "已取消管理器更新."},
     {"expect": "================ 更新与版本回退 ================", "sendline": "0"},
     {"expect": "================ 运行维护 ================", "sendline": "0"},
