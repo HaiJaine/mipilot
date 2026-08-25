@@ -107,6 +107,9 @@ register_temp_dir_cleanup() {
 load_manager() {
   # shellcheck disable=SC2034
   MIPILOT_TESTING=1
+  if [[ -n ${TEST_TEMP_DIR:-} ]]; then
+    MIPILOT_SUBSCRIPTION_CACHE_DIR="${TEST_TEMP_DIR}/var/lib/mipilot/subscriptions"
+  fi
   # shellcheck source=/dev/null
   source "$MANAGER_SCRIPT"
   SERVICE_USER="mipilot-test-account-does-not-exist"
@@ -124,6 +127,7 @@ test_bash_syntax() {
 test_manager_release_version() {
   load_manager || return 1
   assert_equal "1.0.3" "$MANAGER_VERSION" "manager release version"
+  assert_equal "20260825.5" "$MANAGER_BUILD" "manager release build"
 }
 
 test_strategy_group_ui_labels() {
@@ -1069,11 +1073,40 @@ test_download_uses_curl_without_forced_proxy() {
   assert_line_count "$arguments_file" "curl" 2 "download command count" || return 1
   assert_file_has_line "$arguments_file" "-4" "IPv4 download option" || return 1
   assert_file_has_line "$arguments_file" "600" "slow release download timeout" || return 1
+  assert_file_has_line "$arguments_file" "=https" "HTTPS-only download protocol" || return 1
   assert_file_has_line "$arguments_file" "https://example.test/file" "download URL" || return 1
   if grep -Eq -- '^--(proxy|noproxy)$' "$arguments_file"; then
     fail "download command forced a proxy mode"
     return 1
   fi
+}
+
+test_download_tls_fallback() {
+  local root
+  local arguments_file
+  local call_count=0
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  arguments_file="$root/curl-arguments"
+
+  run_cancellable_named() {
+    call_count=$((call_count + 1))
+    shift 2
+    printf 'CALL=%s\n' "$call_count" >>"$arguments_file"
+    printf '%s\n' "$@" >>"$arguments_file"
+    (( call_count == 1 )) && return 35
+    return 0
+  }
+  sleep() {
+    return 0
+  }
+
+  download_file "https://example.test/release" "$root/release" >/dev/null || return 1
+  assert_equal 2 "$call_count" "generic download TLS retry count" || return 1
+  assert_line_count "$arguments_file" '--tls-max' 1 "TLS fallback only on retry" || return 1
+  assert_file_has_line "$arguments_file" '1.2' "generic download TLS fallback version"
 }
 
 test_render_tun_native_routing() {
@@ -3120,6 +3153,8 @@ test_subscription_download_tls_fallback() {
   http_codes=(200)
   download_subscription_with_tls_fallback "$root/curl.conf" "$root/subscription.yaml" >/dev/null || return 1
   assert_equal '1' "$call_count" "successful subscription download call count" || return 1
+  assert_file_has_line "$arguments_file" '=https' "subscription HTTPS-only protocol" || return 1
+  assert_file_has_line "$arguments_file" '67108864' "subscription size limit" || return 1
   if grep -Fq -- '--tls-max' "$arguments_file"; then
     fail "successful subscription download unexpectedly forced TLS 1.2"
     return 1
@@ -3383,13 +3418,15 @@ test_subscription_activation_marker_rollback() {
   CONFIG_DIR="$root/etc/mihomo"
   CONFIG_FILE="$CONFIG_DIR/config.yaml"
   SUBSCRIPTION_FILE="$CONFIG_DIR/subscription.url"
-  mkdir -p -- "$CONFIG_DIR"
+  mkdir -p -- "$CONFIG_DIR" "$MANAGER_CONFIG_DIR"
   printf '%s\n' 'https://old.example/sub' >"$SUBSCRIPTION_FILE"
+  printf '%s\n' '{"subscriptions":{"active_url":"https://old.example/sub"}}' >"$MANAGER_CONFIG_FILE"
 
   sudo() {
     run_as_mock_sudo "$@"
   }
   download_and_apply_subscription() {
+    cat "$2" >"$root/backup-settings-seen"
     return 1
   }
 
@@ -3403,6 +3440,31 @@ test_subscription_activation_marker_rollback() {
     return 1
   fi
   assert_equal 'https://old.example/sub' "$(head -n 1 "$SUBSCRIPTION_FILE")" "active subscription marker rollback" || return 1
+  assert_equal '{"subscriptions":{"active_url":"https://old.example/sub"}}' "$(cat "$root/backup-settings-seen")" "activation backup settings snapshot"
+}
+
+test_subscription_cache_round_trip() {
+  local root
+  local source_file
+  local target_file
+  local cache_file
+
+  root="$(make_temp_dir)" || return 1
+  register_temp_dir_cleanup "$root"
+  load_manager || return 1
+  SUBSCRIPTION_CACHE_DIR="$root/cache"
+  source_file="$root/source.yaml"
+  target_file="$root/target.yaml"
+  printf '%s\n' 'proxies: []' >"$source_file"
+  sudo() {
+    run_as_mock_sudo "$@"
+  }
+
+  save_subscription_cache 'https://example.test/sub/token' "$source_file" || return 1
+  cache_file="$(subscription_cache_path 'https://example.test/sub/token')" || return 1
+  assert_equal 600 "$(stat -c %a "$cache_file")" "subscription cache file mode" || return 1
+  load_subscription_cache 'https://example.test/sub/token' "$target_file" || return 1
+  assert_equal 'proxies: []' "$(cat "$target_file")" "subscription cache contents"
 }
 
 test_reset_runtime_state() {
@@ -4630,6 +4692,7 @@ run_test "TUN routing action lock" test_tun_routing_action_uses_independent_lock
 run_test "manager lock release" test_manager_lock_release
 run_test "lock release preserves caller stderr" test_lock_release_preserves_stderr
 run_test "curl download follows current system route" test_download_uses_curl_without_forced_proxy
+run_test "generic download TLS fallback" test_download_tls_fallback
 run_test "restored TUN state reconciliation" test_reconcile_tun_runtime_state
 run_test "TUN state sync failure restores sidecar" test_tun_state_sync_failure_restores_sidecar
 run_test "native Mihomo TUN routing" test_render_tun_native_routing
@@ -4706,6 +4769,7 @@ run_test "local proxy config rendering" test_local_proxy_config_rendering
 run_test "manager candidate validation helpers" test_manager_candidate_validation_helpers
 run_test "online manager update and rollback" test_online_manager_update_and_rollback
 run_test "subscription activation marker rollback" test_subscription_activation_marker_rollback
+run_test "subscription cache round trip" test_subscription_cache_round_trip
 run_test "reset runtime state" test_reset_runtime_state
 run_test "uninstall stop-before-delete guard" test_uninstall_stops_before_delete
 run_test "uninstall managed lock cleanup" test_uninstall_cleans_managed_lock_files

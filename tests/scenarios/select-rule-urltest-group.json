@@ -11,7 +11,7 @@
       "sendline_env": "MIPILOT_TEST_RULE_GROUP_INDEX"
     },
     {
-      "expect_exact": "该组会自动测速并选择合适节点."
+      "expect_exact": "该组按测速地址的延迟自动选择节点, 不代表所有网站或 TLS 客户端兼容."
     },
     {
       "expect": "按 Enter 或 Esc 返回菜单",

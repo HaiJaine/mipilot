@@ -17,6 +17,7 @@ if (( EUID == 0 )) && ! command -v sudo >/dev/null 2>&1; then
 fi
 
 MANAGER_VERSION="1.0.3"
+MANAGER_BUILD="20260825.5"
 SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname -- "$SCRIPT_PATH")"
 USER_HOME="${HOME:-/root}"
@@ -48,6 +49,7 @@ CLEANUP_SERVICE_FILE="${MIPILOT_CLEANUP_SERVICE_FILE:-/etc/systemd/system/mipilo
 CLEANUP_TIMER_FILE="${MIPILOT_CLEANUP_TIMER_FILE:-/etc/systemd/system/mipilot-cleanup.timer}"
 TUN_BYPASS_SERVICE_FILE="${MIPILOT_TUN_BYPASS_SERVICE_FILE:-/etc/systemd/system/mipilot-tun-bypass.service}"
 STATE_DIR="${MIPILOT_STATE_DIR:-/var/lib/mipilot}"
+SUBSCRIPTION_CACHE_DIR="${MIPILOT_SUBSCRIPTION_CACHE_DIR:-${STATE_DIR}/subscriptions}"
 TUN_ROUTING_STATE_FILE="${MIPILOT_TUN_ROUTING_STATE_FILE:-${STATE_DIR}/tun-routing.state}"
 TUN_ROUTING_TABLE="mipilot_tun"
 ROLLBACK_DIR="${STATE_DIR}/rollback"
@@ -847,6 +849,7 @@ prune_config_backups() {
 
 create_config_backup() {
   local reason="${1:-manual}"
+  local settings_source="${2:-$MANAGER_CONFIG_FILE}"
   local timestamp
   local backup
 
@@ -859,7 +862,7 @@ create_config_backup() {
   if ! mipilot_config_is_valid; then
     sync_mipilot_config_from_state || return 1
   fi
-  sudo install -m 600 "$MANAGER_CONFIG_FILE" "${backup%.yaml}.mipilot.json" || return 1
+  sudo install -m 600 "$settings_source" "${backup%.yaml}.mipilot.json" || return 1
   prune_config_backups "$BACKUP_LIMIT" || return 1
   printf '%s\n' "$backup"
 }
@@ -3102,7 +3105,7 @@ auto_add_region_groups() {
 
   echo
   if (( added_count > 0 )); then
-    echo "新增策略组将使用自动测速(url-test), 并加入规则模式可选列表."
+    echo "新增策略组将使用自动测速(url-test), 并加入规则模式可选列表; 健康检查只代表测速地址."
   fi
   if (( rules_need_refresh > 0 )); then
     echo "自动策略组将生成或更新节点筛选规则, 并排除流量、到期等提示节点."
@@ -4176,7 +4179,7 @@ manage_rule_nodes() {
   fi
   group_type="$(jq -r --arg group "$group" '.proxies[$group].type // ""' <<<"$response")"
   case "$group_type" in
-    URLTest) echo "该组会自动测速并选择合适节点." ;;
+    URLTest) echo "该组按测速地址的延迟自动选择节点, 不代表所有网站或 TLS 客户端兼容." ;;
     Fallback) echo "该组会在节点不可用时自动回退." ;;
     LoadBalance) echo "该组会按订阅配置进行负载均衡." ;;
     Selector)
@@ -4574,7 +4577,7 @@ manage_global_nodes() {
       display_nodes+=("${marker} ${node} [${delay} ms]")
     else
       if (( did_test == 1 )); then
-        display_nodes+=("${marker} ${node} [超时或不可用]")
+        display_nodes+=("${marker} ${node} [测速超时或不可达]")
       else
         display_nodes+=("${marker} ${node} [未测速]")
       fi
@@ -4842,10 +4845,13 @@ download_subscription_with_tls_fallback() {
   headers="$(mktemp /tmp/mipilot-subscription-headers.XXXXXX)" || return 1
   run_cancellable_named "正在下载订阅" 125 curl \
     -L \
+    --proto '=https' \
+    --proto-redir '=https' \
     -sS \
     --show-error \
     --connect-timeout 20 \
     --max-time 120 \
+    --max-filesize 67108864 \
     -H 'User-Agent: clash.meta' \
     -D "$headers" \
     --config "$curl_config" \
@@ -4870,11 +4876,14 @@ download_subscription_with_tls_fallback() {
   : >"$headers"
   run_cancellable_named "正在使用 TLS 1.2 重新下载订阅" 125 curl \
     -L \
+    --proto '=https' \
+    --proto-redir '=https' \
     -sS \
     --show-error \
     --tls-max 1.2 \
     --connect-timeout 20 \
     --max-time 120 \
+    --max-filesize 67108864 \
     -H 'User-Agent: clash.meta' \
     -D "$headers" \
     --config "$curl_config" \
@@ -4892,6 +4901,34 @@ download_subscription_with_tls_fallback() {
   fi
   rm -f -- "$headers"
   return "$status"
+}
+
+subscription_cache_path() {
+  local url="$1"
+  local key
+
+  key="$(printf '%s' "$url" | sha256sum | awk '{print $1}')" || return 1
+  printf '%s/%s.yaml\n' "$SUBSCRIPTION_CACHE_DIR" "$key"
+}
+
+save_subscription_cache() {
+  local url="$1"
+  local source_file="$2"
+  local cache_file
+
+  cache_file="$(subscription_cache_path "$url")" || return 1
+  sudo install -d -m 700 "$SUBSCRIPTION_CACHE_DIR" || return 1
+  atomic_install_file 600 "$source_file" "$cache_file"
+}
+
+load_subscription_cache() {
+  local url="$1"
+  local target="$2"
+  local cache_file
+
+  cache_file="$(subscription_cache_path "$url")" || return 1
+  sudo test -s "$cache_file" || return 1
+  copy_privileged_file_to_temp "$cache_file" "$target"
 }
 
 show_subscription_http_error() {
@@ -4949,6 +4986,7 @@ render_local_proxy_config() {
 
 download_and_apply_subscription() {
   local url="$1"
+  local backup_settings="${2:-$MANAGER_CONFIG_FILE}"
   local temporary
   local curl_config
   local tun_temporary
@@ -4973,6 +5011,7 @@ download_and_apply_subscription() {
   local status
   local was_active=0
   local selection_restore_failed=0
+  local used_cache=0
   local rule_parent_candidates=()
 
   ensure_sudo_access || return 1
@@ -4997,9 +5036,14 @@ download_and_apply_subscription() {
     return 130
   fi
   if (( status != 0 )); then
-    rm -f -- "$temporary"
-    echo "订阅下载失败, 现有配置未改变."
-    return 1
+    if load_subscription_cache "$url" "$temporary"; then
+      used_cache=1
+      echo "实时下载失败, 正在使用该订阅最近一次成功配置; 节点不会更新到最新."
+    else
+      rm -f -- "$temporary"
+      echo "订阅下载失败且没有可用缓存, 现有配置未改变."
+      return 1
+    fi
   fi
 
   if sudo test -s "$TUN_STATE_FILE"; then
@@ -5142,6 +5186,7 @@ download_and_apply_subscription() {
        { current_semantic_hash="$(config_semantic_hash "$CONFIG_FILE")" &&
          candidate_semantic_hash="$(config_semantic_hash "$temporary")" &&
          [[ $current_semantic_hash == "$candidate_semantic_hash" ]]; }; }; then
+    save_subscription_cache "$url" "$temporary" || echo "警告: 无法保存订阅缓存."
     rm -f -- "$temporary"
     warn_empty_managed_region_groups || true
     echo "订阅内容与当前配置一致, 无需覆盖配置或重启 Mihomo."
@@ -5149,7 +5194,7 @@ download_and_apply_subscription() {
   fi
 
   echo "新配置验证成功, 正在备份并替换配置; 此阶段不应中断."
-  backup="$(create_config_backup subscription)" || {
+  backup="$(create_config_backup subscription "$backup_settings")" || {
     rm -f -- "$temporary"
     return 1
   }
@@ -5185,6 +5230,8 @@ download_and_apply_subscription() {
     return 1
   fi
 
+  save_subscription_cache "$url" "$CONFIG_FILE" || echo "警告: 无法保存订阅缓存."
+
   refresh_api_config
   if (( was_active == 1 )); then
     if ! restore_mipilot_selections; then
@@ -5199,6 +5246,7 @@ download_and_apply_subscription() {
   else
     echo "订阅更新成功."
   fi
+  (( used_cache == 1 )) && echo "当前使用缓存配置, 节点列表不是订阅服务的最新版本."
   (( was_active == 0 )) && echo "Mihomo 当前未运行, 新配置将在下次启动时生效."
   echo "备份文件: ${backup}"
 }
@@ -5438,13 +5486,22 @@ append_subscription_url() {
 activate_subscription() {
   local url="$1"
   local previous_marker
+  local previous_settings
   local had_previous=0
   local status
 
   previous_marker="$(mktemp /tmp/mihomo-active-subscription.XXXXXX)" || return 1
+  previous_settings="$(mktemp /tmp/mihomo-manager-settings.XXXXXX)" || {
+    rm -f -- "$previous_marker"
+    return 1
+  }
+  if ! copy_privileged_file_to_temp "$MANAGER_CONFIG_FILE" "$previous_settings"; then
+    rm -f -- "$previous_marker" "$previous_settings"
+    return 1
+  fi
   if sudo test -f "$SUBSCRIPTION_FILE"; then
     copy_privileged_file_to_temp "$SUBSCRIPTION_FILE" "$previous_marker" || {
-      sudo rm -f -- "$previous_marker"
+      rm -f -- "$previous_marker" "$previous_settings"
       return 1
     }
     had_previous=1
@@ -5459,28 +5516,29 @@ activate_subscription() {
       sudo rm -f -- "$SUBSCRIPTION_FILE" || true
     fi
     sync_mipilot_config_from_state || true
-    sudo rm -f -- "$previous_marker"
+    rm -f -- "$previous_marker" "$previous_settings"
     echo "无法保存激活订阅标记, 当前节点未改变."
     return 1
   fi
-  download_and_apply_subscription "$url"
+  download_and_apply_subscription "$url" "$previous_settings"
   status=$?
   if (( status != 0 )); then
     if (( had_previous == 1 )); then
       if atomic_install_file 600 "$previous_marker" "$SUBSCRIPTION_FILE"; then
         sync_mipilot_config_from_state || true
-        sudo rm -f -- "$previous_marker"
+        rm -f -- "$previous_marker" "$previous_settings"
       else
+        rm -f -- "$previous_settings"
         echo "警告: 原激活订阅标记恢复失败, 安全副本保留在 ${previous_marker}"
       fi
     else
       sudo rm -f -- "$SUBSCRIPTION_FILE" || true
       sync_mipilot_config_from_state || true
-      sudo rm -f -- "$previous_marker"
+      rm -f -- "$previous_marker" "$previous_settings"
     fi
     return "$status"
   fi
-  sudo rm -f -- "$previous_marker"
+  rm -f -- "$previous_marker" "$previous_settings"
   echo "已切换到目标订阅, 后续流量将使用新订阅节点."
 }
 
@@ -7457,6 +7515,7 @@ download_file() {
   local label="${3:-下载文件}"
   local attempt
   local status
+  local tls_args=()
 
   if (( DOWNLOAD_ROUTE_NOTICE_SHOWN == 0 )); then
     echo "网络路径由当前TUN、代理环境变量或系统路由决定."
@@ -7469,7 +7528,8 @@ download_file() {
       echo "正在重试: ${label} (${attempt}/3)"
     fi
     run_cancellable_named "正在下载 ${label}" 605 \
-      curl -4 -fL -sS --show-error --connect-timeout 15 --max-time 600 \
+      curl -4 -fL --proto '=https' --proto-redir '=https' "${tls_args[@]}" \
+      -sS --show-error --connect-timeout 15 --max-time 600 \
       "$url" -o "$output_file"
     status=$?
     if (( status == 0 )); then
@@ -7481,6 +7541,10 @@ download_file() {
     if (( status == 22 )); then
       echo "服务器返回HTTP错误, 不再重复请求. 如果GitHub提示403, 通常是当前出口IP的匿名API额度已耗尽."
       return 22
+    fi
+    if (( status == 35 )) && (( ${#tls_args[@]} == 0 )); then
+      echo "当前网络路径无法使用默认 TLS, 后续重试将使用 TLS 1.2."
+      tls_args=(--tls-max 1.2)
     fi
     rm -f -- "$output_file"
     (( attempt < 3 )) && sleep 2
@@ -8342,7 +8406,7 @@ show_component_status() {
   if sudo test -f "${CONFIG_DIR}/GeoSite.dat"; then
     geosite_hash="$(sudo sha256sum "${CONFIG_DIR}/GeoSite.dat" | awk '{print substr($1,1,16) "..."}')"
   fi
-  echo "mipilot 版本: ${MANAGER_VERSION}"
+  echo "mipilot 版本: ${MANAGER_VERSION} (build ${MANAGER_BUILD})"
   echo "Mihomo 内核: $(current_core_version)"
   echo "Country.mmdb SHA256: ${country_hash}"
   echo "GeoSite.dat SHA256: ${geosite_hash}"
@@ -8637,6 +8701,7 @@ generate_diagnostic_report() {
     echo "mipilot Diagnostic"
     echo "generated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "manager_version=${MANAGER_VERSION}"
+    echo "manager_build=${MANAGER_BUILD}"
     echo "kernel_version=$(current_core_version)"
     echo "runtime_mode=$(installed_runtime_mode)"
     echo "runtime_active=$(runtime_is_active && printf true || printf false)"
@@ -9064,7 +9129,7 @@ entrypoint() {
 
   case "$action" in
     --version|-v)
-      echo "mipilot ${MANAGER_VERSION}"
+      echo "mipilot ${MANAGER_VERSION} (build ${MANAGER_BUILD})"
       return 0
       ;;
     --cleanup)
