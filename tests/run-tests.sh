@@ -3134,7 +3134,9 @@ test_subscription_download_tls_fallback() {
   assert_equal '2' "$call_count" "TLS failure retry call count" || return 1
   assert_file_has_line "$arguments_file" '--tls-max' "TLS retry option" || return 1
   assert_file_has_line "$arguments_file" '1.2' "TLS retry version" || return 1
-  [[ $output == *'TLS 1.2 兼容下载成功'* ]] || fail "TLS fallback success message was missing"
+  [[ $output == *'当前代理路径无法使用默认 TLS 下载目标订阅'* ]] || fail "TLS fallback path context was missing"
+  [[ $output == *'订阅文件已通过 TLS 1.2 下载成功'* ]] || fail "TLS fallback success message was missing"
+  [[ $output == *'仅用于本次下载, 不会修改目标订阅的节点或 TLS 设置'* ]] || fail "TLS fallback scope message was missing"
 
   : >"$arguments_file"
   call_count=0
@@ -3396,7 +3398,7 @@ test_subscription_activation_marker_rollback() {
     fail "failed subscription activation unexpectedly succeeded"
     return 1
   }
-  if [[ $output == *'已设为当前激活订阅.'* ]]; then
+  if [[ $output == *'已切换到目标订阅, 后续流量将使用新订阅节点.'* ]]; then
     fail "failed subscription activation reported success"
     return 1
   fi

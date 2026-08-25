@@ -15,7 +15,7 @@
       "sendline": "1"
     },
     {
-      "expect_exact": "已设为当前激活订阅.",
+      "expect_exact": "已切换到目标订阅, 后续流量将使用新订阅节点.",
       "timeout": 300
     },
     {
